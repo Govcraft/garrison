@@ -36,6 +36,7 @@ use crate::types::{ApprovalId, ClientId, ThreadId, TurnId};
 use acton_ai::policy::{name_matches, ApprovalDecision, ToolInvocation};
 use acton_reactive::prelude::*;
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -72,6 +73,11 @@ pub struct TurnScope {
     pub turn_id: TurnId,
     /// The client that owns the session, and therefore answers its approvals.
     pub client_id: ClientId,
+    /// The directory this session's file operations are confined to.
+    ///
+    /// Shared because it is read-only for the life of the session and the
+    /// patch preflight consults it on every call.
+    pub project_root: Arc<PathBuf>,
     /// That client's connection actor.
     pub conn: ActorHandle,
     /// How long the client has to answer before the call is denied.
@@ -178,6 +184,19 @@ pub async fn approval_hook(invocation: ToolInvocation) -> ApprovalDecision {
         return ApprovalDecision::Approve;
     }
 
+    // A patch can often be decided without troubling anybody: one that only
+    // creates files inside the session root destroys nothing, and one that
+    // reaches outside it could not be allowed however the operator answered.
+    // Only the destructive-but-permitted middle reaches a human.
+    if let Some(decided) = crate::patch::preflight(&invocation, &scope.project_root) {
+        tracing::debug!(
+            tool = %invocation.tool_name,
+            thread_id = %scope.thread_id,
+            "decided by the patch safety assessment",
+        );
+        return decided;
+    }
+
     let approval_id = ApprovalId::new();
     tracing::debug!(
         %approval_id,
@@ -262,6 +281,7 @@ mod tests {
             thread_id: ThreadId::new(),
             turn_id: TurnId::new(),
             client_id: ClientId::new(),
+            project_root: Arc::new(PathBuf::from("/nowhere")),
             conn: ActorHandle::default(),
             timeout: Duration::from_secs(1),
             auto_approve: Arc::new(vec!["read_file".to_string(), "mcp__*".to_string()]),
@@ -301,6 +321,7 @@ mod tests {
             thread_id: expected.clone(),
             turn_id: TurnId::new(),
             client_id: ClientId::new(),
+            project_root: Arc::new(PathBuf::from("/nowhere")),
             conn,
             timeout: Duration::from_secs(1),
             auto_approve: Arc::new(Vec::new()),

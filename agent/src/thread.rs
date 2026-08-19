@@ -220,7 +220,11 @@ pub struct ThreadSetup {
     /// The turn router, for attributing broadcast tool events.
     pub router: ActorHandle,
     /// The directory the session's work is rooted at — ACP's `cwd`.
-    pub project_root: PathBuf,
+    ///
+    /// Shared rather than cloned per turn: it is read-only for the life of
+    /// the session, and both the approval preflight and the patch tool read
+    /// it on every call.
+    pub project_root: Arc<PathBuf>,
     /// A system prompt to prepend to every turn.
     pub system_prompt: Option<String>,
     /// How long an approval may wait for the client.
@@ -268,7 +272,7 @@ impl Thread {
     /// A description of this session for `session/list`.
     fn summary(&self) -> ThreadSummary {
         let (thread_id, project_root) = match &self.setup {
-            Some(setup) => (setup.thread_id.clone(), setup.project_root.clone()),
+            Some(setup) => (setup.thread_id.clone(), setup.project_root.as_ref().clone()),
             None => (ThreadId::new(), PathBuf::new()),
         };
 
@@ -499,6 +503,7 @@ async fn drive_turn(
         thread_id: setup.thread_id.clone(),
         turn_id: turn_id.clone(),
         client_id: setup.owner.clone(),
+        project_root: Arc::clone(&setup.project_root),
         conn: setup.conn.clone(),
         timeout: setup.approval_timeout,
         auto_approve: Arc::clone(&setup.auto_approve),
@@ -515,6 +520,10 @@ async fn drive_turn(
     if let Some(system) = &setup.system_prompt {
         builder = builder.system(system.clone());
     }
+    // Registered per prompt because acton-ai has no runtime-wide registration
+    // for a downstream tool. Garrison builds every turn's prompt itself, so
+    // "per prompt" and "always" are the same thing here.
+    builder = crate::patch::install(builder, setup.project_root.as_ref().clone());
 
     // The scope must wrap the await, not merely be set before it: the approval
     // hook runs inside `collect()`, on this task.

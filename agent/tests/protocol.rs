@@ -70,11 +70,52 @@ impl Agent {
 /// A config with the defaults a test wants: no auto-approval, so every tool
 /// call is visible as a protocol round-trip.
 fn strict_config(timeout_secs: u64) -> GarrisonConfig {
+    rooted_config(timeout_secs, project_root())
+}
+
+/// The same, confined to a directory of the test's choosing.
+fn rooted_config(timeout_secs: u64, root: PathBuf) -> GarrisonConfig {
     let mut config = GarrisonConfig::default();
     config.approval.timeout_secs = timeout_secs;
     config.approval.auto_approve.clear();
-    config.threads.project_root = Some(project_root());
+    config.threads.project_root = Some(root);
     config
+}
+
+/// A throwaway project root, removed when the test ends.
+struct TempRoot {
+    path: PathBuf,
+}
+
+impl TempRoot {
+    fn new(name: &str) -> Self {
+        let path =
+            std::env::temp_dir().join(format!("garrison-protocol-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("the test root must be creatable");
+        Self {
+            path: path.canonicalize().expect("the test root must resolve"),
+        }
+    }
+
+    fn write(&self, name: &str, contents: &str) {
+        std::fs::write(self.path.join(name), contents).expect("the fixture must be writable");
+    }
+
+    fn read(&self, name: &str) -> String {
+        std::fs::read_to_string(self.path.join(name)).expect("the file must be readable")
+    }
+}
+
+impl Drop for TempRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// A round in which the model calls `apply_patch` with this text.
+fn patch_call(id: &str, patch: &str) -> Round {
+    Round::tool_call(id, "apply_patch", json!({ "patch": patch }))
 }
 
 /// An absolute directory every test can name as a session root.
@@ -124,12 +165,17 @@ async fn connect(base_url: &str, config: &GarrisonConfig) -> (Agent, AgentClient
 
 /// Handshakes and opens a session, which every test past the first one needs.
 async fn open_session(client: &mut AgentClient) -> acp::SessionId {
+    open_session_at(client, project_root()).await
+}
+
+/// The same, rooted somewhere the test chose.
+async fn open_session_at(client: &mut AgentClient, cwd: PathBuf) -> acp::SessionId {
     client
         .initialize("integration-test")
         .await
         .expect("the handshake must succeed");
     client
-        .new_session(project_root())
+        .new_session(cwd)
         .await
         .expect("a session must open")
         .session_id
@@ -537,6 +583,153 @@ async fn loading_a_session_replays_what_was_said() {
         replay.text.contains("remember this") && replay.text.contains("Noted."),
         "the replay must carry both sides: {:?}",
         replay.text
+    );
+
+    agent.shutdown().await;
+}
+
+// =============================================================================
+// apply_patch, end to end
+// =============================================================================
+
+#[tokio::test]
+async fn a_patch_that_only_creates_files_is_applied_without_asking() {
+    let root = TempRoot::new("creates");
+    let server = MockServer::start(vec![
+        patch_call(
+            "call-1",
+            "*** Begin Patch\n*** Add File: notes/new.txt\n+one\n+two\n*** End Patch\n",
+        ),
+        Round::text("Created notes/new.txt."),
+    ])
+    .await;
+    let config = rooted_config(300, root.path.clone());
+    let (agent, mut client) = connect(server.base_url(), &config).await;
+    let session_id = open_session_at(&mut client, root.path.clone()).await;
+
+    let mut watcher = Scripted::answering(acp::OPTION_REJECT);
+    let response = client
+        .prompt(session_id, "add a notes file", &mut watcher)
+        .await
+        .expect("the turn must complete");
+
+    assert_eq!(response.stop_reason, acp::StopReason::EndTurn);
+    assert!(
+        watcher.asked.is_empty(),
+        "creating a new file destroys nothing, so nobody should have been asked",
+    );
+    assert_eq!(root.read("notes/new.txt"), "one\ntwo\n");
+
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_destructive_patch_is_applied_only_after_the_operator_agrees() {
+    let root = TempRoot::new("approved");
+    root.write("a.txt", "one\ntwo\nthree\n");
+    let server = MockServer::start(vec![
+        patch_call(
+            "call-1",
+            "*** Begin Patch\n\
+             *** Update File: a.txt\n\
+             @@\n\
+             -two\n\
+             +TWO\n\
+             *** End Patch\n",
+        ),
+        Round::text("Updated a.txt."),
+    ])
+    .await;
+    let config = rooted_config(300, root.path.clone());
+    let (agent, mut client) = connect(server.base_url(), &config).await;
+    let session_id = open_session_at(&mut client, root.path.clone()).await;
+
+    let mut watcher = Scripted::answering(acp::OPTION_ALLOW_ONCE);
+    let response = client
+        .prompt(session_id, "shout the second line", &mut watcher)
+        .await
+        .expect("the turn must complete");
+
+    assert_eq!(response.stop_reason, acp::StopReason::EndTurn);
+    assert_eq!(
+        watcher.asked.len(),
+        1,
+        "an in-place edit must reach a human"
+    );
+    assert_eq!(root.read("a.txt"), "one\nTWO\nthree\n");
+
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_refused_patch_leaves_the_file_exactly_as_it_was() {
+    let root = TempRoot::new("refused");
+    root.write("a.txt", "one\ntwo\nthree\n");
+    let server = MockServer::start(vec![
+        patch_call(
+            "call-1",
+            "*** Begin Patch\n\
+             *** Delete File: a.txt\n\
+             *** End Patch\n",
+        ),
+        Round::text("I was not allowed to delete it."),
+    ])
+    .await;
+    let config = rooted_config(300, root.path.clone());
+    let (agent, mut client) = connect(server.base_url(), &config).await;
+    let session_id = open_session_at(&mut client, root.path.clone()).await;
+
+    let mut watcher = Scripted::answering(acp::OPTION_REJECT);
+    client
+        .prompt(session_id, "delete a.txt", &mut watcher)
+        .await
+        .expect("a refusal ends the turn normally");
+
+    assert_eq!(watcher.asked.len(), 1);
+    assert_eq!(
+        root.read("a.txt"),
+        "one\ntwo\nthree\n",
+        "a refused delete must not have run",
+    );
+
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_patch_reaching_outside_the_root_is_refused_without_asking_anybody() {
+    let root = TempRoot::new("escape");
+    let server = MockServer::start(vec![
+        patch_call(
+            "call-1",
+            "*** Begin Patch\n*** Add File: ../escaped.txt\n+hi\n*** End Patch\n",
+        ),
+        Round::text("That path is outside the project."),
+    ])
+    .await;
+    let config = rooted_config(300, root.path.clone());
+    let (agent, mut client) = connect(server.base_url(), &config).await;
+    let session_id = open_session_at(&mut client, root.path.clone()).await;
+
+    let mut watcher = Scripted::answering(acp::OPTION_ALLOW_ALWAYS);
+    client
+        .prompt(session_id, "write outside the project", &mut watcher)
+        .await
+        .expect("the turn must complete");
+
+    assert!(
+        watcher.asked.is_empty(),
+        "no operator may authorize a write outside the root, so none is asked",
+    );
+    assert!(
+        !root.path.join("../escaped.txt").exists(),
+        "nothing may have been written outside the root",
+    );
+    assert!(
+        watcher
+            .tool_calls
+            .contains(&("call-1".to_string(), acp::ToolCallStatus::Failed)),
+        "the refusal must reach the client as a failed tool call: {:?}",
+        watcher.tool_calls,
     );
 
     agent.shutdown().await;

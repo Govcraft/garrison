@@ -29,7 +29,7 @@ Specifically:
     leading and trailing whitespace -- is Codex's.
 
 Garrison's implementation was written independently from the description
-above rather than copied, and it deliberately diverges in two respects:
+above rather than copied, and it deliberately diverges in three respects:
 
   - Codex returns the first match found and never reports ambiguity. Garrison
     treats two or more equally-good matches within a pass as a hard failure,
@@ -40,5 +40,10 @@ above rather than copied, and it deliberately diverges in two respects:
   - Codex's legacy end-of-file handling can search backwards past the running
     cursor, which lets two hunks apply to the same region and silently drops
     one. Garrison always clamps the search to the cursor.
+
+  - Codex applies a patch eagerly, writing each hunk as it resolves, so a
+    patch whose third hunk fails leaves the first two on disk. Garrison
+    resolves every hunk into a planned change before it writes anything, so a
+    patch either applies whole or leaves the tree exactly as it found it.
 
 ================================================================================

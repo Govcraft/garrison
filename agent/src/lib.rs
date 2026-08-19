@@ -5,6 +5,7 @@ pub mod client;
 pub mod config;
 pub mod error;
 pub mod launch;
+pub mod patch;
 pub mod protocol;
 pub mod router;
 pub mod thread;

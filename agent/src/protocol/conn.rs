@@ -733,7 +733,7 @@ async fn session_new(context: &Dispatch, raw: Option<Value>) -> Result<Value, Er
         conn: context.conn.clone(),
         runtime: context.setup.runtime.clone(),
         router: context.setup.router.clone(),
-        project_root: project_root(context, request.cwd),
+        project_root: Arc::new(project_root(context, request.cwd)),
         system_prompt: context.setup.defaults.system_prompt.clone(),
         approval_timeout: context.setup.defaults.approval_timeout,
         auto_approve: Arc::clone(&context.setup.defaults.auto_approve),
