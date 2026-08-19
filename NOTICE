@@ -1,0 +1,44 @@
+Garrison
+Copyright 2026 Govcraft
+
+================================================================================
+
+This product includes software derived from OpenAI Codex
+(https://github.com/openai/codex), licensed under the Apache License,
+Version 2.0. You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Copyright 2025 OpenAI
+
+The patch format implemented by `garrison-agent`'s `patch` module, and the
+fuzzy context-matching strategy used to locate hunks, are derived from the
+`codex-rs/apply-patch` crate as of commit
+3b45c29062ff0e76e71c91b6753290400e7fa8da.
+
+Specifically:
+
+  - The wire format is the same one Codex's `apply_patch.lark` grammar
+    describes, so that a model already fluent in it needs no retraining. The
+    envelope markers, the three file operations, the `@@` context convention,
+    the `*** Move to:` rename form, and the `*** End of File` marker are all
+    Codex's design.
+
+  - The idea in `seek_sequence.rs` of locating a hunk by progressively more
+    lenient passes -- exact, then ignoring trailing whitespace, then ignoring
+    leading and trailing whitespace -- is Codex's.
+
+Garrison's implementation was written independently from the description
+above rather than copied, and it deliberately diverges in two respects:
+
+  - Codex returns the first match found and never reports ambiguity. Garrison
+    treats two or more equally-good matches within a pass as a hard failure,
+    reporting the hunk index and every candidate line, because silently
+    editing the wrong one of two identical blocks is the failure mode that
+    costs the most to discover later.
+
+  - Codex's legacy end-of-file handling can search backwards past the running
+    cursor, which lets two hunks apply to the same region and silently drops
+    one. Garrison always clamps the search to the cursor.
+
+================================================================================

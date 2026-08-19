@@ -1,0 +1,19 @@
+# Cargo workspace root for Garrison's Rust components.
+#
+# Declared explicitly, and at the repo root rather than per-crate, for two
+# reasons. First, `hooks-service/` becomes a second crate shortly and a
+# workspace lets both share one lockfile, one `target/`, and one `cargo
+# clippy` invocation. Second, an explicit `[workspace]` here stops a checkout
+# nested under another checkout — a git worktree, a vendored copy — from
+# silently resolving into an outer manifest's workspace.
+#
+# `site/` is pnpm and unaffected by any of this.
+[workspace]
+members = ["agent"]
+default-members = ["agent"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Govcraft/garrison"
