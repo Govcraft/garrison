@@ -1,0 +1,52 @@
+version: '3'
+
+# Local dev runner for the Garrison stack, mirroring the Meridian layout.
+#
+# Four long-lived processes make up "garrison running locally":
+#
+#   1. schemaforge backend   — control plane REST API + Cedar/PASETO (FORGE_PORT, 3000)
+#   2. hooks-service (Rust)  — gRPC lifecycle hooks on :9091
+#   3. Vite dev server       — site/ admin console, /api/v1/forge proxied to backend
+#   4. garrison-agent        — acton-ai daemon from agent/, IPC socket for IDE extensions
+#
+# Dev database: the shared Govcraft pg-dev container on penny-pi (see the
+# Meridian Taskfile for connection details). Database `garrison_dev`,
+# role `garrison_dev`. Override DEV_DB_URL in .env if needed.
+
+dotenv: ['.env']
+
+vars:
+  FORGE_PORT: '{{.FORGE_PORT | default "3000"}}'
+
+tasks:
+  dev:
+    desc: Bring up backend, hooks, site, and agent in parallel
+    deps: [backend, hooks, site, agent]
+
+  backend:
+    desc: SchemaForge control plane API
+    cmds:
+      - schema-forge serve --config ./config.toml
+
+  hooks:
+    desc: Lifecycle hooks gRPC service
+    dir: hooks-service
+    cmds:
+      - cargo run --release
+
+  site:
+    desc: Admin console dev server
+    dir: site
+    cmds:
+      - pnpm dev
+
+  agent:
+    desc: Garrison agent daemon (acton-ai)
+    dir: agent
+    cmds:
+      - cargo run
+
+  validate:
+    desc: Validate schemas + Cedar bundle (run after any schema change)
+    cmds:
+      - schema-forge validate --config ./config.toml

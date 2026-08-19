@@ -6,3 +6,12 @@
 *.txt
 *.md
 !README.md
+keys/
+.env
+*.pcap
+target/
+node_modules/
+dist/
+!README.md
+!docs/**/*.md
+!CHANGELOG.md
