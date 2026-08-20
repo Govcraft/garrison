@@ -33,6 +33,13 @@ timeout_secs = 600
 max_tokens = 8192
 context_window_tokens = 131072
 
+# Groq's actual account limits (from its x-ratelimit headers). With these,
+# the local limiter queues requests until the window frees instead of
+# letting them fly until the server 429s a whole agentic turn to death.
+[providers.groq.rate_limit]
+requests_per_minute = 300
+tokens_per_minute = 250000
+
 [providers.ollama]
 type = "ollama"
 model = "qwen3.8"
