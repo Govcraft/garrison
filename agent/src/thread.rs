@@ -231,6 +231,8 @@ pub struct ThreadSetup {
     pub approval_timeout: Duration,
     /// Tool-name patterns that skip the approval round-trip.
     pub auto_approve: Arc<Vec<String>>,
+    /// The language servers this session's LSP tools reach.
+    pub lsp: Arc<crate::lsp::LspRegistry>,
 }
 
 /// One conversation.
@@ -524,6 +526,11 @@ async fn drive_turn(
     // for a downstream tool. Garrison builds every turn's prompt itself, so
     // "per prompt" and "always" are the same thing here.
     builder = crate::patch::install(builder, setup.project_root.as_ref().clone());
+    builder = crate::lsp::install(
+        builder,
+        Arc::clone(&setup.lsp),
+        Arc::clone(&setup.project_root),
+    );
 
     // The scope must wrap the await, not merely be set before it: the approval
     // hook runs inside `collect()`, on this task.

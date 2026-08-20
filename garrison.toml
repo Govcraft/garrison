@@ -8,4 +8,10 @@ system_prompt = "You are Garrison, a governed coding agent. Work inside the proj
 timeout_secs = 300
 # Read-only tools skip the permission round-trip; anything that can change
 # state still reaches the operator.
-auto_approve = ["read_file", "glob", "grep", "list_directory", "calculate", "get_context_remaining", "update_plan"]
+auto_approve = ["read_file", "glob", "grep", "list_directory", "calculate", "get_context_remaining", "update_plan", "lsp_diagnostics", "lsp_hover", "lsp_definition", "lsp_references"]
+
+# Language servers, routed by file extension. All four lsp_* tools are
+# read-only queries, hence their place in auto_approve above.
+[lsp_servers.rust]
+command = "rust-analyzer"
+extensions = ["rs"]

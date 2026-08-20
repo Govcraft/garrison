@@ -25,6 +25,8 @@ pub struct GarrisonConfig {
     pub threads: ThreadConfig,
     /// How tool approvals behave.
     pub approval: ApprovalConfig,
+    /// Language servers to run, keyed by a name of the operator's choosing.
+    pub lsp_servers: std::collections::HashMap<String, LspServerConfig>,
 }
 
 /// Listener settings.
@@ -80,6 +82,49 @@ impl Default for ApprovalConfig {
             timeout_secs: 300,
             auto_approve: default_auto_approve(),
         }
+    }
+}
+
+/// One language server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LspServerConfig {
+    /// The binary to run, resolved on `PATH`.
+    pub command: String,
+    /// Its arguments.
+    pub args: Vec<String>,
+    /// File extensions (without dots) routed to this server.
+    pub extensions: Vec<String>,
+    /// The `languageId` sent when opening a document.
+    ///
+    /// `None` uses the config key's name, which is right whenever the key is
+    /// the language ("rust", "python") — the common case.
+    pub language_id: Option<String>,
+    /// How long a tool call waits on this server, in seconds.
+    ///
+    /// The default is generous because the first diagnostics request lands
+    /// while the server is still indexing, and a truthful slow answer beats
+    /// a fast timeout.
+    pub request_timeout_secs: u64,
+}
+
+impl Default for LspServerConfig {
+    fn default() -> Self {
+        Self {
+            command: String::new(),
+            args: Vec::new(),
+            extensions: Vec::new(),
+            language_id: None,
+            request_timeout_secs: 60,
+        }
+    }
+}
+
+impl LspServerConfig {
+    /// The ask timeout as a [`Duration`].
+    #[must_use]
+    pub fn timeout(&self) -> Duration {
+        Duration::from_secs(self.request_timeout_secs)
     }
 }
 

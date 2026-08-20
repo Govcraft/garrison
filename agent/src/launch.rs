@@ -144,6 +144,10 @@ pub async fn build_setup(
             .map_err(|error| GarrisonError::runtime(format!("no working directory: {error}")))?,
     };
 
+    // Eager, so rust-analyzer indexes while the first prompt is still being
+    // written; a server that fails to spawn is a warning inside, not an error.
+    let lsp = crate::lsp::spawn_servers(&mut runtime, &config.lsp_servers, &project_root).await;
+
     Ok(ServerSetup {
         supervisor,
         runtime: ai.clone(),
@@ -153,6 +157,7 @@ pub async fn build_setup(
             system_prompt: config.threads.system_prompt.clone(),
             approval_timeout: config.approval_timeout(),
             auto_approve: Arc::new(config.approval.auto_approve.clone()),
+            lsp: Arc::new(lsp),
         },
         capabilities: capabilities(),
         audited: ai.is_audited(),

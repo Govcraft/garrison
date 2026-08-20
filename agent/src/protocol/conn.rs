@@ -83,6 +83,8 @@ pub struct ThreadDefaults {
     pub approval_timeout: Duration,
     /// Tool-name patterns that skip the permission round-trip.
     pub auto_approve: Arc<Vec<String>>,
+    /// The language servers every session's tools reach.
+    pub lsp: Arc<crate::lsp::LspRegistry>,
 }
 
 impl Default for ThreadDefaults {
@@ -92,6 +94,7 @@ impl Default for ThreadDefaults {
             system_prompt: None,
             approval_timeout: Duration::from_secs(300),
             auto_approve: Arc::new(Vec::new()),
+            lsp: Arc::new(crate::lsp::LspRegistry::default()),
         }
     }
 }
@@ -737,6 +740,7 @@ async fn session_new(context: &Dispatch, raw: Option<Value>) -> Result<Value, Er
         system_prompt: context.setup.defaults.system_prompt.clone(),
         approval_timeout: context.setup.defaults.approval_timeout,
         auto_approve: Arc::clone(&context.setup.defaults.auto_approve),
+        lsp: Arc::clone(&context.setup.defaults.lsp),
     };
 
     let created = context
