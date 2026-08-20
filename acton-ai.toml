@@ -1,11 +1,11 @@
 # acton-ai configuration for garrison-agent.
 #
-# The default provider is `claude`; point default_provider at "openai" to
-# use GPT models, or at "ollama" to run fully local. The cloud providers
-# authenticate with keys stored by `garrison-agent login <provider>`; swap
-# the ollama `model` for any tool-calling model `ollama list` shows.
+# The default provider is `groq` (fast hosted gpt-oss-120b); point
+# default_provider at "claude"/"openai" for the frontier clouds or "ollama"
+# to run fully local. The cloud providers authenticate with keys stored by
+# `garrison-agent login <provider>`; the groq key file was placed by hand.
 
-default_provider = "claude"
+default_provider = "groq"
 
 [providers.claude]
 type = "anthropic"
@@ -23,6 +23,15 @@ timeout_secs = 600
 max_tokens = 8192
 # Conservative; raise if the model's real window is larger.
 context_window_tokens = 200000
+
+[providers.groq]
+type = "groq"
+model = "openai/gpt-oss-120b"
+base_url = "https://api.groq.com/openai/v1"
+api_key_file = "~/.config/garrison/groq-key"
+timeout_secs = 600
+max_tokens = 8192
+context_window_tokens = 131072
 
 [providers.ollama]
 type = "ollama"
