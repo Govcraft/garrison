@@ -44,5 +44,10 @@ context_window_tokens = 32768
 requests_per_minute = 1000
 tokens_per_minute = 1000000
 
+[context]
+# Truncation must never drop the system prompt; KeepRecent (the default)
+# keeps only a recent tail and would.
+strategy = "keep-system-and-recent"
+
 [defaults]
 max_tool_rounds = 25
