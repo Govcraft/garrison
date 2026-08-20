@@ -114,6 +114,8 @@ enum ProviderArg {
     Anthropic,
     /// OpenAI (GPT models): OAuth sign-in in the browser.
     Openai,
+    /// Groq (OpenAI‑compatible models): paste a Console API key.
+    Groq,
 }
 
 impl From<ProviderArg> for garrison_agent::auth::Provider {
@@ -121,6 +123,7 @@ impl From<ProviderArg> for garrison_agent::auth::Provider {
         match arg {
             ProviderArg::Anthropic => Self::Anthropic,
             ProviderArg::Openai => Self::OpenAI,
+            ProviderArg::Groq => Self::Groq,
         }
     }
 }

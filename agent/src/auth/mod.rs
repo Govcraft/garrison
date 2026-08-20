@@ -17,6 +17,7 @@
 //! the config names a *path*, and the file behind it is owner-only.
 
 pub mod anthropic;
+pub mod groq;
 pub mod openai;
 
 use crate::error::GarrisonError;
@@ -29,6 +30,8 @@ pub enum Provider {
     Anthropic,
     /// OpenAI (GPT models), keyed via OAuth or a pasted platform key.
     OpenAI,
+    /// Groq (LLM provider), keyed by a Console API key.
+    Groq,
 }
 
 impl Provider {
@@ -37,6 +40,7 @@ impl Provider {
         match self {
             Self::Anthropic => "anthropic-key",
             Self::OpenAI => "openai-key",
+            Self::Groq => "groq-key",
         }
     }
 
@@ -45,6 +49,7 @@ impl Provider {
         match self {
             Self::Anthropic => "Anthropic",
             Self::OpenAI => "OpenAI",
+            Self::Groq => "Groq",
         }
     }
 }
@@ -78,6 +83,7 @@ pub async fn login(provider: Provider, key_stdin: bool) -> Result<(), GarrisonEr
     match provider {
         Provider::Anthropic => anthropic::login(key_stdin).await,
         Provider::OpenAI => openai::login(key_stdin).await,
+        Provider::Groq => groq::login(key_stdin).await,
     }
 }
 
