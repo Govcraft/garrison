@@ -297,7 +297,7 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, TurnRouter>) {
         let mut next = None;
 
         match &event {
-            TurnLifecycle::TurnStarted { turn_id } => {
+            TurnLifecycle::TurnStarted { turn_id, .. } => {
                 // No announcement: ACP has no "turn started" event, and the
                 // client already knows — it is the one holding the open
                 // `session/prompt` request this turn answers.
@@ -308,11 +308,12 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, TurnRouter>) {
                 next = actor.model.settle(None);
                 arm_expiry(actor, next.is_some());
             }
-            TurnLifecycle::TurnFinished { turn_id } => actor.model.forget(turn_id),
+            TurnLifecycle::TurnFinished { turn_id, .. } => actor.model.forget(turn_id),
             TurnLifecycle::ToolStarted {
                 turn_id,
                 tool_call_id,
                 tool_name,
+                ..
             } => {
                 actor
                     .model
@@ -331,6 +332,11 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, TurnRouter>) {
             // The outcome travels on `LLMStreamToolResult`, which carries the
             // success flag and summary this variant lacks.
             TurnLifecycle::ToolFinished { .. } => {}
+            // The enum is non_exhaustive: variants this router has no ACP
+            // mapping for yet (compaction notices, plan updates, and whatever
+            // arrives next) are deliberately not surfaced rather than being a
+            // compile error on every upgrade.
+            _ => {}
         }
 
         Reply::pending(async move {

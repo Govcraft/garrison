@@ -31,6 +31,9 @@ pub const TOOL_NAME: &str = "apply_patch";
 #[must_use]
 pub fn definition() -> ToolDefinition {
     ToolDefinition {
+        // A patch rewrites files; re-running one after a crash without the
+        // model's say-so is exactly what the flag exists to prevent.
+        idempotent: false,
         name: TOOL_NAME.to_string(),
         description: DESCRIPTION.to_string(),
         input_schema: json!({

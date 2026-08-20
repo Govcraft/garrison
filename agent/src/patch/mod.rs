@@ -141,6 +141,7 @@ mod tests {
         ToolInvocation {
             tool_name: tool_name.to_string(),
             arguments,
+            tool_call_id: "call_test".to_string(),
             correlation_id: CorrelationId::new(),
             turn_id: TurnId::new(),
         }

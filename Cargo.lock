@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "acton-ai"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "acton-ai-macros",
  "acton-reactive",
@@ -38,6 +38,7 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "strsim",
+ "sync_wrapper 1.0.2",
  "tempfile",
  "termimad",
  "tiktoken-rs",

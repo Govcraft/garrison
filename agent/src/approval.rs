@@ -303,6 +303,7 @@ mod tests {
         let decision = approval_hook(ToolInvocation {
             tool_name: "bash".to_string(),
             arguments: json!({}),
+            tool_call_id: "call_test".to_string(),
             correlation_id: acton_ai::types::CorrelationId::new(),
             turn_id: acton_ai::types::TurnId::new(),
         })
