@@ -127,11 +127,16 @@ pub async fn build_ai(acton_config: Option<&Path>) -> Result<ActonAI, GarrisonEr
 /// when the configured project root defaults to a working directory the
 /// process cannot read.
 pub async fn build_setup(
-    ai: &mut ActonAI,
+    ai: &ActonAI,
     config: &GarrisonConfig,
 ) -> Result<ServerSetup, GarrisonError> {
-    let router = TurnRouter::spawn(ai.runtime_mut()).await;
-    let supervisor = ThreadSupervisor::spawn(ai.runtime_mut()).await;
+    // A clone of the runtime handle reaches the same system and the same
+    // broker. `runtime_mut()` would instead demand the only `ActonAI` handle
+    // in existence — which the `ServerSetup` below makes false the moment it
+    // takes its own clone.
+    let mut runtime = ai.runtime().clone();
+    let router = TurnRouter::spawn(&mut runtime).await;
+    let supervisor = ThreadSupervisor::spawn(&mut runtime).await;
 
     let project_root = match &config.threads.project_root {
         Some(root) => root.clone(),
@@ -160,12 +165,13 @@ pub async fn build_setup(
 ///
 /// As [`build_setup`] and [`crate::protocol::server::serve`].
 pub async fn start(
-    ai: &mut ActonAI,
+    ai: &ActonAI,
     config: &GarrisonConfig,
     listener: Box<dyn Listener>,
 ) -> Result<ActorHandle, GarrisonError> {
     let setup = build_setup(ai, config).await?;
-    server::serve(ai.runtime_mut(), listener, setup).await
+    let mut runtime = ai.runtime().clone();
+    server::serve(&mut runtime, listener, setup).await
 }
 
 /// Brings up everything and listens on a Unix socket.
@@ -180,13 +186,13 @@ pub async fn launch(
     socket: Option<PathBuf>,
     acton_config: Option<&Path>,
 ) -> Result<Garrison, GarrisonError> {
-    let mut ai = build_ai(acton_config).await?;
+    let ai = build_ai(acton_config).await?;
 
     let path = socket.unwrap_or_else(|| config.server.socket.clone());
     let listener = UnixListener::bind(&path)?;
     let endpoint = listener.endpoint();
 
-    let server = start(&mut ai, config, Box::new(listener)).await?;
+    let server = start(&ai, config, Box::new(listener)).await?;
     let runtime = ai.runtime().clone();
 
     Ok(Garrison {

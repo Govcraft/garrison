@@ -1,0 +1,16 @@
+# acton-ai configuration for garrison-agent — local Ollama development.
+# Swap `model` for any tool-calling model `ollama list` shows.
+
+[providers.ollama]
+type = "ollama"
+model = "qwen3.6-uncensored:27b"
+base_url = "http://127.0.0.1:11434/v1"
+timeout_secs = 600
+context_window_tokens = 32768
+
+[providers.ollama.rate_limit]
+requests_per_minute = 1000
+tokens_per_minute = 1000000
+
+[defaults]
+max_tool_rounds = 25

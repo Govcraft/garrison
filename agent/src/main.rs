@@ -154,8 +154,8 @@ async fn acp_stdio(
     acton_config: Option<PathBuf>,
 ) -> Result<(), GarrisonError> {
     let config = load_config(config)?;
-    let mut ai = launch::build_ai(acton_config.as_deref()).await?;
-    let setup = launch::build_setup(&mut ai, &config).await?;
+    let ai = launch::build_ai(acton_config.as_deref()).await?;
+    let setup = launch::build_setup(&ai, &config).await?;
     let mut runtime = ai.runtime().clone();
 
     tracing::info!("garrison agent speaking ACP on stdio");

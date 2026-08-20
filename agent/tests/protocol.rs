@@ -126,7 +126,7 @@ fn project_root() -> PathBuf {
 /// Brings up the whole agent over a socket pair and returns a connected
 /// client.
 async fn connect(base_url: &str, config: &GarrisonConfig) -> (Agent, AgentClient) {
-    let mut ai = ActonAI::builder()
+    let ai = ActonAI::builder()
         .app_name("garrison-agent-test")
         .with_builtin_tools(&["calculate"])
         .ollama_at(base_url, "test-model")
@@ -136,7 +136,7 @@ async fn connect(base_url: &str, config: &GarrisonConfig) -> (Agent, AgentClient
         .expect("the test runtime must launch");
 
     // One runtime, acton-ai's own: the router lives on its broker.
-    let setup = launch::build_setup(&mut ai, config)
+    let setup = launch::build_setup(&ai, config)
         .await
         .expect("the test setup must build");
     let supervisor = setup.supervisor.clone();
