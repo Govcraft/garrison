@@ -234,17 +234,22 @@ async fn ping(socket: Option<PathBuf>) -> Result<(), GarrisonError> {
 /// The smoke client's reactions: print what arrives, ask before every tool.
 struct Terminal {
     approve_all: bool,
+    tool_titles: std::collections::HashMap<String, String>,
 }
 
 impl Interactions for Terminal {
     fn update(&mut self, notification: &acp::SessionNotification) {
         match &notification.update {
             acp::SessionUpdate::ToolCall(call) => {
+                self.tool_titles
+                    .insert(call.tool_call_id.to_string(), call.title.clone());
                 println!("\n  [tool {} started]", call.title);
             }
             acp::SessionUpdate::ToolCallUpdate(update) => {
                 if let Some(status) = update.fields.status {
-                    println!("  [tool {}: {status:?}]", update.tool_call_id);
+                    let id = update.tool_call_id.to_string();
+                    let name = self.tool_titles.get(&id).cloned().unwrap_or(id);
+                    println!("  [tool {name}: {status:?}]");
                 }
             }
             _ => {
@@ -318,7 +323,10 @@ async fn chat(
     let session = client.new_session(cwd).await?;
     println!("session {}", session.session_id);
 
-    let mut terminal = Terminal { approve_all };
+    let mut terminal = Terminal {
+        approve_all,
+        tool_titles: std::collections::HashMap::new(),
+    };
     let response = client
         .prompt(session.session_id, &message, &mut terminal)
         .await?;

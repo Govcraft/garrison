@@ -3,7 +3,7 @@
 
 [providers.ollama]
 type = "ollama"
-model = "qwen3.6-uncensored:27b"
+model = "qwen3.8"
 base_url = "http://127.0.0.1:11434/v1"
 timeout_secs = 600
 context_window_tokens = 32768
