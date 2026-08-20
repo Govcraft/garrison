@@ -118,6 +118,8 @@ pub struct ConnSetup {
     pub capabilities: acp::AgentCapabilities,
     /// Whether the runtime is recording tool calls, for `_garrison/status`.
     pub audited: bool,
+    /// What isolation the runtime's writing tools run under, for the same.
+    pub sandbox: acp::SandboxStatus,
 }
 
 /// A frame the reader task pulled off the socket.
@@ -910,6 +912,7 @@ async fn status(context: &Dispatch) -> Result<Value, ErrorObject> {
             enabled: context.setup.audited,
             chain_head: None,
         },
+        sandbox: context.setup.sandbox.clone(),
     })
 }
 

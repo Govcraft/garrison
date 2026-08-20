@@ -29,7 +29,7 @@
 //! client cannot leave a thread waiting.
 
 use crate::error::GarrisonError;
-use crate::protocol::acp::AgentCapabilities;
+use crate::protocol::acp::{self, AgentCapabilities};
 use crate::protocol::codec::{self, EventSink, FrameError};
 use crate::protocol::conn::{ClientConn, ConnSetup, Incoming, ThreadDefaults};
 use crate::protocol::jsonrpc;
@@ -56,6 +56,8 @@ pub struct ServerSetup {
     pub capabilities: AgentCapabilities,
     /// Whether the runtime is recording tool calls.
     pub audited: bool,
+    /// What isolation the runtime's writing tools run under.
+    pub sandbox: acp::SandboxStatus,
 }
 
 /// Owns the listener and the accept loop.
@@ -231,6 +233,7 @@ where
             defaults: setup.defaults,
             capabilities: setup.capabilities,
             audited: setup.audited,
+            sandbox: setup.sandbox,
         },
     )
     .await;

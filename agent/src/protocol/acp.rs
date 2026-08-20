@@ -129,6 +129,8 @@ pub struct GarrisonStatus {
     pub policy: PolicyStatus,
     /// Whether tool calls are being recorded, and where the chain stands.
     pub audit: AuditStatus,
+    /// What isolation the agent's writing tools run under.
+    pub sandbox: SandboxStatus,
 }
 
 /// The approval gate's configuration, as the client may see it.
@@ -140,6 +142,46 @@ pub struct PolicyStatus {
     pub approval_timeout_secs: u64,
     /// Tool-name patterns that never reach the client.
     pub auto_approve: Vec<String>,
+}
+
+/// What isolation stands between a tool call and the host.
+///
+/// A reviewer asking "does this thing run `bash` in my daemon's process" gets
+/// an answer from the running agent rather than from the config file someone
+/// hopes it loaded.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct SandboxStatus {
+    /// Whether writing tools are dispatched to a sandboxed child at all.
+    ///
+    /// False means `bash`, `write_file`, and `edit_file` run in the agent's
+    /// own process, with the agent's own privileges.
+    pub enabled: bool,
+    /// The OS-hardening policy in force: `off`, `besteffort`, or `enforce`.
+    ///
+    /// Absent when nothing is sandboxed, because there is no policy to name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hardening: Option<String>,
+    /// How long a sandboxed call may run before the parent kills it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    /// The child's address-space ceiling, in bytes, when one is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_limit_bytes: Option<u64>,
+}
+
+impl SandboxStatus {
+    /// The answer when no sandbox is configured.
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self {
+            enabled: false,
+            hardening: None,
+            timeout_secs: None,
+            memory_limit_bytes: None,
+        }
+    }
 }
 
 /// What the audit trail can say about itself.

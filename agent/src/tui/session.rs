@@ -195,7 +195,20 @@ pub fn describe_status(status: &acp::GarrisonStatus) -> Vec<Line<'static>> {
         } else {
             "audit: not recording".to_string()
         }),
+        notice_line(describe_sandbox(&status.sandbox)),
     ]
+}
+
+/// One line on what stands between a tool call and the host.
+fn describe_sandbox(sandbox: &acp::SandboxStatus) -> String {
+    if !sandbox.enabled {
+        return "sandbox: off, writing tools run in the agent's process".to_string();
+    }
+
+    sandbox.hardening.as_ref().map_or_else(
+        || "sandbox: on".to_string(),
+        |hardening| format!("sandbox: on, hardening {hardening}"),
+    )
 }
 
 /// What a turn's ending is worth saying, if anything.
@@ -719,6 +732,12 @@ mod tests {
                 enabled: true,
                 chain_head: None,
             },
+            sandbox: acp::SandboxStatus {
+                enabled: true,
+                hardening: Some("enforce".to_string()),
+                timeout_secs: Some(120),
+                memory_limit_bytes: None,
+            },
         };
 
         let rendered: String = describe_status(&status)
@@ -729,5 +748,19 @@ mod tests {
 
         assert!(rendered.contains("every tool call is asked about"));
         assert!(rendered.contains("audit: recording"));
+        assert!(rendered.contains("sandbox: on, hardening enforce"));
+    }
+
+    #[test]
+    fn an_unsandboxed_agent_says_where_its_tools_actually_run() {
+        // Silence would read as "fine". Someone reviewing a deployment needs
+        // the absence of isolation stated, not merely unmentioned.
+        let rendered = describe_sandbox(&acp::SandboxStatus::disabled());
+
+        assert!(rendered.contains("off"), "got: {rendered}");
+        assert!(
+            rendered.contains("in the agent's process"),
+            "got: {rendered}"
+        );
     }
 }

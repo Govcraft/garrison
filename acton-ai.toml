@@ -1,11 +1,12 @@
 # acton-ai configuration for garrison-agent.
 #
-# The default provider is `groq` (fast hosted gpt-oss-120b); point
+# The default provider is `kimi` (Moonshot's kimi-k3, 1M context); point
 # default_provider at "claude"/"openai" for the frontier clouds or "ollama"
 # to run fully local. The cloud providers authenticate with keys stored by
-# `garrison-agent login <provider>`; the groq key file was placed by hand.
+# `garrison-agent login <provider>`; the kimi key file was placed by hand at
+# ~/.config/garrison/kimi-key, mode 0600.
 
-default_provider = "groq"
+default_provider = "kimi"
 
 [providers.claude]
 type = "anthropic"
@@ -24,21 +25,31 @@ max_tokens = 8192
 # Conservative; raise if the model's real window is larger.
 context_window_tokens = 200000
 
-[providers.groq]
-type = "groq"
-model = "openai/gpt-oss-120b"
-base_url = "https://api.groq.com/openai/v1"
-api_key_file = "~/.config/garrison/groq-key"
+# Moonshot's kimi-k3, spoken to over its OpenAI-compatible endpoint. The type
+# is not one acton-ai knows by name, which is deliberate: an unrecognized type
+# with a base_url is treated as OpenAI-compatible, and that is exactly what
+# this is.
+[providers.kimi]
+type = "kimi"
+model = "kimi-k3"
+base_url = "https://api.moonshot.ai/v1"
+api_key_file = "~/.config/garrison/kimi-key"
 timeout_secs = 600
-max_tokens = 8192
-context_window_tokens = 131072
+# Larger than the other providers' 8192 on purpose. K3 always reasons — the
+# thinking cannot be switched off, only dialed down — and its reasoning tokens
+# are billed and counted against this same completion budget. At 8192 a long
+# deliberation would eat the whole allowance and truncate the tool call it was
+# deliberating about.
+max_tokens = 32768
+context_window_tokens = 1000000
 
-# Groq's actual account limits (from its x-ratelimit headers). With these,
-# the local limiter queues requests until the window frees instead of
-# letting them fly until the server 429s a whole agentic turn to death.
-[providers.groq.rate_limit]
-requests_per_minute = 300
-tokens_per_minute = 250000
+# The account's cumulative top-up ($20) puts it in Moonshot's Tier 2 (500 RPM,
+# 3M TPM). These are Tier 1's numbers, held one tier low so the local limiter
+# queues rather than discovering the ceiling as a 429 mid-turn. Raise them
+# after topping up further; see platform.kimi.ai/docs/pricing/limits.
+[providers.kimi.rate_limit]
+requests_per_minute = 200
+tokens_per_minute = 2000000
 
 [providers.ollama]
 type = "ollama"
@@ -58,3 +69,15 @@ strategy = "keep-system-and-recent"
 
 [defaults]
 max_tool_rounds = 25
+
+# Tool calls that write — bash, write_file, edit_file — run in a re-exec'd
+# child of this binary rather than in the daemon's own process. `best-effort`
+# applies landlock and seccomp where the kernel offers them and warns where it
+# does not; a deployment that must not run unconfined sets `enforce`, which
+# refuses to start the child instead.
+[sandbox]
+hardening = "best-effort"
+
+[sandbox.limits]
+max_execution_ms = 120000
+max_memory_mb = 1024

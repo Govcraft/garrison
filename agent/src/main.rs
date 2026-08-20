@@ -178,8 +178,20 @@ fn log_path() -> Option<PathBuf> {
     Some(state.join("garrison").join("chat.log"))
 }
 
+/// The process entry point, which is deliberately not `#[tokio::main]`.
+///
+/// acton-ai's sandbox child re-execs this binary and dispatches its tool call
+/// on a current-thread runtime it builds itself. Building a runtime inside a
+/// runtime panics, so the check has to run before any runtime exists — which
+/// means before the attribute macro would have started one.
+fn main() -> ExitCode {
+    acton_ai::tools::sandbox::process::runner::run_if_sandbox_child();
+    serve_command_line()
+}
+
+/// Everything the agent does when it was not re-exec'd as a sandbox child.
 #[tokio::main]
-async fn main() -> ExitCode {
+async fn serve_command_line() -> ExitCode {
     let cli = Cli::parse();
     let logs = destination(&cli);
     let builder = tracing_subscriber::fmt().with_env_filter(
@@ -329,6 +341,18 @@ async fn ping(socket: Option<PathBuf>) -> Result<(), GarrisonError> {
         status.policy.auto_approve.join(", "),
     );
     println!("  audit:      {}", status.audit.enabled);
+    println!(
+        "  sandbox:    {}",
+        if status.sandbox.enabled {
+            status
+                .sandbox
+                .hardening
+                .as_deref()
+                .map_or_else(|| "on".to_string(), |mode| format!("on ({mode})"))
+        } else {
+            "off (tools run in-process)".to_string()
+        },
+    );
 
     Ok(())
 }

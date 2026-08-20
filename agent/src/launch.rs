@@ -15,7 +15,8 @@ use crate::approval::approval_hook;
 use crate::config::GarrisonConfig;
 use crate::error::GarrisonError;
 use crate::protocol::acp::{
-    AgentCapabilities, PromptCapabilities, SessionCapabilities, SessionListCapabilities,
+    AgentCapabilities, PromptCapabilities, SandboxStatus, SessionCapabilities,
+    SessionListCapabilities,
 };
 use crate::protocol::conn::ThreadDefaults;
 use crate::protocol::server::{self, ServerSetup};
@@ -24,6 +25,7 @@ use crate::router::TurnRouter;
 use crate::thread::ThreadSupervisor;
 use acton_ai::facade::ActonAI;
 use acton_ai::policy::ToolPolicy;
+use acton_ai::tools::sandbox::{HardeningMode, ProcessSandboxConfig};
 use acton_reactive::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -202,7 +204,35 @@ pub async fn build_setup(
         },
         capabilities: capabilities(),
         audited: ai.is_audited(),
+        sandbox: sandbox_status(ai.sandbox_config()),
     })
+}
+
+/// Describes the isolation in force, for `_garrison/status`.
+///
+/// The absent case is the one that matters: no configuration means writing
+/// tools run in this process, and the status says so plainly rather than
+/// omitting the subject.
+fn sandbox_status(config: Option<&ProcessSandboxConfig>) -> SandboxStatus {
+    let Some(config) = config else {
+        return SandboxStatus::disabled();
+    };
+
+    SandboxStatus {
+        enabled: true,
+        hardening: Some(hardening_name(config.hardening).to_string()),
+        timeout_secs: Some(config.timeout.as_secs()),
+        memory_limit_bytes: config.memory_limit,
+    }
+}
+
+/// The wire spelling of a hardening mode, matching the one TOML accepts.
+const fn hardening_name(mode: HardeningMode) -> &'static str {
+    match mode {
+        HardeningMode::Off => "off",
+        HardeningMode::BestEffort => "besteffort",
+        HardeningMode::Enforce => "enforce",
+    }
 }
 
 /// Starts every Garrison actor and returns the protocol server.
@@ -354,6 +384,50 @@ mod tests {
         api_key_preflight(&config).expect("a keyed provider must pass");
 
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn no_sandbox_configuration_is_reported_as_no_isolation() {
+        let status = sandbox_status(None);
+
+        assert!(!status.enabled);
+        assert!(
+            status.hardening.is_none(),
+            "there is no policy to name when nothing is confined"
+        );
+    }
+
+    #[test]
+    fn a_configured_sandbox_reports_the_terms_it_is_enforcing() {
+        let status = sandbox_status(Some(
+            &ProcessSandboxConfig::new()
+                .with_hardening(HardeningMode::Enforce)
+                .with_timeout(std::time::Duration::from_secs(90))
+                .with_memory_limit(Some(512 * 1024 * 1024)),
+        ));
+
+        assert!(status.enabled);
+        assert_eq!(status.hardening.as_deref(), Some("enforce"));
+        assert_eq!(status.timeout_secs, Some(90));
+        assert_eq!(status.memory_limit_bytes, Some(512 * 1024 * 1024));
+    }
+
+    #[test]
+    fn the_shipped_config_turns_the_sandbox_on() {
+        // The deployment artifact, not a fixture: a `[sandbox]` section that
+        // stopped parsing would silently leave tools running in-process.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../acton-ai.toml");
+        let config = acton_ai::config::from_path(std::path::Path::new(path))
+            .expect("the shipped acton-ai.toml must parse");
+
+        let sandbox = config
+            .sandbox
+            .expect("the shipped config configures a sandbox");
+        assert_eq!(
+            sandbox.hardening,
+            Some(HardeningMode::BestEffort),
+            "`best-effort` in TOML must resolve to the mode it names"
+        );
     }
 
     #[test]

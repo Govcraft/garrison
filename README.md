@@ -21,9 +21,12 @@ not part of this checkout yet.
 - A structural `apply_patch` tool with fuzzy context matching, atomic planning,
   and project-root safety checks.
 - Read-only LSP tools for diagnostics, hover, definitions, and references.
-- Anthropic, OpenAI, Groq, Ollama, and compatible endpoints through acton-ai.
+- Anthropic, OpenAI, Groq, Kimi, Ollama, and compatible endpoints through acton-ai.
 - An interactive terminal chat: streaming replies in the terminal's own
   scrollback, keystroke approvals, Esc to interrupt, and slash commands.
+- Process sandboxing for the tools that write: `bash`, `write_file`, and
+  `edit_file` run in a re-exec'd child with resource limits and, on Linux,
+  landlock and seccomp hardening, confined to the session's root.
 - Provider login/logout helpers and a `ping` smoke client.
 - acton-ai policy, accounting, audit, planning, context, MCP, and tool-loop
   primitives where enabled by configuration.
@@ -43,9 +46,8 @@ These components are not present in this repository today:
 Active tracking issues include
 [documentation alignment](https://github.com/Govcraft/garrison/issues/2),
 [session persistence](https://github.com/Govcraft/garrison/issues/3),
-[audit durability](https://github.com/Govcraft/garrison/issues/4),
-[filesystem boundaries](https://github.com/Govcraft/garrison/issues/5), and
-[sandbox integration](https://github.com/Govcraft/garrison/issues/6).
+[audit durability](https://github.com/Govcraft/garrison/issues/4), and
+[filesystem boundaries](https://github.com/Govcraft/garrison/issues/5).
 
 ## Current architecture
 
@@ -70,7 +72,7 @@ architecture in [docs/garrison-agent-design.md](docs/garrison-agent-design.md).
 | `agent/` | Implemented | `garrison-agent` Rust library, daemon, ACP client, tools, and tests |
 | `docs/` | Implemented | Architecture and design notes |
 | `garrison.toml` | Implemented | Server, approval, thread, and LSP configuration |
-| `acton-ai.toml` | Implemented | Provider, context, and acton-ai runtime configuration |
+| `acton-ai.toml` | Implemented | Provider, context, sandbox, and acton-ai runtime configuration |
 | `Taskfile.yml` | Implemented | Tasks that operate on this checkout |
 | `schemas/`, `policies/`, `hooks-service/`, `site/` | Planned | Control-plane services and policy assets |
 | `extensions/` | Planned | VS Code and JetBrains clients |

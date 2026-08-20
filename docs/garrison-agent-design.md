@@ -63,9 +63,13 @@ axis from filesystem approval. Approval modes: `untrusted | on-failure |
 on-request | never | granular`, with per-session **approved-prefix caching**
 ("remember this approval": `approved_command_prefix_saved.rs`).
 
-→ **Partially available upstream, integration planned:** acton-ai provides an
-opt-in `ProcessSandbox`, but Garrison does not currently enable it or dispatch
-the required sandbox-child entry point. The escalation *flow* (sandboxed fail
+→ **Sandboxing implemented, escalation planned:** Garrison enables acton-ai's
+`ProcessSandbox` from `[sandbox]` in `acton-ai.toml` and dispatches the
+sandbox-child entry point as the first operation in `main`, so `bash`,
+`write_file`, and `edit_file` run in a re-exec'd child under resource limits
+and, on Linux, landlock and seccomp. The child is confined to the session's
+root, which travels with each call. `_garrison/status` reports whether
+isolation and hardening are in force. The escalation *flow* (sandboxed fail
 → approval round-trip → unsandboxed retry,
 recorded in the audit chain as an escalation) is new prompt-loop behavior.
 Approved-prefix caching lives in per-turn policy state. This maps 1:1 onto
@@ -215,8 +219,8 @@ client identity.
 
 1. ~~**ACP server over stdio and Unix sockets**~~ — implemented
 2. ~~**apply_patch + safety assessment**~~ — implemented
-3. **Harden the implemented boundary:** enable sandboxing, validate ACP roots,
-   and align every builtin with the session filesystem boundary
+3. **Harden the implemented boundary:** validate ACP roots and align every
+   builtin with the session filesystem boundary
 4. **execpolicy + canonicalization + escalation flow** (demo criterion:
    "enterprise policy-control functionality, and agentic capability scope")
 5. **Turn diff tracker + repo context** (Tier B review gate artifact)
