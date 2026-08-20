@@ -28,6 +28,58 @@ use std::path::Path;
 use tokio::io::{AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 use tokio::net::UnixStream;
 
+/// Builds the wire line for one outgoing request.
+///
+/// Pure: the caller decides when it reaches the socket.
+///
+/// # Errors
+///
+/// A `params` value that will not serialize.
+pub(crate) fn request_line(
+    id: RequestId,
+    method: &str,
+    params: &impl Serialize,
+) -> Result<String, GarrisonError> {
+    let params = serde_json::to_value(params).map_err(|error| {
+        GarrisonError::transport(method, format!("unserializable params: {error}"))
+    })?;
+    to_line(&OutgoingRequest::new(id, method, params))
+        .map_err(|error| GarrisonError::transport(method, format!("unserializable: {error}")))
+}
+
+/// Builds the wire line for one outgoing notification.
+///
+/// # Errors
+///
+/// A `params` value that will not serialize.
+pub(crate) fn notification_line(
+    method: &str,
+    params: &impl Serialize,
+) -> Result<String, GarrisonError> {
+    let params = serde_json::to_value(params).map_err(|error| {
+        GarrisonError::transport(method, format!("unserializable params: {error}"))
+    })?;
+    to_line(&jsonrpc::OutgoingNotification::new(method, params))
+        .map_err(|error| GarrisonError::transport(method, format!("unserializable: {error}")))
+}
+
+/// Builds the wire line answering one agent-initiated request.
+///
+/// # Errors
+///
+/// A `result` value that will not serialize.
+pub(crate) fn response_line(
+    context: &str,
+    id: RequestId,
+    outcome: Result<serde_json::Value, ErrorObject>,
+) -> Result<String, GarrisonError> {
+    match outcome {
+        Ok(result) => to_line(&SuccessResponse::new(id, result)),
+        Err(error) => to_line(&jsonrpc::ErrorResponse::new(Some(id), error)),
+    }
+    .map_err(|error| GarrisonError::transport(context, error.to_string()))
+}
+
 /// How a client reacts to what the agent sends it unprompted.
 pub trait Interactions {
     /// Called for every `session/update` notification.
@@ -119,13 +171,7 @@ impl AgentClient {
         let id = RequestId::Number(self.next_id);
         self.next_id += 1;
 
-        let params = serde_json::to_value(params).map_err(|error| {
-            GarrisonError::transport(method, format!("unserializable params: {error}"))
-        })?;
-        let line = to_line(&OutgoingRequest::new(id.clone(), method, params)).map_err(|error| {
-            GarrisonError::transport(method, format!("unserializable: {error}"))
-        })?;
-
+        let line = request_line(id.clone(), method, params)?;
         self.write_line(method, line).await?;
         Ok(id)
     }
@@ -140,14 +186,7 @@ impl AgentClient {
         method: &str,
         params: &P,
     ) -> Result<(), GarrisonError> {
-        let params = serde_json::to_value(params).map_err(|error| {
-            GarrisonError::transport(method, format!("unserializable params: {error}"))
-        })?;
-        let line =
-            to_line(&jsonrpc::OutgoingNotification::new(method, params)).map_err(|error| {
-                GarrisonError::transport(method, format!("unserializable: {error}"))
-            })?;
-
+        let line = notification_line(method, params)?;
         self.write_line(method, line).await
     }
 
@@ -235,11 +274,12 @@ impl AgentClient {
         params: Option<serde_json::Value>,
     ) -> Result<(), GarrisonError> {
         if method != acp::method::SESSION_REQUEST_PERMISSION {
-            let line = to_line(&jsonrpc::ErrorResponse::new(
-                Some(id),
-                ErrorObject::method_not_found().data(serde_json::Value::String(method.to_string())),
-            ))
-            .map_err(|error| GarrisonError::transport(method, error.to_string()))?;
+            let line = response_line(
+                method,
+                id,
+                Err(ErrorObject::method_not_found()
+                    .data(serde_json::Value::String(method.to_string()))),
+            )?;
             return self.write_line(method, line).await;
         }
 
@@ -251,8 +291,7 @@ impl AgentClient {
         let outcome = interactions.permission(&request);
         let response = serde_json::to_value(acp::RequestPermissionResponse::new(outcome))
             .map_err(|error| GarrisonError::transport(method, error.to_string()))?;
-        let line = to_line(&SuccessResponse::new(id, response))
-            .map_err(|error| GarrisonError::transport(method, error.to_string()))?;
+        let line = response_line(method, id, Ok(response))?;
 
         self.write_line(method, line).await
     }

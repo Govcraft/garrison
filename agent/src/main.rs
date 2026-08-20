@@ -93,14 +93,18 @@ enum Command {
         #[arg(value_enum)]
         provider: ProviderArg,
     },
-    /// Runs one session against a running daemon.
+    /// Talks to a running daemon.
     Chat {
         /// The socket to connect to.
         #[arg(long)]
         socket: Option<PathBuf>,
-        /// What to say. Required; this is a smoke client, not a REPL.
+        /// Say one thing, print the answer, and exit.
+        ///
+        /// Without it the chat is interactive. With it there is no terminal to
+        /// approve anything at, so a session that would need a permission
+        /// wants `--approve-all` as well.
         #[arg(long)]
-        message: String,
+        message: Option<String>,
         /// Approve every tool call without asking at the terminal.
         #[arg(long)]
         approve_all: bool,
@@ -128,19 +132,68 @@ impl From<ProviderArg> for garrison_agent::auth::Provider {
     }
 }
 
+/// Where this invocation's log lines go.
+enum Logs {
+    /// The usual place. Never stdout: stdout is the protocol in `acp` mode.
+    Stderr,
+    /// A file, because something else owns the screen.
+    File(std::sync::Arc<std::fs::File>),
+    /// Nowhere, because something else owns the screen and no file opened.
+    Nowhere,
+}
+
+/// Decides where logs may be written without wrecking anything.
+///
+/// The interactive chat paints a pinned viewport with escape sequences and
+/// tracks where the cursor is. A log line arriving on stderr in the middle of
+/// that does not merely look untidy: it scrolls the screen out from under the
+/// viewport. So while the chat owns the terminal, logs go to a file, and if no
+/// file can be opened they go nowhere at all.
+fn destination(cli: &Cli) -> Logs {
+    if !matches!(cli.command, Command::Chat { message: None, .. }) {
+        return Logs::Stderr;
+    }
+
+    match log_path().and_then(|path| {
+        std::fs::create_dir_all(path.parent()?).ok()?;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+    }) {
+        Some(file) => Logs::File(std::sync::Arc::new(file)),
+        None => Logs::Nowhere,
+    }
+}
+
+/// The chat's log file: `$XDG_STATE_HOME/garrison/chat.log`, or under `~`.
+fn log_path() -> Option<PathBuf> {
+    let state = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("state"))
+        })?;
+
+    Some(state.join("garrison").join("chat.log"))
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
-    // stderr, always: stdout is the protocol in `acp` mode, and a log line
-    // written into it would be a malformed frame.
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    let cli = Cli::parse();
+    let logs = destination(&cli);
+    let builder = tracing_subscriber::fmt().with_env_filter(
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+    );
 
-    match run(Cli::parse()).await {
+    match logs {
+        Logs::Stderr => builder.with_writer(std::io::stderr).init(),
+        Logs::File(file) => builder.with_ansi(false).with_writer(file).init(),
+        Logs::Nowhere => builder.with_writer(std::io::sink).init(),
+    }
+
+    match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("garrison-agent: {error}");
@@ -360,10 +413,16 @@ fn ask_terminal(request: &acp::RequestPermissionRequest) -> &'static str {
 /// `chat`: one session, one turn, rendered as it happens.
 async fn chat(
     socket: Option<PathBuf>,
-    message: String,
+    message: Option<String>,
     approve_all: bool,
 ) -> Result<(), GarrisonError> {
     let path = client_socket(socket)?;
+    let Some(message) = message else {
+        let cwd = std::env::current_dir()
+            .map_err(|error| GarrisonError::runtime(format!("no working directory: {error}")))?;
+        return garrison_agent::tui::run(&path, cwd, approve_all).await;
+    };
+
     let mut client = AgentClient::connect(&path).await?;
     client.initialize("garrison-agent chat").await?;
 
