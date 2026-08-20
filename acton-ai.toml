@@ -1,9 +1,9 @@
 # acton-ai configuration for garrison-agent.
 #
-# The default provider is `claude`, which authenticates with the API key
-# stored by `garrison-agent login`. Set `default_provider = "ollama"` to run
-# fully local instead; swap `model` for any tool-calling model `ollama list`
-# shows.
+# The default provider is `claude`; point default_provider at "openai" to
+# use GPT models, or at "ollama" to run fully local. The cloud providers
+# authenticate with keys stored by `garrison-agent login <provider>`; swap
+# the ollama `model` for any tool-calling model `ollama list` shows.
 
 default_provider = "claude"
 
@@ -13,6 +13,15 @@ model = "claude-sonnet-5"
 api_key_file = "~/.config/garrison/anthropic-key"
 timeout_secs = 600
 max_tokens = 8192
+context_window_tokens = 200000
+
+[providers.openai]
+type = "openai"
+model = "gpt-5.6-terra"
+api_key_file = "~/.config/garrison/openai-key"
+timeout_secs = 600
+max_tokens = 8192
+# Conservative; raise if the model's real window is larger.
 context_window_tokens = 200000
 
 [providers.ollama]

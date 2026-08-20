@@ -9,13 +9,16 @@ repository.workspace = true
 acton-ai = { version = "0.33.0", path = "../../acton-ai" }
 acton-reactive = "9.1.0"
 agent-client-protocol-schema = "1.6.0"
+base64 = "0.23.1"
 clap = { version = "4.6.6", features = ["derive"] }
+getrandom = "0.4.3"
 lsp-types = "0.97.0"
 mti = "1.1.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rpassword = "7.5.4"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+sha2 = "0.11.0"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process"] }
 tokio-util = "0.7.19"
 toml = "1.1.4"

@@ -70,19 +70,29 @@ enum Command {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
-    /// Stores an Anthropic API key so the `claude` provider can run.
+    /// Signs in to a model provider and stores its API key.
     ///
-    /// Anthropic reserves Claude.ai subscription OAuth for Claude Code, so
-    /// this signs in the sanctioned way: a Console API key, validated
-    /// against the live API and stored owner-readable.
+    /// `openai` runs an OAuth sign-in in the browser with the OpenAI
+    /// account and mints a platform API key; `anthropic` walks through
+    /// pasting a Console key, because Anthropic reserves subscription
+    /// OAuth for Claude Code itself. Either way the key is validated
+    /// against the live API and stored under ~/.config/garrison/ with
+    /// mode 0600.
     Login {
-        /// Read the key from standard input instead of prompting.
-        /// Made for `rbw get anthropic | garrison-agent login --key-stdin`.
+        /// Which provider to sign in to.
+        #[arg(value_enum)]
+        provider: ProviderArg,
+        /// Read an API key from standard input instead of the normal flow.
+        /// Made for `rbw get openai | garrison-agent login openai --key-stdin`.
         #[arg(long)]
         key_stdin: bool,
     },
-    /// Removes the stored Anthropic API key.
-    Logout,
+    /// Removes a provider's stored API key.
+    Logout {
+        /// Which provider's key to remove.
+        #[arg(value_enum)]
+        provider: ProviderArg,
+    },
     /// Runs one session against a running daemon.
     Chat {
         /// The socket to connect to.
@@ -95,6 +105,24 @@ enum Command {
         #[arg(long)]
         approve_all: bool,
     },
+}
+
+/// Which cloud provider a login or logout addresses.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum ProviderArg {
+    /// Anthropic (Claude models): paste a Console API key.
+    Anthropic,
+    /// OpenAI (GPT models): OAuth sign-in in the browser.
+    Openai,
+}
+
+impl From<ProviderArg> for garrison_agent::auth::Provider {
+    fn from(arg: ProviderArg) -> Self {
+        match arg {
+            ProviderArg::Anthropic => Self::Anthropic,
+            ProviderArg::Openai => Self::OpenAI,
+        }
+    }
 }
 
 #[tokio::main]
@@ -137,8 +165,11 @@ async fn run(cli: Cli) -> Result<(), GarrisonError> {
             acton_config,
         } => serve(socket, config, acton_config).await,
         Command::Ping { socket } => ping(socket).await,
-        Command::Login { key_stdin } => garrison_agent::auth::login(key_stdin).await,
-        Command::Logout => garrison_agent::auth::logout(),
+        Command::Login {
+            provider,
+            key_stdin,
+        } => garrison_agent::auth::login(provider.into(), key_stdin).await,
+        Command::Logout { provider } => garrison_agent::auth::logout(provider.into()),
         Command::Chat {
             socket,
             message,
