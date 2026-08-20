@@ -324,6 +324,105 @@ async fn a_session_cannot_be_opened_before_the_handshake() {
 }
 
 // =============================================================================
+// The session boundary
+// =============================================================================
+
+#[tokio::test]
+async fn a_session_rooted_outside_the_approved_tree_is_refused() {
+    // The whole point of a configured root: a client cannot pick the host's
+    // filesystem and get a session pointed at it.
+    let approved = TempRoot::new("boundary-approved");
+    let elsewhere = TempRoot::new("boundary-elsewhere");
+    let server = MockServer::start(Vec::new()).await;
+    let (agent, mut client) = connect(
+        server.base_url(),
+        &rooted_config(300, approved.path.clone()),
+    )
+    .await;
+
+    client
+        .initialize("integration-test")
+        .await
+        .expect("the handshake must succeed");
+
+    let refusal = client
+        .new_session(elsewhere.path.clone())
+        .await
+        .expect_err("a root outside the approved tree must be refused");
+
+    assert!(
+        refusal.to_string().contains("outside the approved roots"),
+        "the refusal should name the boundary, got: {refusal}"
+    );
+
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_session_rooted_under_the_approved_root_is_accepted() {
+    let approved = TempRoot::new("boundary-nested");
+    let nested = approved.path.join("workspace");
+    std::fs::create_dir_all(&nested).expect("the nested root must be creatable");
+    let server = MockServer::start(Vec::new()).await;
+    let (agent, mut client) = connect(
+        server.base_url(),
+        &rooted_config(300, approved.path.clone()),
+    )
+    .await;
+
+    let session_id = open_session_at(&mut client, nested).await;
+    assert!(!session_id.to_string().is_empty());
+
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn traversal_out_of_the_approved_root_is_refused() {
+    let approved = TempRoot::new("boundary-traversal");
+    let nested = approved.path.join("workspace");
+    std::fs::create_dir_all(&nested).expect("the nested root must be creatable");
+    let server = MockServer::start(Vec::new()).await;
+    let (agent, mut client) = connect(
+        server.base_url(),
+        &rooted_config(300, approved.path.clone()),
+    )
+    .await;
+
+    client
+        .initialize("integration-test")
+        .await
+        .expect("the handshake must succeed");
+
+    let refusal = client
+        .new_session(nested.join("..").join(".."))
+        .await
+        .expect_err("`..` must be resolved before the boundary is checked");
+
+    assert!(
+        refusal.to_string().contains("outside the approved roots"),
+        "got: {refusal}"
+    );
+
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_second_workspace_is_reachable_only_once_an_administrator_approves_it() {
+    let approved = TempRoot::new("boundary-primary");
+    let second = TempRoot::new("boundary-second");
+    let server = MockServer::start(Vec::new()).await;
+
+    let mut config = rooted_config(300, approved.path.clone());
+    config.threads.workspace_roots = vec![second.path.clone()];
+    let (agent, mut client) = connect(server.base_url(), &config).await;
+
+    let session_id = open_session_at(&mut client, second.path.clone()).await;
+    assert!(!session_id.to_string().is_empty());
+
+    agent.shutdown().await;
+}
+
+// =============================================================================
 // A plain turn
 // =============================================================================
 

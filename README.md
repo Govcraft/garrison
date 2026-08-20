@@ -20,6 +20,10 @@ not part of this checkout yet.
 - Human approval round-trips, timeouts, and per-connection approval caching.
 - A structural `apply_patch` tool with fuzzy context matching, atomic planning,
   and project-root safety checks.
+- One canonical filesystem boundary per session: a client's `cwd` is resolved
+  through symlinks and `..` and must land inside a root the administrator
+  approved, and every filesystem tool a turn registers is built for that root
+  and no other directory.
 - Read-only LSP tools for diagnostics, hover, definitions, and references.
 - Anthropic, OpenAI, Groq, Kimi, Ollama, and compatible endpoints through acton-ai.
 - An interactive terminal chat: streaming replies in the terminal's own
@@ -40,14 +44,13 @@ These components are not present in this repository today:
 - VS Code and JetBrains extensions.
 - Hooks service and federal-ui administration site.
 - Infrastructure, SIEM integration, and compliance document sets.
-- Command-prefix policy, sandbox escalation, turn diffs, repository context,
+- Command-prefix policy, turn diffs, repository context,
   project-instruction discovery, persistent PTYs, and Bitbucket review mode.
 
 Active tracking issues include
 [documentation alignment](https://github.com/Govcraft/garrison/issues/2),
-[session persistence](https://github.com/Govcraft/garrison/issues/3),
-[audit durability](https://github.com/Govcraft/garrison/issues/4), and
-[filesystem boundaries](https://github.com/Govcraft/garrison/issues/5).
+[session persistence](https://github.com/Govcraft/garrison/issues/3), and
+[audit durability](https://github.com/Govcraft/garrison/issues/4).
 
 ## Current architecture
 

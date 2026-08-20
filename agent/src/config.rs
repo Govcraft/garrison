@@ -54,6 +54,13 @@ pub struct ThreadConfig {
     /// `None` means the server's working directory, resolved at launch rather
     /// than baked into the file, so the same config works from any checkout.
     pub project_root: Option<PathBuf>,
+    /// Further directories a client may root a session at.
+    ///
+    /// A session's `cwd` must equal, or lie under, `project_root` or one of
+    /// these; anything else is refused. Listing a workspace here is how an
+    /// administrator grants access to it, which is why the default is empty:
+    /// one server, one tree, unless someone says otherwise.
+    pub workspace_roots: Vec<PathBuf>,
     /// A system prompt prepended to every turn.
     pub system_prompt: Option<String>,
 }

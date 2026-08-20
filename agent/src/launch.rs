@@ -73,9 +73,14 @@ impl Garrison {
 /// configured — an agent with nothing to think with is a misconfiguration, not
 /// a server to start.
 pub async fn build_ai(acton_config: Option<&Path>) -> Result<ActonAI, GarrisonError> {
+    // Builtins are registered per turn rather than automatically, because a
+    // turn knows something the runtime does not: which session it belongs to,
+    // and therefore which directory its tools may touch. See
+    // `thread::run_turn`.
     let mut builder = ActonAI::builder()
         .app_name("garrison-agent")
-        .with_builtins();
+        .with_builtins()
+        .manual_builtins();
 
     builder = match acton_config {
         Some(path) => builder.from_config_file(path).map_err(|error| {
@@ -181,11 +186,26 @@ pub async fn build_setup(
     let router = TurnRouter::spawn(&mut runtime).await;
     let supervisor = ThreadSupervisor::spawn(&mut runtime).await;
 
-    let project_root = match &config.threads.project_root {
+    let configured = match &config.threads.project_root {
         Some(root) => root.clone(),
         None => std::env::current_dir()
             .map_err(|error| GarrisonError::runtime(format!("no working directory: {error}")))?,
     };
+
+    // Canonical from here on. Everything downstream — the session boundary,
+    // the patch tool, the language servers, the builtins a turn registers —
+    // compares against this one resolved path, so there is no spelling of a
+    // directory that is inside for one tool and outside for another.
+    let project_root = configured.canonicalize().map_err(|error| {
+        GarrisonError::runtime(format!(
+            "project root '{}' cannot be resolved: {error}",
+            configured.display()
+        ))
+    })?;
+
+    let mut roots = vec![project_root.clone()];
+    roots.extend(config.threads.workspace_roots.iter().cloned());
+    let approved_roots = Arc::new(crate::boundary::approve(&roots));
 
     // Eager, so rust-analyzer indexes while the first prompt is still being
     // written; a server that fails to spawn is a warning inside, not an error.
@@ -197,6 +217,7 @@ pub async fn build_setup(
         router,
         defaults: ThreadDefaults {
             project_root,
+            approved_roots,
             system_prompt: config.threads.system_prompt.clone(),
             approval_timeout: config.approval_timeout(),
             auto_approve: Arc::new(config.approval.auto_approve.clone()),

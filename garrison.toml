@@ -1,7 +1,11 @@
 # Garrison server configuration — local development.
 
 [threads]
-# project_root defaults to the working directory the server starts in.
+# project_root defaults to the working directory the server starts in. It is
+# the boundary, not a default: a client asking for a session anywhere else is
+# refused, and every tool a turn registers can reach that tree and nothing
+# else. List further trees in workspace_roots to approve them too.
+# workspace_roots = ["/srv/projects/other"]
 system_prompt = "You are Garrison, a governed coding agent. Work inside the project root. Read before you write, prefer small verifiable steps, and explain what you changed."
 
 [approval]

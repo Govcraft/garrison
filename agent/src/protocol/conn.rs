@@ -66,7 +66,7 @@ use acton_ai::facade::ActonAI;
 use acton_reactive::prelude::*;
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -75,6 +75,11 @@ use std::time::Duration;
 pub struct ThreadDefaults {
     /// The root a session is confined to unless the client names another.
     pub project_root: PathBuf,
+    /// Every directory a client may root a session at, canonicalized.
+    ///
+    /// Includes `project_root`. A `session/new` naming anything outside these
+    /// is refused rather than honoured.
+    pub approved_roots: Arc<Vec<PathBuf>>,
     /// The system prompt a session uses unless the server was configured
     /// otherwise.
     pub system_prompt: Option<String>,
@@ -91,6 +96,7 @@ impl Default for ThreadDefaults {
     fn default() -> Self {
         Self {
             project_root: PathBuf::from("."),
+            approved_roots: Arc::new(Vec::new()),
             system_prompt: None,
             approval_timeout: Duration::from_secs(300),
             auto_approve: Arc::new(Vec::new()),
@@ -729,6 +735,7 @@ async fn initialize(context: &Dispatch, raw: Option<Value>) -> Result<Value, Err
 /// `session/new`: open a session this client holds.
 async fn session_new(context: &Dispatch, raw: Option<Value>) -> Result<Value, ErrorObject> {
     let request: acp::NewSessionRequest = params(raw)?;
+    let project_root = project_root(context, &request.cwd)?;
     let thread_id = ThreadId::new();
 
     let setup = ThreadSetup {
@@ -738,7 +745,7 @@ async fn session_new(context: &Dispatch, raw: Option<Value>) -> Result<Value, Er
         conn: context.conn.clone(),
         runtime: context.setup.runtime.clone(),
         router: context.setup.router.clone(),
-        project_root: Arc::new(project_root(context, request.cwd)),
+        project_root: Arc::new(project_root),
         system_prompt: context.setup.defaults.system_prompt.clone(),
         approval_timeout: context.setup.defaults.approval_timeout,
         auto_approve: Arc::clone(&context.setup.defaults.auto_approve),
@@ -766,20 +773,33 @@ async fn session_new(context: &Dispatch, raw: Option<Value>) -> Result<Value, Er
     )))
 }
 
-/// Resolves the directory a session is rooted at.
+/// Resolves the directory a session is rooted at, or refuses to open it.
 ///
-/// ACP requires an absolute `cwd`; a relative one is taken as a client bug
-/// worth tolerating rather than a request worth refusing, and falls back to the
-/// server's configured root so the session cannot silently escape it.
-fn project_root(context: &Dispatch, cwd: PathBuf) -> PathBuf {
-    if cwd.is_absolute() {
-        return cwd;
-    }
-    tracing::warn!(
-        cwd = %cwd.display(),
-        "client sent a relative cwd; using the configured project root",
-    );
-    context.setup.defaults.project_root.clone()
+/// The client names a directory; the administrator decides which directories
+/// may be named. A `cwd` that resolves outside every approved root is not
+/// quietly replaced with the default — that would give the client a session it
+/// did not ask for, pointed somewhere it did not expect — it is refused, and
+/// the refusal says which boundary it fell outside.
+///
+/// # Errors
+///
+/// [`ErrorCode::InvalidParams`](acp::ErrorCode) naming what was wrong with the
+/// requested root.
+fn project_root(context: &Dispatch, cwd: &Path) -> Result<PathBuf, ErrorObject> {
+    let defaults = &context.setup.defaults;
+
+    crate::boundary::resolve(cwd, &defaults.project_root, &defaults.approved_roots).map_err(
+        |rejection| {
+            tracing::warn!(
+                cwd = %cwd.display(),
+                rejection = %rejection,
+                "refused a session root",
+            );
+            ErrorObject::invalid_params().data(Value::String(format!(
+                "cannot open a session there: {rejection}"
+            )))
+        },
+    )
 }
 
 /// `session/load`: re-point an existing session's events at this connection

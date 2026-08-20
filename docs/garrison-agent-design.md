@@ -219,8 +219,8 @@ client identity.
 
 1. ~~**ACP server over stdio and Unix sockets**~~ — implemented
 2. ~~**apply_patch + safety assessment**~~ — implemented
-3. **Harden the implemented boundary:** validate ACP roots and align every
-   builtin with the session filesystem boundary
+3. ~~**Harden the implemented boundary:** enable sandboxing, validate ACP roots,
+   and align every builtin with the session filesystem boundary~~ — implemented
 4. **execpolicy + canonicalization + escalation flow** (demo criterion:
    "enterprise policy-control functionality, and agentic capability scope")
 5. **Turn diff tracker + repo context** (Tier B review gate artifact)

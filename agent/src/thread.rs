@@ -522,6 +522,12 @@ async fn drive_turn(
     if let Some(system) = &setup.system_prompt {
         builder = builder.system(system.clone());
     }
+    // Every filesystem-capable builtin is built for this session's root and
+    // no other directory: not the daemon's working directory, not `/tmp`. It
+    // is the same boundary `apply_patch` and the language servers below are
+    // held to, which is the whole point of scoping it here rather than once
+    // at launch.
+    builder = builder.use_builtins_in(setup.project_root.as_ref());
     // Registered per prompt because acton-ai has no runtime-wide registration
     // for a downstream tool. Garrison builds every turn's prompt itself, so
     // "per prompt" and "always" are the same thing here.

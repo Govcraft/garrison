@@ -2,6 +2,7 @@
 
 pub mod approval;
 pub mod auth;
+pub mod boundary;
 pub mod client;
 pub mod config;
 pub mod duplex;
