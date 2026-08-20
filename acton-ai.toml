@@ -1,5 +1,19 @@
-# acton-ai configuration for garrison-agent — local Ollama development.
-# Swap `model` for any tool-calling model `ollama list` shows.
+# acton-ai configuration for garrison-agent.
+#
+# The default provider is `claude`, which authenticates with the API key
+# stored by `garrison-agent login`. Set `default_provider = "ollama"` to run
+# fully local instead; swap `model` for any tool-calling model `ollama list`
+# shows.
+
+default_provider = "claude"
+
+[providers.claude]
+type = "anthropic"
+model = "claude-sonnet-5"
+api_key_file = "~/.config/garrison/anthropic-key"
+timeout_secs = 600
+max_tokens = 8192
+context_window_tokens = 200000
 
 [providers.ollama]
 type = "ollama"

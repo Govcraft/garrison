@@ -70,6 +70,19 @@ enum Command {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
+    /// Stores an Anthropic API key so the `claude` provider can run.
+    ///
+    /// Anthropic reserves Claude.ai subscription OAuth for Claude Code, so
+    /// this signs in the sanctioned way: a Console API key, validated
+    /// against the live API and stored owner-readable.
+    Login {
+        /// Read the key from standard input instead of prompting.
+        /// Made for `rbw get anthropic | garrison-agent login --key-stdin`.
+        #[arg(long)]
+        key_stdin: bool,
+    },
+    /// Removes the stored Anthropic API key.
+    Logout,
     /// Runs one session against a running daemon.
     Chat {
         /// The socket to connect to.
@@ -124,6 +137,8 @@ async fn run(cli: Cli) -> Result<(), GarrisonError> {
             acton_config,
         } => serve(socket, config, acton_config).await,
         Command::Ping { socket } => ping(socket).await,
+        Command::Login { key_stdin } => garrison_agent::auth::login(key_stdin).await,
+        Command::Logout => garrison_agent::auth::logout(),
         Command::Chat {
             socket,
             message,

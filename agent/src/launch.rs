@@ -84,6 +84,17 @@ pub async fn build_ai(acton_config: Option<&Path>) -> Result<ActonAI, GarrisonEr
             .map_err(|error| GarrisonError::configuration("acton-ai.toml", error.to_string()))?,
     };
 
+    // Fail now, with the fix in the message, rather than 401 on the first
+    // prompt: a cloud provider selected as the default but holding no key is
+    // a setup gap, and the setup command is `garrison-agent login`.
+    let file_config = match acton_config {
+        Some(path) => acton_ai::config::from_path(path).ok(),
+        None => acton_ai::config::load().ok(),
+    };
+    if let Some(config) = file_config {
+        api_key_preflight(&config)?;
+    }
+
     // A policy with a hook and no rules: every call reaches the hook, and the
     // hook decides whether it needs a human. Rules arrive with the prefix-rule
     // engine; until then the decision belongs entirely to Garrison's callback.
@@ -101,6 +112,36 @@ pub async fn build_ai(acton_config: Option<&Path>) -> Result<ActonAI, GarrisonEr
     }
 
     Ok(ai)
+}
+
+/// Refuses to launch when the default provider needs an API key it lacks.
+///
+/// Only the *default* provider is checked: a configured-but-keyless
+/// alternate is dormant, not broken.
+fn api_key_preflight(config: &acton_ai::config::ActonAIConfig) -> Result<(), GarrisonError> {
+    let name = match &config.default_provider {
+        Some(name) => name.clone(),
+        None if config.providers.len() == 1 => {
+            config.providers.keys().next().cloned().unwrap_or_default()
+        }
+        None => return Ok(()),
+    };
+    let Some(provider) = config.providers.get(&name) else {
+        return Ok(());
+    };
+    let needs_key = matches!(
+        provider.provider_type.to_lowercase().as_str(),
+        "anthropic" | "openai"
+    );
+    if needs_key && provider.resolve_api_key().is_empty() {
+        return Err(GarrisonError::configuration(
+            format!("providers.{name}"),
+            "no API key found; run `garrison-agent login` (Anthropic) or set the \
+             provider's api_key_env / api_key_file, or point default_provider \
+             at a local provider",
+        ));
+    }
+    Ok(())
 }
 
 /// Spawns the router and the thread supervisor, and assembles what a
@@ -248,5 +289,82 @@ mod tests {
         assert!(!advertised.prompt_capabilities.audio);
         assert!(!advertised.prompt_capabilities.embedded_context);
         assert!(advertised.session_capabilities.list.is_some());
+    }
+
+    fn ai_config(toml: &str) -> acton_ai::config::ActonAIConfig {
+        acton_ai::config::from_str(toml).expect("test config must parse")
+    }
+
+    #[test]
+    fn a_keyless_default_cloud_provider_is_refused_with_the_fix() {
+        let config = ai_config(
+            r#"
+            default_provider = "claude"
+
+            [providers.claude]
+            type = "anthropic"
+            model = "claude-sonnet-5"
+            api_key_file = "/nonexistent/garrison-test-key"
+
+            [providers.ollama]
+            type = "ollama"
+            model = "qwen3.8"
+            "#,
+        );
+
+        let error = api_key_preflight(&config).expect_err("must refuse");
+        assert!(error.is_configuration());
+        assert!(error.to_string().contains("garrison-agent login"));
+    }
+
+    #[test]
+    fn a_keyless_cloud_provider_that_is_not_the_default_is_dormant() {
+        let config = ai_config(
+            r#"
+            default_provider = "ollama"
+
+            [providers.claude]
+            type = "anthropic"
+            model = "claude-sonnet-5"
+            api_key_file = "/nonexistent/garrison-test-key"
+
+            [providers.ollama]
+            type = "ollama"
+            model = "qwen3.8"
+            "#,
+        );
+
+        api_key_preflight(&config).expect("a local default must pass");
+    }
+
+    #[test]
+    fn a_default_cloud_provider_with_a_key_file_passes() {
+        let path = std::env::temp_dir().join("garrison-preflight-key-test");
+        std::fs::write(&path, "sk-ant-test\n").unwrap();
+
+        let config = ai_config(&format!(
+            r#"
+            [providers.claude]
+            type = "anthropic"
+            model = "claude-sonnet-5"
+            api_key_file = "{}"
+            "#,
+            path.display()
+        ));
+        api_key_preflight(&config).expect("a keyed provider must pass");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_sole_local_provider_needs_no_key() {
+        let config = ai_config(
+            r#"
+            [providers.ollama]
+            type = "ollama"
+            model = "qwen3.8"
+            "#,
+        );
+        api_key_preflight(&config).expect("local providers need no key");
     }
 }
