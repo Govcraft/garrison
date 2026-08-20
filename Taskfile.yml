@@ -1,52 +1,46 @@
 version: '3'
 
-# Local dev runner for the Garrison stack, mirroring the Meridian layout.
-#
-# Four long-lived processes make up "garrison running locally":
-#
-#   1. schemaforge backend   — control plane REST API + Cedar/PASETO (FORGE_PORT, 3000)
-#   2. hooks-service (Rust)  — gRPC lifecycle hooks on :9091
-#   3. Vite dev server       — site/ admin console, /api/v1/forge proxied to backend
-#   4. garrison-agent        — acton-ai daemon from agent/, IPC socket for IDE extensions
-#
-# Dev database: the shared Govcraft pg-dev container on penny-pi (see the
-# Meridian Taskfile for connection details). Database `garrison_dev`,
-# role `garrison_dev`. Override DEV_DB_URL in .env if needed.
-
-dotenv: ['.env']
-
-vars:
-  FORGE_PORT: '{{.FORGE_PORT | default "3000"}}'
+# Tasks in this file intentionally operate only on components present in this
+# checkout. Control-plane, hooks, site, and extension tasks should be added when
+# their directories land rather than pointing at planned paths.
 
 tasks:
+  default:
+    desc: List available development tasks
+    cmds:
+      - task --list
+
   dev:
-    desc: Bring up backend, hooks, site, and agent in parallel
-    deps: [backend, hooks, site, agent]
-
-  backend:
-    desc: SchemaForge control plane API
+    desc: Start the currently implemented Garrison agent daemon
     cmds:
-      - schema-forge serve --config ./config.toml
-
-  hooks:
-    desc: Lifecycle hooks gRPC service
-    dir: hooks-service
-    cmds:
-      - cargo run --release
-
-  site:
-    desc: Admin console dev server
-    dir: site
-    cmds:
-      - pnpm dev
+      - task: agent
 
   agent:
-    desc: Garrison agent daemon (acton-ai)
-    dir: agent
+    desc: Run garrison-agent as an ACP daemon on its configured Unix socket
     cmds:
-      - cargo run
+      - cargo run -p garrison-agent -- serve
 
-  validate:
-    desc: Validate schemas + Cedar bundle (run after any schema change)
+  acp:
+    desc: Run garrison-agent in editor-spawned ACP stdio mode
     cmds:
-      - schema-forge validate --config ./config.toml
+      - cargo run -p garrison-agent -- acp
+
+  ping:
+    desc: Handshake with the running ACP daemon and print its status
+    cmds:
+      - cargo run -p garrison-agent -- ping
+
+  test:
+    desc: Run the Rust workspace test suite
+    cmds:
+      - cargo test --workspace
+
+  check:
+    desc: Type-check the Rust workspace
+    cmds:
+      - cargo check --workspace
+
+  fmt:
+    desc: Check Rust formatting without changing files
+    cmds:
+      - cargo fmt --all -- --check
