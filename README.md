@@ -22,7 +22,9 @@ not part of this checkout yet.
   and project-root safety checks.
 - Read-only LSP tools for diagnostics, hover, definitions, and references.
 - Anthropic, OpenAI, Groq, Ollama, and compatible endpoints through acton-ai.
-- Provider login/logout helpers and terminal `ping`/`chat` smoke clients.
+- An interactive terminal chat: streaming replies in the terminal's own
+  scrollback, keystroke approvals, Esc to interrupt, and slash commands.
+- Provider login/logout helpers and a `ping` smoke client.
 - acton-ai policy, accounting, audit, planning, context, MCP, and tool-loop
   primitives where enabled by configuration.
 
