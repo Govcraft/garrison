@@ -2,69 +2,115 @@
 
 **Governed agentic coding inside your boundary.**
 
-Garrison is a federal-ready AI coding assistant: an agentic coding engine built
-on [acton-ai](https://github.com/rodzilla/acton-ai), administered through a
-SchemaForge control plane. Code never leaves the agency's approved data-handling
-boundary; every agent action passes a policy gate and lands in a tamper-evident
-audit chain.
+Garrison is a pre-alpha AI coding-agent daemon built on
+[acton-ai](https://github.com/rodzilla/acton-ai). The checked-in product is a
+Rust agent that speaks the Agent Client Protocol (ACP), routes tool approvals
+to its client, provides structural patching and language-server queries, and
+can use agency-approved model endpoints.
 
-Named for what it is: a force stationed inside the perimeter, operating under
-standing orders, keeping a duty log.
+The broader federal control plane described below is the product direction,
+not part of this checkout yet.
 
-## Why it exists
+## What is implemented
 
-Agencies buying AI coding assistants (see USAC RFQ IT-26-107 as the reference
-requirements set) need what seat-license SaaS vendors structurally cannot give
-them:
+- ACP v1 over stdin/stdout for editor-spawned agents.
+- ACP v1 over a Unix-domain socket for a long-lived daemon.
+- In-memory session create, load, list, prompt, and cancellation.
+- Streaming model text and tool lifecycle events.
+- Human approval round-trips, timeouts, and per-connection approval caching.
+- A structural `apply_patch` tool with fuzzy context matching, atomic planning,
+  and project-root safety checks.
+- Read-only LSP tools for diagnostics, hover, definitions, and references.
+- Anthropic, OpenAI, Groq, Ollama, and compatible endpoints through acton-ai.
+- Provider login/logout helpers and terminal `ping`/`chat` smoke clients.
+- acton-ai policy, accounting, audit, planning, context, MCP, and tool-loop
+  primitives where enabled by configuration.
 
-- **No vendor tenant.** BYO model provider (Bedrock in GovCloud, or any
-  Anthropic/OpenAI-compatible endpoint). The subprocessor list is one row.
-- **Governance tiers as enforcement, not policy PDFs.** Tier A/B/C agentic
-  scopes (inline suggest → human-gated multi-file edits → PMO-approved
-  autonomy) enforced by the acton-ai approval gate, centrally distributed.
-- **Evidence, not logs.** BLAKE3 hash-chained append-only audit trail per
-  seat, aggregated to the control plane, SIEM-exportable, `verify`-able.
-- **FIPS build path.** aws-lc-rs FIPS crypto provider process-wide.
+## What is planned
 
-## Architecture
+These components are not present in this repository today:
 
+- SchemaForge control plane, Entra ID integration, Cedar administration, seat
+  management, policy distribution, and audit aggregation.
+- VS Code and JetBrains extensions.
+- Hooks service and federal-ui administration site.
+- Infrastructure, SIEM integration, and compliance document sets.
+- Command-prefix policy, sandbox escalation, turn diffs, repository context,
+  project-instruction discovery, persistent PTYs, and Bitbucket review mode.
+
+Active tracking issues include
+[documentation alignment](https://github.com/Govcraft/garrison/issues/2),
+[session persistence](https://github.com/Govcraft/garrison/issues/3),
+[audit durability](https://github.com/Govcraft/garrison/issues/4),
+[filesystem boundaries](https://github.com/Govcraft/garrison/issues/5), and
+[sandbox integration](https://github.com/Govcraft/garrison/issues/6).
+
+## Current architecture
+
+```text
+ACP client (editor, terminal, or socket client)
+  └─ ClientConn actor
+      └─ ThreadSupervisor / Thread actor
+          └─ acton-ai prompt and tool loop
+              ├─ configured LLM provider
+              ├─ acton-ai built-in and MCP tools
+              ├─ Garrison apply_patch and LSP tools
+              └─ policy hook → ACP permission request
 ```
-┌─ developer workstation ────────────────────┐   ┌─ control plane (SchemaForge) ──┐
-│  IDE (VS Code / JetBrains)                 │   │  Entra ID OIDC SSO             │
-│    └─ extension ── IPC ──> garrison-agent  │──▶│  Cedar RBAC (admin/dev/auditor)│
-│         (acton-ai: prompt loop, tools,     │   │  Org policy distribution       │
-│          policy gate, audit chain, FIPS)   │◀──│  Seat & license management     │
-│                └──> LLM provider           │   │  Audit aggregation + SIEM      │
-│                     (Bedrock GovCloud /    │   │  Usage & acceptance-rate KPIs  │
-│                      agency-approved API)  │   │  Admin dashboards (federal-ui) │
-└────────────────────────────────────────────┘   └────────────────────────────────┘
+
+The intended control plane and IDE integrations are documented as roadmap
+architecture in [docs/garrison-agent-design.md](docs/garrison-agent-design.md).
+
+## Repository layout
+
+| Path | Status | Purpose |
+|---|---|---|
+| `agent/` | Implemented | `garrison-agent` Rust library, daemon, ACP client, tools, and tests |
+| `docs/` | Implemented | Architecture and design notes |
+| `garrison.toml` | Implemented | Server, approval, thread, and LSP configuration |
+| `acton-ai.toml` | Implemented | Provider, context, and acton-ai runtime configuration |
+| `Taskfile.yml` | Implemented | Tasks that operate on this checkout |
+| `schemas/`, `policies/`, `hooks-service/`, `site/` | Planned | Control-plane services and policy assets |
+| `extensions/` | Planned | VS Code and JetBrains clients |
+| `infra/`, `docs/compliance/` | Planned | Deployment and compliance material |
+
+## Development quickstart
+
+Prerequisites are a Rust toolchain and the sibling acton-ai checkout expected
+by `agent/Cargo.toml` at `../../acton-ai`.
+
+```sh
+# Compile and run the test suite.
+task test
+
+# Start the ACP daemon on the configured Unix socket.
+task agent
+
+# In another terminal, inspect the running daemon.
+task ping
 ```
 
-## Layout
+For editor-spawned stdio mode, run:
 
-| Path | What |
-|---|---|
-| `agent/` | `garrison-agent` — Rust daemon + CLI built on acton-ai (prompt loop, tools, IPC for IDE extensions, policy pull, audit push) |
-| `schemas/` | SchemaForge `.schema` files: User, Seat, PolicyProfile, AuditEvent, UsageReport, ... |
-| `policies/` | Cedar policies (admin / developer / read-only auditor) |
-| `hooks-service/` | SchemaForge lifecycle hooks (gRPC, acton-service) |
-| `site/` | Admin console — `schema-forge site generate`, federal-ui, WCAG 2.1 AA |
-| `extensions/vscode/` | VS Code extension (inline completion + chat over agent IPC) |
-| `extensions/jetbrains/` | JetBrains plugin (IntelliJ Platform, inline completion API) |
-| `infra/` | Dockerfiles, terraform, runbook |
-| `docs/compliance/` | VPAT/ACR, NIST 800-53 Moderate compensating-controls plan, IRP, subprocessor table |
-| `keys/` | PASETO keys (dev only, never committed) |
-| `scripts/` | Dev/ops helpers |
+```sh
+cargo run -p garrison-agent -- acp
+```
 
-## Dev quickstart
+Cloud providers require credentials configured in `acton-ai.toml`; use
+`cargo run -p garrison-agent -- login <anthropic|openai>` where supported, or
+populate the provider's configured key file. Ollama can be selected for a local
+deployment. `garrison.toml` configures the project root, approval behavior, and
+optional language servers.
 
-`task dev` (see `Taskfile.yml`) brings up the control plane backend, hooks
-service, and admin site, mirroring the Meridian stack layout. The agent runs
-from `agent/` with `cargo run`.
+## Target architecture
+
+The roadmap adds a SchemaForge control plane for identity, centrally managed
+policy, seats, and audit aggregation, plus editor extensions that consume the
+same ACP service. Until those components land, claims about centralized
+governance, SIEM export, or compliance certification describe intended product
+capabilities rather than this repository's runnable state.
 
 ## Status
 
-Pre-alpha scaffold. Requirements source of truth: USAC RFQ IT-26-107 + Q&A
-(quote due 2026-08-31). Build order: acton-reactive Windows unblock →
-VS Code extension over agent IPC → control plane schemas/policies →
-JetBrains MVP → VPAT + 800-53 plan → Bitbucket DC PR review.
+Pre-alpha. The agent daemon is implemented and tested; the control plane and
+editor products remain roadmap work.
