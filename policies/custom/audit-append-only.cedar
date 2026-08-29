@@ -34,6 +34,16 @@ forbid (
     resource is AuditChain
 );
 
+// The daemon's own account of its trail updates as it ships, and it is the
+// half of the silence detector that says the install was alive. Deleting it
+// would turn "stopped shipping" into "never existed".
+@id("garrison.audittrail.no_delete")
+forbid (
+    principal is Forge::Principal,
+    action == Action::"DeleteAuditTrail",
+    resource is AuditTrail
+);
+
 // Bulk export is the compliance-reporting path: the roles that already read
 // the trail may take a copy of it. Operators, who append and cannot read,
 // are absent here on purpose.

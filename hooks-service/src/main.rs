@@ -30,8 +30,14 @@ mod plane;
 
 mod pb {
     // SCHEMAFORGE_HOOKS_PB_BEGIN — DO NOT REMOVE (additive insertion marker)
+    pub mod audit_event {
+        tonic::include_proto!("schema_forge_hooks.audit_event");
+    }
     pub mod redemption {
         tonic::include_proto!("schema_forge_hooks.redemption");
+    }
+    pub mod policy_bundle {
+        tonic::include_proto!("schema_forge_hooks.policy_bundle");
     }
     // SCHEMAFORGE_HOOKS_PB_END
 }
@@ -85,8 +91,18 @@ async fn main() -> Result<()> {
         .with_health()
         // SCHEMAFORGE_HOOKS_SERVICES_BEGIN — DO NOT REMOVE (additive insertion marker)
         .add_service(
+            pb::audit_event::audit_event_hooks_server::AuditEventHooksServer::new(
+                hooks::audit_event::Service,
+            ),
+        )
+        .add_service(
             pb::redemption::redemption_hooks_server::RedemptionHooksServer::new(
                 hooks::redemption::Service::new(plane, garrison.issuer),
+            ),
+        )
+        .add_service(
+            pb::policy_bundle::policy_bundle_hooks_server::PolicyBundleHooksServer::new(
+                hooks::policy_bundle::Service,
             ),
         )
         // SCHEMAFORGE_HOOKS_SERVICES_END

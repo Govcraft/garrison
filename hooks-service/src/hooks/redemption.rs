@@ -229,7 +229,7 @@ fn credential_fields(
     fields.insert("credential_id".into(), json!(credential_id(req)));
     fields.insert("install".into(), json!(install));
     fields.insert("organization".into(), json!(organization));
-    fields.insert("kind".into(), json!(req.credential_kind));
+    fields.insert("credential_kind".into(), json!(req.credential_kind));
     fields.insert("public_key".into(), json!(req.public_key));
     fields.insert("status".into(), json!("active"));
     if let Some(fingerprint) = req.cert_fingerprint.as_deref().filter(|f| !f.is_empty()) {
