@@ -65,6 +65,24 @@ tasks:
     cmds:
       - npm run package
 
+  jetbrains:build:
+    desc: Compile and package the JetBrains extension
+    dir: extensions/jetbrains
+    cmds:
+      - ./gradlew buildPlugin
+
+  jetbrains:verify:
+    desc: Validate the JetBrains plugin project and archive structure
+    dir: extensions/jetbrains
+    cmds:
+      - ./gradlew verifyPluginProjectConfiguration verifyPluginStructure
+
+  jetbrains:run:
+    desc: Launch a development IDE with the Garrison plugin installed
+    dir: extensions/jetbrains
+    cmds:
+      - ./gradlew runIde
+
   # --- Control plane -------------------------------------------------------
 
   plane:parse:
