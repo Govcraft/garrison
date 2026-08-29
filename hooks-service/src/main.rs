@@ -25,8 +25,11 @@
 
 mod adjudicate;
 mod config;
+mod directory;
 mod hooks;
 mod plane;
+mod reconcile;
+mod sync;
 
 mod pb {
     // SCHEMAFORGE_HOOKS_PB_BEGIN — DO NOT REMOVE (additive insertion marker)
@@ -42,12 +45,19 @@ mod pb {
     // SCHEMAFORGE_HOOKS_PB_END
 }
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use acton_service::error::Error;
 use acton_service::grpc::server::GrpcServicesBuilder;
 use acton_service::prelude::*;
 
-use crate::config::HooksConfig;
+use crate::config::{DirectoryMode, HooksConfig};
+use crate::directory::Directory;
+use crate::hooks::redemption::DirectoryGate;
 use crate::plane::Plane;
+use crate::reconcile::Policy;
+use crate::sync::{DirectorySync, SyncSettings};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -62,22 +72,70 @@ async fn main() -> Result<()> {
     // untyped `AppState`, so the framework path has to stay `Config<()>`;
     // threading `HooksConfig` through it would mean giving up the health
     // service's dependency probing to keep one call.
-    let garrison = Config::<HooksConfig>::load()?.custom.garrison;
+    let custom = Config::<HooksConfig>::load()?.custom;
+    let garrison = custom.garrison;
+    let directory = custom.directory;
 
     // Refuse to boot on a half-configured plane rather than discover it on the
     // night of the first enrollment. Every missing field is named at once.
-    let missing = garrison.missing();
+    let mut missing = garrison.missing();
+    missing.extend(directory.missing());
     if !missing.is_empty() {
         return Err(Error::ValidationError(format!(
             "missing required configuration: {}",
             missing.join(", ")
         )));
     }
+    let invalid = directory.invalid();
+    if !invalid.is_empty() {
+        return Err(Error::ValidationError(format!(
+            "invalid configuration: {}",
+            invalid.join("; ")
+        )));
+    }
 
-    // One client for the process. It holds the `enrollment_service` bearer,
-    // which is authorized for four operations and nothing else.
+    // One client for the enrollment hook. It holds the `enrollment_service`
+    // bearer, which is authorized for a handful of operations and nothing else.
     let plane = Plane::new(&garrison.url, &garrison.token)
         .map_err(|e| Error::ValidationError(e.to_string()))?;
+
+    // The directory sync, when enabled, holds its own bearer for the
+    // `directory_service` role. Settings are parked where the supervised
+    // actor's `after_start` can find them on every incarnation.
+    let gate = DirectoryGate {
+        enabled: directory.enabled(),
+        staleness: Duration::from_secs(directory.staleness),
+    };
+    if directory.enabled() {
+        let source: Arc<dyn Directory> = match directory.mode {
+            DirectoryMode::File => Arc::new(directory::file::FileDirectory::new(&directory.path)),
+            DirectoryMode::Graph => Arc::new(
+                directory::graph::GraphDirectory::new(
+                    &directory.authority,
+                    &directory.graph,
+                    &directory.client,
+                    &directory.secret,
+                )
+                .map_err(|e| Error::ValidationError(e.to_string()))?,
+            ),
+            DirectoryMode::Off => unreachable!("enabled() is false for Off"),
+        };
+        let sync_plane = Plane::new(&garrison.url, &directory.token)
+            .map_err(|e| Error::ValidationError(e.to_string()))?;
+        sync::install(Arc::new(SyncSettings {
+            directory: source,
+            organization: directory.organization.clone(),
+            plane: sync_plane,
+            interval: Duration::from_secs(directory.interval),
+            policy: Policy {
+                max_offboard_fraction: directory.fraction,
+            },
+        }));
+    } else {
+        tracing::warn!(
+            "[directory] mode is off: operators are hand-typed and nothing deprovisions them"
+        );
+    }
 
     // The health service probes whatever dependencies the config declares.
     let state = AppState::builder().config(config.clone()).build().await?;
@@ -97,7 +155,7 @@ async fn main() -> Result<()> {
         )
         .add_service(
             pb::redemption::redemption_hooks_server::RedemptionHooksServer::new(
-                hooks::redemption::Service::new(plane, garrison.issuer),
+                hooks::redemption::Service::new(plane, garrison.issuer).with_directory(gate),
             ),
         )
         .add_service(
@@ -108,11 +166,12 @@ async fn main() -> Result<()> {
         // SCHEMAFORGE_HOOKS_SERVICES_END
         .build(Some(state));
 
-    ServiceBuilder::new()
+    let mut builder = ServiceBuilder::new()
         .with_config(config)
-        .with_grpc_services(grpc_services)
-        .try_build()?
-        .serve()
-        .await?;
+        .with_grpc_services(grpc_services);
+    if directory.enabled() {
+        builder = builder.with_actor::<DirectorySync>();
+    }
+    builder.try_build()?.serve().await?;
     Ok(())
 }

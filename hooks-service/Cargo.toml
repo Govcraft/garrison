@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+acton-reactive = "9.2.1"
 # The hook service runs on the same platform layer as the forge that calls it.
 # This is what supplies token authentication, mutual-TLS caller authorization,
 # tracing, and the health surface — see `src/main.rs`. Do not replace it with a
@@ -14,6 +15,7 @@ acton-service = { version = "0.39", features = ["grpc", "tls"] }
 acton-service-client = "0.1.2"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde"] }
 prost = "0.14"
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "form"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1", features = ["full"] }
@@ -26,4 +28,6 @@ tonic-build = "0.14"
 tonic-prost-build = "0.14"
 
 [dev-dependencies]
+tempfile = "3.27.0"
+testcontainers = "0.28.0"
 toml = "1.1.4"

@@ -36,9 +36,15 @@ Tooling: `schemaforge` 0.37.2, PostgreSQL flavor.
 The agent enrolls itself on first run (`agent/src/enrollment/`), against the
 same endpoint and the same hook.
 
+Entra ID is the authority for operators: `hooks-service/` runs a directory
+sync that creates, links, renames, suspends, and offboards `Operator` rows
+from a Microsoft Graph listing (or a JSON file), and the enrollment hook
+refuses anyone the directory has not vouched for. See "Directory" below for
+the rules and for what has and has not been proved against a real tenant.
+
 **Planned:** everything else that moves bytes. The agent does not yet pull
 policy from this plane or push audit to it, no database has been provisioned,
-Entra ID is modeled but not integrated, and there is no administration site. The
+and there is no administration site. The
 model landing first is deliberate — the wire contract between agent and plane is
 the entity model, so it is the thing worth being wrong about early and cheaply.
 
@@ -234,6 +240,7 @@ in `hooks-service/`:
 |---|---|
 | Adjudicate the token | issuer, status, expiry, use count, tenant — in that order |
 | Resolve the operator | an operator-scoped grant wins over the machine's claim |
+| Admit the operator | `status` must be `active`; with the directory on, the row must carry an `entra_object_id` and the organization's directory view must be fresh (R4 below) |
 | Create the `AgentInstall` | `status = enrolled`, not `active`: joining the fleet is not entitlement |
 | Create the `InstallCredential` | public material only, `status = active` |
 | Spend the token | one patch carrying both the new count and the status it implies |
@@ -594,6 +601,124 @@ The rule when adding a `@require`: list every field the expression names, and
 confirm each is `required` or carries `@default`. Then test the create that
 omits the optional fields, not just the one that violates the rule.
 
+## Directory
+
+The directory sync lives in `hooks-service/` as a supervised actor
+(`src/sync.rs`) beside the enrollment hook, because the enrollment decision
+now depends on the sync's freshness and one service is one config to audit.
+It is configured by the `[directory]` table in `hooks-service/config.toml`
+and holds its own plane bearer for the `directory_service` role, distinct from
+the hook's `enrollment_service` bearer. Every write it makes goes through the
+plane's REST API, so it is bounded by the same `@access` lists and
+`@field_access` fences as a console user, and lands in the same audit table.
+One hooks service reconciles one organization, named by
+`[directory] organization`: the bearer is scoped to that tenant, and the
+plane does not return the tenant-root `Organization` row itself from a
+tenant-scoped listing, so the sync fetches the row it was told about by id
+and nothing wider. Every row the sync writes carries that tenant; rows
+written by a bearer with no tenant chain (the bootstrap `admin` login, for
+one) land with no tenant and are invisible to the sync and to the enrollment
+hook alike, so operators must be created inside the tenant.
+
+Everything it decides is decided by one pure function,
+`reconcile::reconcile`, whose tests are the specification. The rules, in the
+words the code uses:
+
+- **R1. Join key.** `Operator.entra_object_id` is the identity. A directory
+  member with no row is created (`active`, or `suspended` if the account is
+  disabled). A row whose member is absent from the listing is `offboarded`.
+- **R2. One-time link, then rename in place.** A hand-typed row with no
+  object id is linked exactly once, by case-insensitive UPN match, and stamped
+  with the member's object id. After that `upn`, `display_name`, and `email`
+  are directory-owned: a rename patches the same row and every install,
+  session, and audit entry keeps pointing at the same person. A hand-typed
+  row that matches nobody is reported in the sync detail and never offboarded;
+  the directory never knew it.
+- **R3. Deprovision.** A disabled account becomes `suspended`; a removed
+  member becomes `offboarded`. Either way the operator's `assigned` and
+  `active` seats are set `revoked` with `revoked_at` and a reason the
+  `@require` rule demands: `directory: account disabled` or `directory:
+  account removed`. `reconcile` also plans the console `User` with the same
+  object id (or, before it is stamped, the same email) to `active = false`,
+  never a `platform_admin`; but the plane's user store has no tenant column,
+  so a tenant-scoped bearer cannot list it (the plane answers `502`, `column
+  "_tenant" does not exist`). The sync therefore reconciles operators and
+  seats, records `console users not reconciled` in `directory_sync_detail`,
+  and leaves the console login to be closed by hand. That is a known gap,
+  listed below, not a silent one. A member who reappears enabled is set
+  `active` again, but no seat is re-assigned: that is an `org_admin`
+  decision. On a running install a revocation reaches the daemon within
+  `seat_check_secs` (`garrison.toml`, `[plane]`), which is the runtime lever;
+  the directory sync is the provisioning lever.
+- **R4. Enrollment admissibility.** The hook refuses, with a persisted
+  `outcome = refused`, an operator whose `status` is not `active`, and, when
+  `[directory] mode` is not `off`, one with no `entra_object_id` ("operator is
+  not linked to the directory") or one whose organization has not synced
+  successfully within `staleness` seconds ("directory view is stale;
+  enrollment refused until the next successful sync"). An unreachable plane
+  during the hook is still an abort, not a refusal.
+- **R5. Bounded damage.** An empty listing is a failure, never "everyone
+  left". A plan that would suspend or offboard more than `fraction` (default
+  0.5) of the currently active operators is refused whole, so a wrong group
+  id cannot empty a fleet. Both are recorded on the Organization as
+  `directory_sync_status = failed` with the reason in `directory_sync_detail`,
+  and no operator changes.
+- **R6. Unreachable directory or plane.** The tick fails, the failure is
+  recorded where it can be, and the next tick retries. While the view is
+  stale, existing installs keep running and no new enrollment is admitted.
+- **R7. Enrollment carries no directory identity.** The machine reports a
+  UPN once, at first enrollment; the plane resolves it to a row and the row's
+  object id is the identity from then on. A rename after enrollment changes
+  nothing about the install.
+
+Each successful tick stamps `Organization.directory_synced_at` and
+`directory_sync_status = ok`, and `Operator.directory_synced_at` on every row
+the listing confirmed, so "when did the directory last see this person" is a
+column, not a log search.
+
+### What has been proved, and against what
+
+`cargo nextest run -p garrison-hooks` runs three layers:
+
+- Unit tests on `reconcile` for every rule above, with no network.
+- Fixture tests on the Graph parsers (`tests/fixtures/graph/`): a paged
+  listing with `@odata.nextLink`, a guest UPN with `#EXT#` and `mail: null`,
+  `accountEnabled: false`, a member missing `accountEnabled` (a failed page,
+  not a guess), a throttled `429` body, and a token-endpoint error body.
+- An integration test (`tests/directory_sync.rs`) that starts PostgreSQL in a
+  container, applies this repository's schemas and policies, serves the plane,
+  and runs `garrison-hooks` with `[directory] mode = "file"`. It proves that a
+  member is provisioned into an operator a `Redemption` can bind to, that a
+  hand-typed operator is linked by UPN, and that disabling the account
+  suspends the operator, revokes the seat with the written reason, records
+  the unreconciled console half in the sync detail, and refuses the next
+  enrollment. It skips,
+  saying why, without `schemaforge` on `PATH` or a container socket
+  (`DOCKER_HOST=unix:///run/user/1000/podman/podman.sock` for rootless
+  podman).
+
+Running that test against the real plane changed two schemas, and the
+reasons are worth keeping:
+
+- `Organization.owner_id` lost its `@owner` annotation. The annotation
+  generates a Cedar `forbid` on Read, List, Update, and Delete for every
+  principal other than the owner, which hid the row from every role in its
+  own `@access(read: ...)` list, `org_admin` included. The row is fenced by
+  the tenant guard and the per-field `@field_access` writes instead.
+- `Seat` now lists `directory_service` under `read`. It could already write
+  a revocation; it could not find the seats to revoke.
+
+The Graph transport (`src/directory/graph.rs`) has **not** been run against
+a real tenant. Before trusting `mode = "graph"` in a deployment, confirm on
+the actual tenant: that the app registration's `User.Read.All` and
+`GroupMember.Read.All` application permissions are admin-consented; that
+`accountEnabled` is populated for every member, including users synced from
+on-premises AD (a missing value fails the tick rather than guessing); that
+guest members are meant to be operators at all (they are listed, with their
+`#EXT#` UPN); that a group of the expected size pages through `$top=999`
+correctly; and that throttling under the tenant's real rate limits resolves
+within `staleness`, because a run of failed ticks grounds new enrollments.
+
 ## Roles
 
 `policies/role_ranks.toml` orders the hierarchy. Ranks drive the
@@ -656,26 +781,36 @@ are failures the runtime would otherwise refuse to hot-swap after merge.
 
 ## Known gaps
 
-- **No daemon-side client.** The agent has never spoken to the plane. There is
-  no enrollment, no heartbeat, no bundle pull, no audit shipping, and no
-  `[control_plane]` section in `GarrisonConfig` — its only outbound network
-  auth is to model providers. `schemas/credential.schema` describes the
-  identity a daemon would present; nothing generates or presents one yet.
+- **The daemon-side client is enrollment only.** The agent enrolls itself
+  under `[plane]` in `garrison.toml` and presents the credential
+  `schemas/credential.schema` describes. Heartbeat, bundle pull, and audit
+  shipping remain to be wired.
 - **Schemas are unsigned.** Every command prints `schema signature
   verification is disabled (signing.mode = off)`. SchemaForge can require
   ed25519, SSH allowed-signers, or cosign-keyless signatures over `schemas/`
   before parsing, which is worth adopting here well before anything federal
   ships. The rollout is off → warn → enforce.
-- **Entra claims are projected, not yet populated.**
-  `[schema_forge.authz.principal_claims]` in `config.toml` is enabled with
-  `required = false`, and `schemas/user.schema` supplies the columns it reads.
-  Nothing writes those columns yet: the directory reconciler that would is
-  planned, so every console login still carries no `entra_object_id` and the
-  export `forbid` in `directory-identity.cedar` currently refuses everyone.
-  That is the fail-closed direction, and it is stated here so nobody reads a
-  403 on export as a bug. `required` cannot be `true`: it is enforced against
-  every bearer the plane accepts, including enrollment artifacts and service
-  tokens, which carry no such claim by construction.
+- **Graph is untested against a real tenant.** The directory sync's Microsoft
+  Graph client is exercised against recorded responses only; the
+  end-to-end proof uses `[directory] mode = "file"`. The "Directory" section
+  lists what a real tenant must confirm. Until a console login has been
+  stamped by a sync it carries no `entra_object_id`, and the export `forbid`
+  in `directory-identity.cedar` refuses it; that is the fail-closed direction,
+  stated here so nobody reads a 403 on export as a bug. `required` on the
+  projected claims cannot be `true`: it is enforced against every bearer the
+  plane accepts, including enrollment artifacts and service tokens, which
+  carry no such claim by construction.
+- **Console logins are not deactivated by the sync.** The plane's user store
+  has no tenant column, so a tenant-scoped `directory_service` bearer cannot
+  list `User`; the tick says so in `directory_sync_detail` and closes the
+  operator and the seats. Closing the console login is a manual step until
+  the plane can scope its user store, or the sync is given a second,
+  unscoped bearer for that one read.
+- **The directory bearer is tenant-scoped.** A `directory_service` token is
+  minted with one organization's tenant chain, so one `garrison-hooks` syncs
+  the organizations that bearer can see. A deployment with several
+  organizations on one plane runs one hooks service per organization, or
+  waits for a chain-less service bearer.
 - **Two hooks are declared and refuse.** The `AuditEvent` and `PolicyBundle`
   `before_validate` hooks are bound and served, and both are stubs that fail
   closed: every audit ingest is refused, and every bundle publish is refused,

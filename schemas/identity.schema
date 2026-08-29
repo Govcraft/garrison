@@ -61,14 +61,15 @@ schema Operator {
 // a model: no active seat, no turns. Revocation is the offboarding lever, and
 // it is deliberately expensive to do silently — a revoked seat must say why.
 //
-// The directory reconciler may write here, and the `@field_access` fences
+// The directory reconciler reads and writes here: it must find the seats an
+// operator holds before it can take them away, and the `@field_access` fences
 // bound what that means: it can move `status` to revoked and record when and
 // why, and nothing else. Who a seat belongs to, what tier it is, and when it
 // expires stay with org_admin. The sync can only take a seat away.
 @version(1)
 @tenant(parent: "Organization")
 @access(
-    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin"],
+    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin", "directory_service"],
     write:  ["org_admin", "directory_service"],
     delete: ["org_admin"]
 )

@@ -7,11 +7,17 @@
 //!
 //! The order of the checks is the order a reader would ask the questions, and
 //! the refusal text is written for the security officer reading the refused
-//! row later — not for the daemon, which is not entitled to know why.
+//! row later, not for the daemon, which is not entitled to know why.
+//!
+//! The second half of the file is the operator's side of the same question
+//! (R4 in `docs/control-plane.md`): once the token has named a person, is
+//! that person still someone the directory says may hold a machine?
+
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use crate::plane::EnrollmentTokenRow;
+use crate::plane::{EnrollmentTokenRow, OperatorRow, OrganizationRow};
 
 /// What the plane decided about a redemption request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,7 +46,7 @@ impl Verdict {
 ///
 /// `expected_issuer` is the `iss` the plane mints enrollment artifacts under.
 /// The row records the issuer it was created for, and a mismatch means the
-/// artifact was signed for some other purpose against the same key — the one
+/// artifact was signed for some other purpose against the same key, the one
 /// thing a shared signing key makes possible and a row can still catch.
 #[must_use]
 pub fn adjudicate(
@@ -124,6 +130,58 @@ pub fn operator_source(token: &EnrollmentTokenRow, reported_upn: &str) -> Operat
     }
 }
 
+/// Whether the person the install would belong to may hold one (R4).
+///
+/// An operator must be `active`. When the directory is the authority, they
+/// must also be a directory identity: a hand-typed row the sync has not yet
+/// linked is a person the directory has not vouched for, and the refusal
+/// says so, because the fix is a UPN that matches or a wait for the next
+/// sync, not a new token.
+pub fn operator_admissible(operator: &OperatorRow, directory_enabled: bool) -> Result<(), String> {
+    if operator.status != "active" {
+        return Err(format!("operator is not active ({})", operator.status));
+    }
+    if directory_enabled
+        && operator
+            .entra_object_id
+            .as_deref()
+            .is_none_or(str::is_empty)
+    {
+        return Err("operator is not linked to the directory".into());
+    }
+    Ok(())
+}
+
+/// Whether the organization's directory view is recent enough to enrol
+/// against (R4).
+///
+/// A view older than `staleness` is one the sync has been failing to refresh
+/// for longer than the operator allowed, and an enrollment against it could
+/// admit someone the directory disabled after the last good tick. Fail
+/// closed: refuse until a sync succeeds. A view that never synced is stale
+/// by definition.
+pub fn directory_fresh(
+    organization: &OrganizationRow,
+    now: DateTime<Utc>,
+    staleness: Duration,
+) -> Result<(), String> {
+    const REFUSAL: &str =
+        "directory view is stale; enrollment refused until the next successful sync";
+    let synced = organization
+        .directory_synced_at
+        .as_deref()
+        .and_then(parse_instant)
+        .ok_or_else(|| REFUSAL.to_string())?;
+    if organization.directory_sync_status.as_deref() != Some("ok") {
+        return Err(REFUSAL.to_string());
+    }
+    let allowed = chrono::Duration::from_std(staleness).map_err(|_| REFUSAL.to_string())?;
+    if now - synced > allowed {
+        return Err(REFUSAL.to_string());
+    }
+    Ok(())
+}
+
 /// The token's state after a successful redemption.
 ///
 /// Returns the new use count and the status that count implies, so the caller
@@ -139,7 +197,9 @@ pub fn spend(token: &EnrollmentTokenRow) -> (i64, &'static str) {
     }
 }
 
-fn parse_instant(text: &str) -> Option<DateTime<Utc>> {
+/// An RFC 3339 instant, or `None` if the text is not one.
+#[must_use]
+pub fn parse_instant(text: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(text)
         .ok()
         .map(|dt| dt.with_timezone(&Utc))
@@ -167,6 +227,30 @@ mod tests {
             status: "issued".into(),
             expires_at: Some("2026-08-31T00:00:00Z".into()),
             first_redeemed_at: None,
+        }
+    }
+
+    fn operator(status: &str, oid: Option<&str>) -> OperatorRow {
+        OperatorRow {
+            id: "operator_01".into(),
+            upn: "dev@agency.gov".into(),
+            display_name: "Dev".into(),
+            email: None,
+            entra_object_id: oid.map(str::to_owned),
+            status: status.into(),
+            organization: Some("organization_01".into()),
+        }
+    }
+
+    fn organization(synced_at: Option<&str>, status: Option<&str>) -> OrganizationRow {
+        OrganizationRow {
+            id: "organization_01".into(),
+            slug: "agency".into(),
+            entra_tenant_id: Some("tenant".into()),
+            entra_group_id: None,
+            directory_synced_at: synced_at.map(str::to_owned),
+            directory_sync_status: status.map(str::to_owned),
+            active: true,
         }
     }
 
@@ -312,5 +396,51 @@ mod tests {
         let mut row = token();
         row.max_uses = 1;
         assert_eq!(spend(&row), (1, "redeemed"));
+    }
+
+    #[test]
+    fn an_active_linked_operator_is_admissible_either_way() {
+        assert_eq!(operator_admissible(&operator("active", Some("A")), false), Ok(()));
+        assert_eq!(operator_admissible(&operator("active", Some("A")), true), Ok(()));
+    }
+
+    #[test]
+    fn a_suspended_or_invited_operator_is_refused_and_the_status_is_named() {
+        for status in ["suspended", "offboarded", "invited"] {
+            let err = operator_admissible(&operator(status, Some("A")), false).unwrap_err();
+            assert_eq!(err, format!("operator is not active ({status})"));
+        }
+    }
+
+    #[test]
+    fn an_unlinked_operator_is_refused_only_when_the_directory_is_the_authority() {
+        assert_eq!(operator_admissible(&operator("active", None), false), Ok(()));
+        assert_eq!(
+            operator_admissible(&operator("active", Some("")), true),
+            Err("operator is not linked to the directory".into())
+        );
+    }
+
+    #[test]
+    fn a_recently_synced_organization_is_fresh() {
+        let org = organization(Some("2026-08-28T23:50:00Z"), Some("ok"));
+        assert_eq!(directory_fresh(&org, now(), Duration::from_secs(900)), Ok(()));
+    }
+
+    #[test]
+    fn a_view_older_than_the_staleness_bound_is_refused() {
+        let org = organization(Some("2026-08-28T23:40:00Z"), Some("ok"));
+        assert!(directory_fresh(&org, now(), Duration::from_secs(900)).is_err());
+    }
+
+    #[test]
+    fn a_never_synced_organization_is_stale_by_definition() {
+        assert!(directory_fresh(&organization(None, None), now(), Duration::from_secs(900)).is_err());
+    }
+
+    #[test]
+    fn a_recent_stamp_with_a_failed_status_is_still_refused() {
+        let org = organization(Some("2026-08-28T23:59:00Z"), Some("failed"));
+        assert!(directory_fresh(&org, now(), Duration::from_secs(900)).is_err());
     }
 }

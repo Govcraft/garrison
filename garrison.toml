@@ -41,5 +41,8 @@ extensions = ["rs"]
 # enrollment_packet = "/etc/garrison/enrollment.toml"
 #
 # Who this install belongs to, when the grant itself does not name an operator.
-# The plane resolves it to a registered operator and refuses if it cannot.
+# The plane resolves it to a registered operator and refuses if it cannot, or
+# if that operator is not active or is not known to the directory. It is
+# consulted once, at first enrollment: the install binds to the operator's
+# row, so a later rename in the directory does not affect an enrolled install.
 # operator_upn = "dev@agency.gov"
