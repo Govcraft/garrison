@@ -8,9 +8,10 @@ Rust agent that speaks the Agent Client Protocol (ACP), routes tool approvals
 to its client, provides structural patching and language-server queries, and
 can use agency-approved model endpoints.
 
-The control plane's entity model has landed as SchemaForge schemas; the
-services that would carry data between it and the agent have not. The rest of
-the federal product described below is direction, not checkout.
+The control plane's entity model has landed as SchemaForge schemas, and the
+agent enrolls itself against it on first run; the services that would carry
+policy and audit between the two have not. The rest of the federal product
+described below is direction, not checkout.
 
 ## What is implemented
 
@@ -33,12 +34,17 @@ the federal product described below is direction, not checkout.
   `edit_file` run in a re-exec'd child with resource limits and, on Linux,
   landlock and seccomp hardening, confined to the session's root.
 - Provider login/logout helpers and a `ping` smoke client.
-- The control plane's administrative entity model: 15 SchemaForge schemas
+- The control plane's administrative entity model: 16 SchemaForge schemas
   covering tenancy, operators and seats, machine identity for the daemons, the
   install fleet, policy bundles and command rules, approved model endpoints,
   and audit-chain aggregation — lowering into a 170-policy, strict-mode-
   validated Cedar bundle. See
   [docs/control-plane.md](docs/control-plane.md).
+- Enrollment, end to end: the daemon redeems a single-use grant on its first
+  start, generates an Ed25519 install key it never transmits, and records the
+  identity the plane assigns. A machine the plane turns away does not start;
+  one already enrolled never calls the plane again. The plane side is a
+  `before_validate` gRPC hook in `hooks-service/`.
 - acton-ai policy, accounting, audit, planning, context, MCP, and tool-loop
   primitives where enabled by configuration.
 
@@ -46,10 +52,10 @@ the federal product described below is direction, not checkout.
 
 These components are not present in this repository today:
 
-- Control-plane *services*: Entra ID integration, policy distribution to
-  installs, and audit ingest. The model those services will speak is in
-  `schemas/`; nothing pushes or pulls against it yet.
-- Hooks service and federal-ui administration site.
+- The rest of the control-plane *services*: Entra ID integration, policy
+  distribution to installs, and audit ingest. The model those services will
+  speak is in `schemas/`; enrollment is the only path wired against it so far.
+- The federal-ui administration site.
 - Infrastructure, SIEM integration, and compliance document sets.
 - Command-prefix policy, turn diffs, repository context,
   project-instruction discovery, persistent PTYs, and Bitbucket review mode.
@@ -118,8 +124,9 @@ cargo run -p garrison-agent -- acp
 Cloud providers require credentials configured in `acton-ai.toml`; use
 `cargo run -p garrison-agent -- login <anthropic|openai>` where supported, or
 populate the provider's configured key file. Ollama can be selected for a local
-deployment. `garrison.toml` configures the project root, approval behavior, and
-optional language servers.
+deployment. `garrison.toml` configures the project root, approval behavior,
+optional language servers, and an optional `[plane]` section naming the control
+plane to enroll with. Without that section the agent runs standalone.
 
 ## Target architecture
 
@@ -132,5 +139,5 @@ capabilities rather than this repository's runnable state.
 ## Status
 
 Pre-alpha. The agent daemon and first VS Code and JetBrains clients are
-implemented. The control plane exists as a validated entity model with no
-services behind it yet.
+implemented. The control plane exists as a validated entity model with one
+service behind it: enrollment, which the agent now uses to join a fleet.

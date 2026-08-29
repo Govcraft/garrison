@@ -25,8 +25,42 @@ pub struct GarrisonConfig {
     pub threads: ThreadConfig,
     /// How tool approvals behave.
     pub approval: ApprovalConfig,
+    /// The control plane this install answers to, if any.
+    ///
+    /// `None` — no `[plane]` section — is a standalone agent: it starts, it
+    /// works, and it reports to nobody. That has to stay the default, because
+    /// the editor integration a developer tries first cannot depend on an
+    /// agency having stood a plane up. Adding the section is what turns this
+    /// daemon into a member of a fleet.
+    pub plane: Option<PlaneConfig>,
     /// Language servers to run, keyed by a name of the operator's choosing.
     pub lsp_servers: std::collections::HashMap<String, LspServerConfig>,
+}
+
+/// Where the control plane is, and how this machine first proves itself to it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PlaneConfig {
+    /// Origin of the control plane, e.g. `https://plane.agency.gov`. The
+    /// versioned API path is the framework's convention and is appended for
+    /// you, so this is an origin and not a route.
+    pub url: String,
+
+    /// The enrollment packet placed on this machine by whoever provisioned it.
+    ///
+    /// A path rather than the values themselves, for the reason every
+    /// credential here is a path: a secret in `garrison.toml` is a secret in
+    /// whatever backs that file up. See [`crate::enrollment`] for the packet's
+    /// two fields and why it needs both.
+    pub enrollment_packet: Option<PathBuf>,
+
+    /// Which operator this install belongs to, as an Entra userPrincipalName.
+    ///
+    /// Only consulted for a grant that does not already name a person. An
+    /// operator-scoped enrollment token carries the answer, and the plane
+    /// prefers its own record over anything a machine claims, so leaving this
+    /// unset is correct whenever the grant was issued to an individual.
+    pub operator_upn: Option<String>,
 }
 
 /// Listener settings.
@@ -275,6 +309,61 @@ mod tests {
         assert_eq!(config.server.socket, PathBuf::from("/run/garrison.sock"));
         assert_eq!(config.approval_timeout(), Duration::from_secs(30));
         assert_eq!(config.approval.auto_approve, vec!["read_file".to_string()]);
+    }
+
+    #[test]
+    fn no_plane_section_is_a_standalone_agent() {
+        let config = GarrisonConfig::from_toml("[approval]\ntimeout_secs = 30\n").unwrap();
+        assert!(
+            config.plane.is_none(),
+            "an agent must not need a control plane to start"
+        );
+    }
+
+    #[test]
+    fn a_plane_section_names_where_to_enroll() {
+        let config = GarrisonConfig::from_toml(
+            r#"
+            [plane]
+            url = "https://plane.agency.gov"
+            enrollment_packet = "/etc/garrison/enrollment.toml"
+            operator_upn = "dev@agency.gov"
+            "#,
+        )
+        .unwrap();
+
+        let plane = config.plane.expect("the section was declared");
+        assert_eq!(plane.url, "https://plane.agency.gov");
+        assert_eq!(
+            plane.enrollment_packet,
+            Some(PathBuf::from("/etc/garrison/enrollment.toml"))
+        );
+        assert_eq!(plane.operator_upn.as_deref(), Some("dev@agency.gov"));
+    }
+
+    #[test]
+    fn a_plane_section_needs_only_a_url() {
+        let plane = GarrisonConfig::from_toml("[plane]\nurl = \"https://plane.agency.gov\"\n")
+            .unwrap()
+            .plane
+            .expect("the section was declared");
+
+        assert!(plane.enrollment_packet.is_none());
+        assert!(plane.operator_upn.is_none());
+    }
+
+    #[test]
+    fn a_misspelled_plane_key_is_refused_rather_than_ignored() {
+        let error = GarrisonConfig::from_toml(
+            r#"
+            [plane]
+            url = "https://plane.agency.gov"
+            enrollment_token = "/etc/garrison/token"
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("enrollment_token"));
     }
 
     #[test]

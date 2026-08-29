@@ -44,6 +44,12 @@ pub enum GarrisonErrorKind {
         /// The identifier the client sent.
         thread_id: String,
     },
+    /// This install could not join, or could not confirm it had joined, the
+    /// control plane it is configured to answer to.
+    Enrollment {
+        /// What the plane said, or what stopped it being asked.
+        reason: String,
+    },
     /// A turn could not be run to completion.
     TurnFailed {
         /// Why it failed.
@@ -119,6 +125,14 @@ impl GarrisonError {
         })
     }
 
+    /// This install could not join the control plane.
+    #[must_use]
+    pub fn enrollment(reason: impl Into<String>) -> Self {
+        Self::new(GarrisonErrorKind::Enrollment {
+            reason: reason.into(),
+        })
+    }
+
     /// A turn could not be run to completion.
     #[must_use]
     pub fn turn_failed(reason: impl Into<String>) -> Self {
@@ -181,6 +195,9 @@ impl fmt::Display for GarrisonError {
                 write!(f, "transport error on {endpoint}: {reason}")
             }
             GarrisonErrorKind::Runtime { reason } => write!(f, "runtime error: {reason}"),
+            GarrisonErrorKind::Enrollment { reason } => {
+                write!(f, "enrollment error: {reason}")
+            }
             GarrisonErrorKind::UnknownThread { thread_id } => {
                 write!(f, "no such thread: {thread_id}")
             }

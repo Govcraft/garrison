@@ -66,8 +66,19 @@ key_path = "../keys/paseto.key"
 url   = "http://127.0.0.1:3000"
 token = ""
 
-# The `iss` an enrollment artifact must carry. Enrollment tokens are minted
-# under their own issuer, so a console bearer presented at the redemption
-# endpoint is refused on the issuer alone, before any status or expiry is read.
-issuer = "garrison-enrollment"
+# The `iss` an enrollment artifact must carry, checked against the issuer
+# recorded on the EnrollmentToken row.
+#
+# This must match the plane's own `[token] issuer`, and that is a constraint
+# rather than a preference. acton-service validates every bearer against the
+# single issuer in its `[token]` section, so an artifact minted under some
+# other issuer is a 401 at authentication and never reaches this service. A
+# value here that the plane would not itself accept refuses every artifact
+# that can actually arrive.
+#
+# Separating enrollment artifacts from console bearers by `iss` therefore
+# needs the plane to accept more than one issuer, which it does not today.
+# The separation that does hold is the `enrollee` role, which is granted write
+# on Redemption and nothing else anywhere in the bundle.
+issuer = "garrison-control-plane"
 # ---------------------------------------------------------------------------

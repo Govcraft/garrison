@@ -32,11 +32,14 @@ passing and its failing branch. That database was discarded.
 
 Tooling: `schemaforge` 0.37.2, PostgreSQL flavor.
 
-**Planned:** everything that moves bytes. The agent does not yet pull policy
-from this plane or push audit to it, no database has been provisioned, Entra ID
-is modeled but not integrated, and there is no administration site. The model
-landing first is deliberate — the wire contract between agent and plane is the
-entity model, so it is the thing worth being wrong about early and cheaply.
+The agent enrolls itself on first run (`agent/src/enrollment/`), against the
+same endpoint and the same hook.
+
+**Planned:** everything else that moves bytes. The agent does not yet pull
+policy from this plane or push audit to it, no database has been provisioned,
+Entra ID is modeled but not integrated, and there is no administration site. The
+model landing first is deliberate — the wire contract between agent and plane is
+the entity model, so it is the thing worth being wrong about early and cheaply.
 
 ## What SchemaForge owns, and what it does not
 
@@ -224,6 +227,16 @@ the part that is genuinely SchemaForge's. The bearer it holds is scoped by the
 `enrollment_service` role, which appears in four `@access` lists and nowhere
 else.
 
+One constraint is worth recording because it is easy to design around and
+impossible to configure around. The plane validates every bearer against the
+single `issuer` in its `[token]` section, so an enrollment artifact minted
+under a distinct issuer is a 401 at authentication and never reaches the hook.
+Artifacts are therefore minted under the plane's own issuer, and
+`hooks-service`'s expected issuer must match it. What separates an artifact
+from a console bearer is not `iss` but the `enrollee` role, which is granted
+write on `Redemption` and nothing else anywhere in the bundle. Issuer
+separation would need the plane to accept more than one issuer.
+
 Verified end to end against a live plane:
 
 ```
@@ -238,6 +251,116 @@ POST Redemption  tok_OTHER, operator_upn nobody@agency.gov
   201  outcome=refused, "no operator is registered as 'nobody@agency.gov'"
        token still unspent
 ```
+
+### Enrolling, from the agent's side — `agent/src/enrollment/`
+
+The daemon's half is small on purpose. Redemption is an ordinary entity create,
+so there is no bespoke protocol here to get wrong: the agent posts a row and
+reads what came back.
+
+Three files sit on disk, all under the Garrison config directory
+(`$XDG_CONFIG_HOME/garrison`, else `~/.config/garrison`):
+
+| File | Written by | Lives |
+|---|---|---|
+| `enrollment.toml` | whoever provisions the machine | until it is spent |
+| `install-key.pem` | the daemon, at enrollment, mode 0600 | forever |
+| `install.json` | the daemon, on acceptance | forever |
+
+The packet carries two fields rather than one:
+
+```toml
+token_id = "tok_7f3a"
+artifact = "v4.local...."
+```
+
+The `token_id` is there because the artifact is a PASETO **v4.local** token,
+encrypted with the plane's own key. The daemon cannot read a single claim from
+it, which is the right design, but the redemption body must still name the
+`token_id` it is spending so the `@require` above has something to compare. So
+the id travels in the clear beside the artifact. The id is not a secret. The
+artifact is, which is why the packet is deleted the moment it has been spent.
+
+The install key is generated here and never transmitted. What crosses the wire
+is the public half in SPKI form. The alternative, a plane-issued shared secret,
+would put a replayable credential in the plane's database, on the wire at every
+heartbeat, and in a file on every workstation: three copies of something that
+needs to exist in one place.
+
+`install.json` is the whole first-run test. There is no separate flag whose
+only job is to say "done" — a daemon is enrolled if and only if it can read
+that record back, and the record exists only because a redemption succeeded.
+One fact, one place, no way for the two to disagree. A *corrupt* record is an
+error rather than a silent re-enrollment, which would spend a second grant and
+leave two installs in the fleet for one machine.
+
+Enrollment runs in `build_setup`, before any actor spawns, and has four
+outcomes:
+
+| Situation | What happens |
+|---|---|
+| No `[plane]` section | Nothing. A standalone agent starts as it always did. |
+| Already enrolled | The record is logged and the daemon starts. No call is made. |
+| Not enrolled, plane says yes | Identity is recorded, the packet is destroyed, the daemon starts. |
+| Not enrolled, anything else | The daemon refuses to start. |
+
+That last row is the one worth defending. A governed agent that starts anyway
+when the plane turned it away is not governed; it is an agent with a policy
+document next to it. The same holds for an unreachable plane on a machine that
+has never enrolled: with no install record there is no organization, no seat,
+and nothing to attribute a session to, which is exactly the unattributable
+activity this plane exists to prevent.
+
+An *already enrolled* daemon is deliberately not held to that. It does not call
+the plane at all, so an outage cannot ground a fleet that has already been
+admitted. Enrollment is a one-time gate, not a heartbeat.
+
+What the daemon reports is what the process observed, not what a config file
+claims. `sandbox_hardening` in particular is what the kernel actually granted,
+so a machine whose Landlock support degraded says so and the fleet view shows
+it. The agent's own vocabulary is wider than the plane's — it distinguishes "no
+sandbox configured" from "configured, hardening off" — and both collapse to
+`unavailable` on the way out, so the fleet view answers one question instead of
+two.
+
+Reading the answer fails closed. An `outcome` the daemon does not recognize, or
+an acceptance missing any part of the identity it was supposed to carry, is
+treated as a refusal. A daemon that decided it had enrolled on the strength of
+a half-filled response would be a daemon whose local record disagrees with the
+fleet.
+
+Verified end to end, agent against a live plane, on a staged first-boot
+machine with an empty config directory:
+
+```
+boot 1  packet present, no install record
+  enrolling ... install_id=inst_01m17dz1j7 hostname=govcraft
+  spent enrollment packet removed
+  enrolled  install=agentinstall_01m17dz1vp credential=installcredential_01m17dz1xz
+  daemon starts and listens
+  plane:  EnrollmentToken issued -> redeemed, uses 0 -> 1
+          AgentInstall status=enrolled, sandbox_hardening=best_effort,
+                       isolation_active=true, operator resolved from the UPN
+          InstallCredential kind=ed25519 status=active
+          Redemption outcome=accepted
+  disk:   enrollment.toml gone, install-key.pem 0600, install.json written
+          the stored public_key is the public half of install-key.pem
+
+boot 2  same machine, record present
+  already enrolled ... no call to the plane
+  daemon starts and listens
+
+boot 3  a second machine presenting the same spent packet
+  the control plane refused this install: token has already been fully redeemed
+  exit 1, no install record written, packet left in place
+  plane:  a second Redemption row, outcome=refused, reason recorded
+          no second install, no second credential, token still at uses=1
+```
+
+An earlier attempt in this same run refused with `401 ... The claim 'iss'
+failed validation` and is the reason the constraint above is written down. The
+failure also exercised the path that matters most: the packet survived, no
+record was written, and the daemon did not start.
 
 ### Fleet — `schemas/fleet.schema`
 

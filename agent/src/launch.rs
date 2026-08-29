@@ -182,6 +182,18 @@ pub async fn build_setup(
     // broker. `runtime_mut()` would instead demand the only `ActonAI` handle
     // in existence — which the `ServerSetup` below makes false the moment it
     // takes its own clone.
+    // What the kernel actually granted, computed once and used twice: the
+    // plane is told it at enrollment, and every client reads it back from
+    // `_garrison/status`. Deriving it in one place is what keeps the two
+    // answers from drifting.
+    let sandbox = sandbox_status(ai.sandbox_config());
+
+    // Before any actor, any listener, and any thread. An install the plane
+    // turned away must not reach the point of having somewhere to run a turn.
+    if let Some(plane) = config.plane.as_ref() {
+        crate::enrollment::ensure(plane, &sandbox).await?;
+    }
+
     let mut runtime = ai.runtime().clone();
     let router = TurnRouter::spawn(&mut runtime).await;
     let supervisor = ThreadSupervisor::spawn(&mut runtime).await;
@@ -225,7 +237,7 @@ pub async fn build_setup(
         },
         capabilities: capabilities(),
         audited: ai.is_audited(),
-        sandbox: sandbox_status(ai.sandbox_config()),
+        sandbox,
     })
 }
 

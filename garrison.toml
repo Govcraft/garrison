@@ -19,3 +19,27 @@ auto_approve = ["read_file", "glob", "grep", "list_directory", "calculate", "get
 [lsp_servers.rust]
 command = "rust-analyzer"
 extensions = ["rs"]
+
+# [plane]
+# Enrolling with a control plane. Omit this section entirely and the agent runs
+# standalone, exactly as it did before enrollment existed.
+#
+# The first start that finds this section and no install record redeems an
+# enrollment packet: a single-use grant left on this machine by whoever
+# provisions the fleet. The packet is deleted once spent, and the identity the
+# plane assigns is written to install.json beside this file's config directory.
+# Every later start reads that record and makes no call, so a plane outage
+# cannot ground a fleet that has already been admitted.
+#
+# A machine that has *not* enrolled and is refused, or cannot reach the plane,
+# does not start. A governed agent that runs anyway is not governed.
+#
+# url = "https://plane.agency.gov"
+#
+# Where to look for the enrollment packet. Defaults to enrollment.toml in the
+# Garrison config directory (~/.config/garrison/enrollment.toml).
+# enrollment_packet = "/etc/garrison/enrollment.toml"
+#
+# Who this install belongs to, when the grant itself does not name an operator.
+# The plane resolves it to a registered operator and refuses if it cannot.
+# operator_upn = "dev@agency.gov"
