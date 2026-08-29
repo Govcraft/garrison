@@ -1,0 +1,33 @@
+# Garrison's engine: one daemon per user per machine.
+#
+# Install as a *user* unit (~/.config/systemd/user/garrison-agent.service, or
+# `task daemon:install`). The daemon owns the acton-ai runtime, the socket
+# under $XDG_RUNTIME_DIR, the sandbox host and the audit trail; editors reach
+# it through `garrison-agent acp`, which is a relay and starts this unit when
+# it finds nothing listening.
+#
+# It reads only the XDG configuration files: ~/.config/garrison/garrison.toml
+# and ~/.config/acton-ai/config.toml. No flags are passed here on purpose.
+
+[Unit]
+Description=Garrison governed coding agent (one per user, owns the audit trail)
+Documentation=https://github.com/Govcraft/garrison
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/garrison-agent serve
+WorkingDirectory=%h
+# A crash (exit 1, a signal) is retried. A refusal to start (exit 2: locked
+# or broken audit trail, unusable configuration, a control plane that turned
+# this install away) and a rejection (exit 3) are decisions, not crashes;
+# retrying them cannot change the answer, so an operator has to look.
+Restart=on-failure
+RestartPreventExitStatus=2 3
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

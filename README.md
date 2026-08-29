@@ -15,8 +15,10 @@ described below is direction, not checkout.
 
 ## What is implemented
 
-- ACP v1 over stdin/stdout for editor-spawned agents.
-- ACP v1 over a Unix-domain socket for a long-lived daemon.
+- One daemon per user per machine, serving ACP v1 over a Unix-domain socket
+  and owning the runtime, the sandbox host and the audit trail.
+- ACP v1 over stdin/stdout for editor-spawned hosts, as a relay to that
+  daemon: the spawned process runs no engine of its own.
 - In-memory session create, load, list, prompt, and cancellation.
 - Streaming model text and tool lifecycle events.
 - Human approval round-trips, timeouts, and per-connection approval caching.
@@ -69,8 +71,11 @@ Active tracking issues include
 ## Current architecture
 
 ```text
-ACP client (editor, terminal, or socket client)
-  └─ ClientConn actor
+editor ─ garrison-agent acp (relay) ─┐
+terminal ─ garrison-agent chat ──────┤ $XDG_RUNTIME_DIR/garrison-agent.sock
+socket client ───────────────────────┘
+  └─ garrison-agent serve (one per user; owns runtime, socket, audit trail)
+      └─ ClientConn actor
       └─ ThreadSupervisor / Thread actor
           └─ acton-ai prompt and tool loop
               ├─ configured LLM provider
@@ -81,6 +86,46 @@ ACP client (editor, terminal, or socket client)
 
 The intended control plane and IDE integrations are documented as roadmap
 architecture in [docs/garrison-agent-design.md](docs/garrison-agent-design.md).
+
+## Process topology
+
+One daemon per user per machine. `garrison-agent serve` is the only process
+that ever builds an acton-ai runtime, so it is the only owner of the policy,
+the sandbox host, the socket and the audit trail. Everything else is a
+client of its socket (`$XDG_RUNTIME_DIR/garrison-agent.sock`):
+
+- `garrison-agent acp`, the mode editors spawn, is a relay between its pipes
+  and that socket. It never builds an engine, so a spawned child cannot be a
+  second writer of the hash chain. Two VS Code windows, a JetBrains project
+  and a terminal `chat` are four clients of one daemon, one policy, one
+  trail.
+- The daemon's configuration is the one in force. `--config` on the relay is
+  read for `[server]` only; `--acton-config` is accepted and ignored with a
+  warning.
+- A daemon that is not running is started by the first `acp` or `chat` that
+  needs it when `[server] autostart` is on: through `systemctl --user start
+  garrison-agent` when that unit is loaded, otherwise as a detached child
+  rooted at `$HOME`. An autostarted daemon reads only the XDG configuration
+  files (`~/.config/garrison/garrison.toml`, `~/.config/acton-ai/config.toml`);
+  the relay's flags are never handed to it. With `autostart = false` the
+  client reports the missing daemon and starts nothing. `ping` never starts
+  anything.
+- Two guards, both kernel-owned and gone with the process, no pidfile: the
+  socket is probed before it is bound, and a second daemon on a live socket
+  refuses to start; acton-ai holds an exclusive advisory lock on the trail,
+  and a second daemon over the same trail refuses to start rather than fork
+  the chain.
+- Exit codes from `serve`: 2 is "refused to start" (locked or broken trail,
+  unusable configuration, a control plane that turned the install away), 3 is
+  a rejection, 1 is a malfunction. The packaged unit
+  (`packaging/systemd/garrison-agent.service`, `task daemon:install`) retries
+  only 1; 2 and 3 wait for an operator.
+- The boundary: with `[threads] project_root` unset the default root is the
+  daemon's working directory, `$HOME` under systemd or autostart, so any
+  workspace under home can host a session and each session is confined to
+  its own `cwd`. Workspaces elsewhere need `workspace_roots`. Language
+  servers are off in the shipped `garrison.toml` until they are spawned per
+  session root; see the comment there.
 
 ## Repository layout
 
@@ -94,6 +139,7 @@ architecture in [docs/garrison-agent-design.md](docs/garrison-agent-design.md).
 | `acton-ai.toml` | Implemented | Provider, context, sandbox, and acton-ai runtime configuration |
 | `config.toml` | Implemented | Control-plane (SchemaForge on acton-service) configuration |
 | `Taskfile.yml` | Implemented | Tasks that operate on this checkout |
+| `packaging/` | Implemented | The per-user systemd unit and packaging notes |
 | `hooks-service/` | Working | The enrollment hook and the Entra ID directory sync: adjudicates a token, provisions the install and its credential, keeps operators in step with the directory |
 | `site/` | Planned | Control-plane administration site |
 | `extensions/vscode/` | Implemented | VS Code ACP client, sidebar chat, approvals, and status |
@@ -109,14 +155,15 @@ by `agent/Cargo.toml` at `../../acton-ai`.
 # Compile and run the test suite.
 task test
 
-# Start the ACP daemon on the configured Unix socket.
+# Start the daemon on the configured Unix socket (or: task daemon:install).
 task agent
 
-# In another terminal, inspect the running daemon.
+# In another terminal, inspect the running daemon. Never starts one.
 task ping
 ```
 
-For editor-spawned stdio mode, run:
+Editors spawn the relay, which connects to the daemon and starts it if
+`[server] autostart` allows:
 
 ```sh
 cargo run -p garrison-agent -- acp

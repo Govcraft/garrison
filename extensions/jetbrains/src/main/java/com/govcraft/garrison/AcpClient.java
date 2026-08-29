@@ -34,10 +34,12 @@ final class AcpClient implements AutoCloseable {
               AgentRequestHandler requestHandler) throws IOException {
         this.notificationHandler = notificationHandler;
         this.requestHandler = requestHandler;
+        // `acp` is a relay to the per-user daemon's socket; the flags only say
+        // where that socket is. The daemon's configuration governs the session.
         String executable = settings.agentPath.isBlank() ? "garrison-agent" : settings.agentPath;
         var command = new java.util.ArrayList<>(List.of(executable, "acp"));
+        if (!settings.socket.isBlank()) command.addAll(List.of("--socket", settings.socket));
         if (!settings.configPath.isBlank()) command.addAll(List.of("--config", settings.configPath));
-        if (!settings.actonConfigPath.isBlank()) command.addAll(List.of("--acton-config", settings.actonConfigPath));
         process = new ProcessBuilder(command).directory(cwd.toFile()).start();
         writer = new BufferedWriter(new OutputStreamWriter(process.getOutputStream(), StandardCharsets.UTF_8));
         readers.submit(this::readStdout);

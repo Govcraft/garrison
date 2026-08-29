@@ -202,7 +202,8 @@ means every §1 item has a socket to plug into.
 ```
 GarrisonRuntime (acton-ai / acton-reactive)
 ├── acton-ai core: providers, tool registry, policy gate, audit actor, accountant
-├── ProtocolServer        — implemented: stdio/UDS ACP; one ClientConn per client
+├── ProtocolServer        — implemented: UDS ACP; one ClientConn per client
+│                            (one daemon per user; `acp` is a stdio relay to it)
 ├── ThreadSupervisor      — implemented: one in-memory Thread per conversation
 ├── LspServer             — implemented: one actor per configured language server
 ├── PtySupervisor         — planned
@@ -220,7 +221,8 @@ client identity.
 
 ## 5. Build order (RFQ-demo-first)
 
-1. ~~**ACP server over stdio and Unix sockets**~~ — implemented
+1. ~~**ACP server over stdio and Unix sockets**~~ — implemented; stdio is now
+   a relay to the per-user daemon (README, "Process topology")
 2. ~~**apply_patch + safety assessment**~~ — implemented
 3. ~~**Harden the implemented boundary:** enable sandboxing, validate ACP roots,
    and align every builtin with the session filesystem boundary~~ — implemented

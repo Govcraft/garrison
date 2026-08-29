@@ -97,7 +97,25 @@ read_write = ["~/.cache/uv"]
 # verdict (approved, and by whom) alongside the outcome, so refusals are on
 # the record exactly as successes are. `acton-ai audit verify` walks the chain.
 #
-# Kept inside the checkout during development so the trail travels with the
-# work; a deployment points this at a durable path outside the project tree.
+# One daemon per user owns this file, and it holds an exclusive lock on it
+# while it runs: a second daemon over the same trail refuses to start (exit
+# 2) instead of forking the chain. So the trail must be per user and must not
+# depend on where the daemon was started. With `path` omitted acton-ai uses
+# $XDG_DATA_HOME/acton-ai/audit.jsonl (~/.local/share/acton-ai/audit.jsonl),
+# which is exactly that. A relative path would resolve against the daemon's
+# working directory, which is $HOME under systemd and relay autostart, and
+# acton-ai does not expand `~` or `$XDG_DATA_HOME` in this key, so a
+# deployment that wants the garrison directory writes the absolute path:
+# path = "/home/<user>/.local/share/garrison/audit.jsonl"
+#
+# Keep the trail on a local filesystem: the lock is an advisory flock and is
+# not reliable on NFS.
 [audit]
-path = ".garrison/audit.jsonl"
+
+# Interrupted-turn checkpoints (session persistence). The same rule applies
+# when this section is enabled: `db_path` is resolved against the daemon's
+# working directory and is not tilde-expanded, so give it an absolute
+# per-user path, never a workspace-relative one.
+# [checkpoint]
+# db_path = "/home/<user>/.local/share/garrison/sessions.db"
+# policy = "abandon"

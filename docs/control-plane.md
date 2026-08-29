@@ -779,12 +779,57 @@ the plan from `plane:plan` before forcing anything.
 touches `schemas/` or `policies/` — strict-mode failures caught at review time
 are failures the runtime would otherwise refuse to hot-swap after merge.
 
+## Process topology on the agent side
+
+One daemon per user per machine. `garrison-agent serve` is the only process
+that ever builds an acton-ai runtime, so it is the only owner of the policy,
+the sandbox host, the socket and the audit trail. Everything else is a
+client of its socket (`$XDG_RUNTIME_DIR/garrison-agent.sock`):
+
+- `garrison-agent acp`, the mode editors spawn, is a relay between its pipes
+  and that socket. It never builds an engine, so a spawned child cannot be a
+  second writer of the hash chain. Two VS Code windows, a JetBrains project
+  and a terminal `chat` are four clients of one daemon, one policy, one
+  trail.
+- The daemon's configuration is the one in force. `--config` on the relay is
+  read for `[server]` only; `--acton-config` is accepted and ignored with a
+  warning.
+- A daemon that is not running is started by the first `acp` or `chat` that
+  needs it when `[server] autostart` is on: through `systemctl --user start
+  garrison-agent` when that unit is loaded, otherwise as a detached child
+  rooted at `$HOME`. An autostarted daemon reads only the XDG configuration
+  files (`~/.config/garrison/garrison.toml`, `~/.config/acton-ai/config.toml`);
+  the relay's flags are never handed to it. With `autostart = false` the
+  client reports the missing daemon and starts nothing. `ping` never starts
+  anything.
+- Two guards, both kernel-owned and gone with the process, no pidfile: the
+  socket is probed before it is bound, and a second daemon on a live socket
+  refuses to start; acton-ai holds an exclusive advisory lock on the trail,
+  and a second daemon over the same trail refuses to start rather than fork
+  the chain.
+- Exit codes from `serve`: 2 is "refused to start" (locked or broken trail,
+  unusable configuration, a control plane that turned the install away), 3 is
+  a rejection, 1 is a malfunction. The packaged unit
+  (`packaging/systemd/garrison-agent.service`, `task daemon:install`) retries
+  only 1; 2 and 3 wait for an operator.
+- The boundary: with `[threads] project_root` unset the default root is the
+  daemon's working directory, `$HOME` under systemd or autostart, so any
+  workspace under home can host a session and each session is confined to
+  its own `cwd`. Workspaces elsewhere need `workspace_roots`. Language
+  servers are off in the shipped `garrison.toml` until they are spawned per
+  session root; see the comment there.
+
+Enrollment happens in that one daemon, before it listens, so a machine has
+exactly one install identity: a fleet of editor windows is one
+`AgentInstall`, one credential and one seat, not one per window.
+
 ## Known gaps
 
-- **The daemon-side client is enrollment only.** The agent enrolls itself
-  under `[plane]` in `garrison.toml` and presents the credential
-  `schemas/credential.schema` describes. Heartbeat, bundle pull, and audit
-  shipping remain to be wired.
+- **The daemon speaks to the plane only to enroll.** There is a `[plane]`
+  section in `GarrisonConfig`, an enrollment client under
+  `agent/src/enrollment/`, and the install key it generates is the identity
+  `schemas/credential.schema` describes. There is no heartbeat, no bundle
+  pull and no audit shipping yet; after enrollment the daemon makes no call.
 - **Schemas are unsigned.** Every command prints `schema signature
   verification is disabled (signing.mode = off)`. SchemaForge can require
   ed25519, SSH allowed-signers, or cosign-keyless signatures over `schemas/`

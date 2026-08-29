@@ -8,10 +8,16 @@ import org.jetbrains.annotations.NotNull;
 
 @State(name = "GarrisonSettings", storages = @Storage("garrison.xml"))
 public final class GarrisonSettings implements PersistentStateComponent<GarrisonSettings.State> {
+    /**
+     * What the plugin needs to reach the agent. {@code garrison-agent acp} is a
+     * relay to the per-user daemon, so these locate the relay and its socket;
+     * the daemon's own configuration governs every session, which is why no
+     * acton-ai config path lives here.
+     */
     public static final class State {
         public String agentPath = "garrison-agent";
+        public String socket = "";
         public String configPath = "";
-        public String actonConfigPath = "";
     }
 
     private State state = new State();

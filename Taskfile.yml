@@ -18,19 +18,34 @@ tasks:
       - task: agent
 
   agent:
-    desc: Run garrison-agent as an ACP daemon on its configured Unix socket
+    desc: Run the garrison-agent daemon (one per user) on its configured Unix socket
     cmds:
       - cargo run -p garrison-agent -- serve
 
   acp:
-    desc: Run garrison-agent in editor-spawned ACP stdio mode
+    desc: Run the ACP relay (connects to the daemon, starting it if [server].autostart allows)
     cmds:
       - cargo run -p garrison-agent -- acp
 
   ping:
-    desc: Handshake with the running ACP daemon and print its status
+    desc: Handshake with the running daemon and print its status (never starts one)
     cmds:
       - cargo run -p garrison-agent -- ping
+
+  daemon:install:
+    desc: Install and enable the per-user systemd unit for garrison-agent
+    # The unit runs /usr/bin/garrison-agent; install the binary there first
+    # (cargo build --release && sudo install -m755 target/release/garrison-agent /usr/bin/).
+    cmds:
+      - mkdir -p ~/.config/systemd/user
+      - cp packaging/systemd/garrison-agent.service ~/.config/systemd/user/
+      - systemctl --user daemon-reload
+      - systemctl --user enable --now garrison-agent
+
+  daemon:logs:
+    desc: Follow the daemon's journal
+    cmds:
+      - journalctl --user -u garrison-agent -f --no-pager
 
   test:
     desc: Run the Rust workspace test suite

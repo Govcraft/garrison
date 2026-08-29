@@ -1,10 +1,41 @@
-# Garrison server configuration — local development.
+# Garrison server configuration.
+#
+# One `garrison-agent serve` per user per machine reads this file. Editors
+# spawn `garrison-agent acp`, which is a relay to that daemon's socket and
+# runs no engine of its own, so this file is the one configuration in force
+# for every editor window and every terminal chat on this seat.
+#
+# Where the daemon looks: ./garrison.toml, then
+# $XDG_CONFIG_HOME/garrison/garrison.toml (~/.config/garrison/garrison.toml).
+# A daemon started by a relay, or by systemd, runs with its working directory
+# at $HOME and is handed only the XDG file; the relay's own --config flag is
+# never passed on, so a workspace-local file cannot become every later
+# editor's policy.
+
+[server]
+# The Unix socket the daemon listens on and every client connects to. The
+# default is $XDG_RUNTIME_DIR/garrison-agent.sock (per user, mode 0700), so
+# it is left unset here. A --socket flag overrides it on either side.
+# socket = "/run/user/1000/garrison-agent.sock"
+#
+# Whether a client that finds no daemon may start one. On (the default), the
+# relay starts the daemon through `systemctl --user start garrison-agent` when
+# that unit is loaded, otherwise as a detached child rooted at $HOME. Off, a
+# missing daemon is an error the client reports; only an operator or systemd
+# starts the engine. `garrison-agent ping` never starts anything either way.
+autostart = true
+# How long a client waits for an autostarted daemon to answer.
+start_timeout_secs = 10
 
 [threads]
-# project_root defaults to the working directory the server starts in. It is
-# the boundary, not a default: a client asking for a session anywhere else is
-# refused, and every tool a turn registers can reach that tree and nothing
-# else. List further trees in workspace_roots to approve them too.
+# The boundary rule for a shared daemon. project_root defaults to the working
+# directory the daemon starts in: under systemd that is %h, and under relay
+# autostart it is $HOME, so any workspace under the home directory can host a
+# session and each session is still confined to its own cwd. Workspaces
+# elsewhere (/srv, /opt) must be listed in workspace_roots or the session is
+# refused as "outside the approved roots". An administrator narrows the
+# default by setting project_root to one tree.
+# project_root = "/home/dev/projects"
 # workspace_roots = ["/srv/projects/other"]
 system_prompt = "You are Garrison, a governed coding agent. Work inside the project root. Read before you write, prefer small verifiable steps, and explain what you changed."
 
@@ -14,11 +45,18 @@ timeout_secs = 300
 # state still reaches the operator.
 auto_approve = ["read_file", "glob", "grep", "list_directory", "calculate", "get_context_remaining", "update_plan", "lsp_diagnostics", "lsp_hover", "lsp_definition", "lsp_references"]
 
-# Language servers, routed by file extension. All four lsp_* tools are
-# read-only queries, hence their place in auto_approve above.
-[lsp_servers.rust]
-command = "rust-analyzer"
-extensions = ["rs"]
+# Language servers, routed by file extension. Deliberately none by default.
+#
+# Servers are spawned once, at launch, rooted at the daemon's project root.
+# With one daemon per user that root is $HOME, not a workspace, so a server
+# started here would index the wrong tree and the lsp_* tools would answer
+# from nothing while looking as if they worked. Rather than ship that
+# silently degraded, the block is off until servers are spawned per session
+# root (a tracked follow-up). Enable it only on a daemon whose
+# [threads] project_root names the one tree the server should index.
+# [lsp_servers.rust]
+# command = "rust-analyzer"
+# extensions = ["rs"]
 
 # [plane]
 # Enrolling with a control plane. Omit this section entirely and the agent runs
@@ -32,7 +70,8 @@ extensions = ["rs"]
 # cannot ground a fleet that has already been admitted.
 #
 # A machine that has *not* enrolled and is refused, or cannot reach the plane,
-# does not start. A governed agent that runs anyway is not governed.
+# does not start (exit 2, which the systemd unit does not retry). A governed
+# agent that runs anyway is not governed.
 #
 # url = "https://plane.agency.gov"
 #
