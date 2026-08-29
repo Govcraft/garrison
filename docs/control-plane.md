@@ -543,6 +543,120 @@ The same sequence runs in CI against a containerized plane
 `schemaforge apply` and `serve`, one `garrison-hooks`, a keypair generated in
 the test whose SPKI goes onto a real `InstallCredential` row.
 
+### Seat entitlement, from the agent's side — `agent/src/entitlement/`
+
+**Implemented.** A seat is not a line in a licence file. It is a row on this
+plane, and the daemon runs only while that row says it may. Every turn passes
+a gate that spends the seat, and a turn that starts on a live seat is ended
+when the seat stops being live under it.
+
+**What is read.** One check is three calls through the shared plane component,
+in the order the rule needs them:
+
+1. `AgentInstall`, this machine's own row, which names its operator.
+2. `Seat`, filtered to that operator.
+3. `Organization`, for `impact_level`, which sets how long a stale answer may
+   be spent.
+
+Nothing here holds a credential of its own. The reader asks `PlaneSession`
+for an `Authenticate` and spends the `Api` it gets back, exactly like the
+policy pull and the audit shipper. A 401 costs one `RevokeBearer` and one
+retry, because the one benign cause of a 401 is a bearer that expired between
+being handed out and being spent. A second 401 is the plane meaning it.
+
+**The rule.** `entitlement::verdict::adjudicate` is a pure function over those
+three rows, and it decides in this order:
+
+| Condition | Answer |
+|---|---|
+| install `status` is not `enrolled` or `active` | refused, `install_not_active` |
+| install has no operator | refused, `install_unbound` |
+| an `active` seat for that operator, not past `expires_at` | entitled, at that seat's tier |
+| a seat exists but every one is revoked | refused, `seat_revoked`, with the recorded reason |
+| a seat exists but its `expires_at` has passed | refused, `seat_expired` |
+| a seat exists in some other state | refused, `seat_not_active`, naming the state |
+| no seat at all | refused, `no_seat` |
+
+When several seats are live the longest-lasting one is spent, and a seat with
+no expiry outlasts every dated one. An `expires_at` that does not parse counts
+as expired: the daemon cannot tell whether an unreadable date is in the
+future, and a seat it cannot date is not a seat it may spend.
+
+**Where the answer comes from at turn time.** The gate answers from the
+standing already in the actor's model, in one message pass, with no network
+call on the turn path. That is not an optimization. A gate has five seconds to
+answer, and a seat check is three plane calls behind a token exchange; a gate
+that went to the network there would, on a slow plane, blow the deadline and
+come back as the generic "a gate could not be asked", collapsing "your seat
+was revoked" and "the plane is unreachable" into one indistinguishable
+failure. Freshness is the timer's job instead: `[plane] seat_check_secs`
+(default 60, clamped to 15..900) drives a repeating `send_every` refresh, and
+the daemon performs one check at startup before it accepts a connection.
+
+**Offline grace.** A plane that cannot be reached is not the same as a plane
+that said no, and only the first gets a window. How long the last confirmed
+entitlement may be spent without reconfirmation comes from the organization's
+`impact_level` and the seat's tier:
+
+| `impact_level` | standard | elevated |
+|---|---|---|
+| `commercial` | 72h | 24h |
+| `fedramp_moderate`, `il2` | 24h | 4h |
+| `fedramp_high`, `il4` | 4h | 0 |
+| `il5`, or an unrecognized value | 0 | 0 |
+
+`[plane] offline_grace_secs` may shorten any of these and can never lengthen
+one: a deployment can be stricter than its impact level requires, never more
+generous. A tier the daemon does not recognize is read as `elevated`, the
+stricter row.
+
+A refusal carries no window at all. A revoked seat refuses the next turn and
+every turn after it, however long the plane is then unreachable for, because a
+refusal is an answer rather than an outage. That is the property that stops a
+revoked install from running out the rest of what would have been its grace.
+
+**Two refusals, not one.** When the seat is revoked, absent, or expired, the
+turn is refused with `SEAT_REFUSED` (-32014). When the seat cannot be
+confirmed and the last confirmation has aged past its window, it is refused
+with `PLANE_UNREACHABLE` (-32015). Both carry prose naming the plane and, for
+a revocation, the reason the console recorded. An operator reading a refused
+prompt can tell which of the two happened without reading a log.
+
+**A turn in flight is not grandfathered.** When a refresh turns an admitting
+standing into a refusing one, the monitor broadcasts `EntitlementLost` on the
+runtime's broker. Sessions subscribe and end the turn they are running with
+that refusal, so a revocation reaches a turn that has already started rather
+than only the next one. The broadcast fires on the transition, so a
+persistently revoked seat does not re-cancel anything.
+
+**The cache.** `entitlement.json` beside the install key, mode 0600, holds the
+last standing so a daemon that restarts while the plane is down still knows
+what it last confirmed and how much of its window is left. It is deliberately
+unsigned: the install key sits in the same directory under the same uid, so
+anyone who can rewrite the cache can already sign it. What bounds the damage
+is the grace table, not a signature, and at `fedramp_high` elevated, `il4`
+elevated, `il5`, or an unrecognized impact level the window is zero and the
+file buys an attacker nothing. Every read failure is a missing cache, which is
+a refusal.
+
+**Status.** `_garrison/status` gains an `entitlement` block: the state, the
+seat and tier when entitled, the refusal reason when not, the impact level,
+when the plane was last confirmed, the grace window and when it runs out, when
+the next check is due, and the last error. `garrison-agent ping` prints a
+`seat:` line from it.
+
+**Proved end to end** against a containerized plane
+(`agent/tests/seat_entitlement.rs`): one PostgreSQL 16, one `schemaforge
+apply` and `serve` on this repository's own schemas and policies, and the
+daemon's own reader spending an `operator` bearer. An `assigned` seat does not
+entitle; activated, it does, at the tier the console set; a PATCH revoking a
+seat with no reason is refused by the `@require`, so the explanation is a fact
+the schema enforces rather than a convention; revoked with a reason, the very
+next check refuses and carries that reason; that refusal is still a refusal
+thirty days later; and a retired install is refused whatever its operator's
+seats say.
+
+
 ### Fleet — `schemas/fleet.schema`
 
 | Schema | What it answers |
@@ -1277,11 +1391,12 @@ exactly one install identity: a fleet of editor windows is one
 
 ## Known gaps
 
-- **The daemon speaks to the plane only to enroll.** There is a `[plane]`
-  section in `GarrisonConfig`, an enrollment client under
-  `agent/src/enrollment/`, and the install key it generates is the identity
-  `schemas/credential.schema` describes. There is no heartbeat, no bundle
-  pull and no audit shipping yet; after enrollment the daemon makes no call.
+- **The daemon does not heartbeat, and does not pull policy.** It enrolls
+  (`agent/src/enrollment/`), it exchanges its install key for a bearer
+  (`agent/src/plane/`), and it checks its seat on a timer
+  (`agent/src/entitlement/`). `AgentInstall.last_heartbeat` is never written,
+  and no bundle is pulled, so a console cannot yet tell a daemon that is
+  quietly wedged from one that was shut down cleanly.
 - **Schemas are unsigned.** Every command prints `schema signature
   verification is disabled (signing.mode = off)`. SchemaForge can require
   ed25519, SSH allowed-signers, or cosign-keyless signatures over `schemas/`

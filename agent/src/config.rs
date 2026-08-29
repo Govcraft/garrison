@@ -238,9 +238,60 @@ pub struct PlaneConfig {
     /// prefers its own record over anything a machine claims, so leaving this
     /// unset is correct whenever the grant was issued to an individual.
     pub operator_upn: Option<String>,
+
+    /// How often this install re-confirms that its operator holds a seat.
+    ///
+    /// Also the bound on how long a revocation takes to bite: at most one
+    /// interval for the next turn, and the same for a turn already running.
+    /// Clamped to 15..=900 by [`seat_check_interval`](Self::seat_check_interval),
+    /// so a `garrison.toml` cannot turn the check into a day-long cache.
+    /// Zero, or absent, is the 60-second default.
+    pub seat_check_secs: u64,
+
+    /// A ceiling on how long this install may run without reaching the plane.
+    ///
+    /// The window itself comes from the organization's `impact_level` and the
+    /// seat's tier ([`crate::entitlement::grace_period`]). This key may only
+    /// **shorten** it. A file on the machine being governed must not be able
+    /// to widen how long that machine runs unsupervised, so a value larger
+    /// than the table's is ignored, and `0` means "the plane must answer for
+    /// every turn".
+    pub offline_grace_secs: Option<u64>,
 }
 
 impl PlaneConfig {
+    /// How often the seat is re-confirmed, within bounds this file cannot
+    /// escape.
+    ///
+    /// Pure. The floor stops a deployment from hammering the plane; the
+    /// ceiling stops one from caching an entitlement for so long that
+    /// revoking a seat stops meaning anything.
+    #[must_use]
+    pub const fn seat_check_interval(&self) -> Duration {
+        const DEFAULT: u64 = 60;
+        const FLOOR: u64 = 15;
+        const CEILING: u64 = 900;
+
+        let seconds = match self.seat_check_secs {
+            0 => DEFAULT,
+            asked if asked < FLOOR => FLOOR,
+            asked if asked > CEILING => CEILING,
+            asked => asked,
+        };
+        Duration::from_secs(seconds)
+    }
+
+    /// The deployment's ceiling on offline grace, when it set one.
+    ///
+    /// Pure. `None` means the grace table stands unmodified.
+    #[must_use]
+    pub const fn offline_grace_cap(&self) -> Option<Duration> {
+        match self.offline_grace_secs {
+            Some(seconds) => Some(Duration::from_secs(seconds)),
+            None => None,
+        }
+    }
+
     /// Where the install-token exchange lives.
     ///
     /// Pure, and the only place the fallback is spelled, so a caller cannot

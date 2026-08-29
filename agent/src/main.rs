@@ -460,6 +460,9 @@ async fn ping(socket: Option<PathBuf>) -> Result<(), GarrisonError> {
         status.policy.approval_timeout_secs,
         status.policy.auto_approve.join(", "),
     );
+    if let Some(entitlement) = status.entitlement.as_ref() {
+        println!("  seat:       {}", seat_line(entitlement));
+    }
     println!("  audit:      {}", audit_line(&status.audit));
     println!(
         "  sandbox:    {}",
@@ -475,6 +478,36 @@ async fn ping(socket: Option<PathBuf>) -> Result<(), GarrisonError> {
     );
 
     Ok(())
+}
+
+/// The seat summary `ping` prints, in one line. Pure.
+///
+/// The state comes first because it is the word an operator triages on, and
+/// the reason comes last because it is the sentence they act on. A refusal
+/// prints its whole explanation: `ping` is where somebody looks when every
+/// prompt is failing, and truncating the answer there would send them to the
+/// logs for no reason.
+fn seat_line(status: &acp::EntitlementStatus) -> String {
+    let mut line = status.state.clone();
+
+    if let Some(tier) = status.tier.as_deref() {
+        line.push_str(&format!(" ({tier})"));
+    }
+    if let Some(checked) = status.checked_at.as_deref() {
+        line.push_str(&format!(" checked={checked}"));
+    }
+    if let Some(until) = status.grace_until.as_deref() {
+        line.push_str(&format!(" grace_until={until}"));
+    }
+    line.push_str(&format!(" every={}s", status.check_interval_secs));
+    if let Some(error) = status.last_error.as_deref() {
+        line.push_str(&format!(" last_error={error}"));
+    }
+    if let Some(reason) = status.reason.as_deref() {
+        line.push_str(&format!("\n              {reason}"));
+    }
+
+    line
 }
 
 /// The audit summary `ping` prints, in one line. Pure.

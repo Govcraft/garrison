@@ -182,6 +182,9 @@ pub enum StatusPart {
     Plane(acp::PlaneStatus),
     /// From the turn router, which sees every compaction.
     Context(acp::ContextStatus),
+    /// From the seat monitor: whether a seat entitles this install to run at
+    /// all, and how long the last answer may outlive the plane.
+    Entitlement(acp::EntitlementStatus),
     /// From the audit anchor keeper: the writer's health, what the trail
     /// promises, and where the head is anchored.
     ///
@@ -1373,6 +1376,7 @@ fn own_status(context: &Dispatch) -> acp::GarrisonStatus {
         plane: None,
         context: None,
         session_store: None,
+        entitlement: None,
     }
 }
 
@@ -1426,6 +1430,7 @@ fn assemble(
             StatusPart::Threads(threads) => status.threads = Some(threads),
             StatusPart::Plane(plane) => status.plane = Some(plane),
             StatusPart::Context(context) => status.context = Some(context),
+            StatusPart::Entitlement(entitlement) => status.entitlement = Some(entitlement),
             // The keeper asked the writer itself, so its answer replaces the
             // head this connection read on its own — including the head,
             // which the keeper reports from the same barrier that produced
@@ -1679,6 +1684,7 @@ mod tests {
             plane: None,
             session_store: None,
             context: None,
+            entitlement: None,
         }
     }
 
