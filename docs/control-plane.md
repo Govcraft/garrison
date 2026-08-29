@@ -167,6 +167,43 @@ roles that already read the trail, and the exported column set is
 `@exportable ∩ readable`. `AuditEvent.detail` is deliberately left out: a bulk
 file is the wrong place for whatever a tool happened to attach.
 
+## Write-time rules: `@default` is what binds a value for `@require`
+
+A `@require` predicate is evaluated against the in-flight write. A field the
+client omitted is **not bound**, and an unbound reference is a fail-closed
+rejection reported as a `500` schema-authoring fault — not the `422` carrying
+the message the rule author wrote.
+
+The literal `default(value)` *modifier* does not help: it is applied at
+persistence, after the rule phases. Only the `@default("expr")` *annotation*
+runs early enough (`@default` → `@compute` → `@require`).
+
+None of that is a SchemaForge defect — the phase order and the fail-closed
+treatment of an absent reference are both documented, and the `500` correctly
+names the schema as the fault. It is written down here because the schemas in
+this directory got it wrong first, and the failure surfaces on a request that
+looks like it should have worked.
+
+The consequence is easy to miss, because the failure is not in the rule's own
+field. `Seat.revocation_reason` reads `status != 'revoked' || size(...) > 0`,
+so a create that simply omitted `status` and took its default blew up on
+`status`, on the ordinary happy path:
+
+```
+POST .../Seat/entities  {"operator": ..., "organization": ...}
+  500  @require on field 'revocation_reason' could not be evaluated:
+       undeclared reference to 'status'
+```
+
+So every field named by a `@require` anywhere in `schemas/` now carries a
+`@default` annotation alongside its literal default. The pair looks redundant
+and is not: the modifier is the column's declared default, the annotation is
+what makes the predicate evaluable. Deleting either changes behavior.
+
+The rule when adding a `@require`: list every field the expression names, and
+confirm each is `required` or carries `@default`. Then test the create that
+omits the optional fields, not just the one that violates the rule.
+
 ## Roles
 
 `policies/role_ranks.toml` orders the hierarchy. Ranks drive the
