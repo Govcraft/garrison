@@ -203,12 +203,26 @@ impl SandboxStatus {
 }
 
 /// What the audit trail can say about itself.
+///
+/// The four states of [`state`](Self::state) are what an operator triages on,
+/// and they are deliberately four rather than a boolean: `disabled` (nothing
+/// is being recorded), `configured` (a trail is armed and nothing has been
+/// written to it yet), `healthy` (every append reached the disk), and
+/// `degraded` (at least one did not, so the record is incomplete). A daemon
+/// that cannot ask its own writer reports `degraded` and never `healthy`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct AuditStatus {
     /// Whether the runtime is recording tool invocations at all.
     pub enabled: bool,
+    /// Where the audit stands, in one word.
+    #[serde(default)]
+    pub state: crate::audit::AuditState,
+    /// What an append promises before it is acknowledged: `best_effort` or
+    /// `strict`. Absent when no trail is armed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durability: Option<String>,
     /// The hash at the end of the chain, when the runtime will disclose it.
     ///
     /// Read from `ActonAI::audit_head()` at the moment of the request. Absent
@@ -217,6 +231,83 @@ pub struct AuditStatus {
     /// guessing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chain_head: Option<String>,
+    /// The sequence number that head carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<u64>,
+    /// The trail's identity, once acton-ai has sealed one into the chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trail_id: Option<String>,
+    /// Entries this process has written and, when strict, synced.
+    #[serde(default)]
+    pub appended: u64,
+    /// Appends this process could not write.
+    #[serde(default)]
+    pub failures: u64,
+    /// The sequence number of the first entry that failed to reach the disk,
+    /// which is where an auditor starts reading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_failed_sequence: Option<u64>,
+    /// What the operating system said about the most recent failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// When the writer first failed, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded_since: Option<String>,
+    /// The externally anchored head, which is what makes a tail truncation
+    /// detectable. Absent when nothing anchors this trail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<AnchorStatus>,
+}
+
+impl AuditStatus {
+    /// What a connection can say before any subsystem has described itself.
+    ///
+    /// `enabled` is known from the runtime; everything else waits for the
+    /// audit keeper's part, and a daemon without a keeper reports the state
+    /// it can actually justify rather than a healthy-looking default.
+    #[must_use]
+    pub fn undescribed(enabled: bool) -> Self {
+        Self {
+            enabled,
+            state: if enabled {
+                crate::audit::AuditState::Configured
+            } else {
+                crate::audit::AuditState::Disabled
+            },
+            durability: None,
+            chain_head: None,
+            sequence: None,
+            trail_id: None,
+            appended: 0,
+            failures: 0,
+            first_failed_sequence: None,
+            last_error: None,
+            degraded_since: None,
+            anchor: None,
+        }
+    }
+}
+
+/// Where the chain head is remembered outside the trail.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct AnchorStatus {
+    /// The anchor file.
+    pub path: String,
+    /// The sequence number it vouches for, absent until one is written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<u64>,
+    /// The hash it vouches for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+    /// When it was last written, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchored_at: Option<String>,
+    /// Why the last attempt to write it failed, when one did. An anchor that
+    /// stops advancing while the trail grows is a finding in its own right.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 /// What Garrison attaches to a `session/prompt` response's `_meta`.

@@ -2,6 +2,7 @@
 
 pub mod admission;
 pub mod approval;
+pub mod audit;
 pub mod auth;
 pub mod boundary;
 pub mod client;

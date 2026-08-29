@@ -222,9 +222,10 @@ pub async fn build_setup(
 
     // Before any actor, any listener, and any thread. An install the plane
     // turned away must not reach the point of having somewhere to run a turn.
-    if let Some(plane) = config.plane.as_ref() {
-        crate::enrollment::ensure(plane, &sandbox).await?;
-    }
+    let enrolled = match config.plane.as_ref() {
+        Some(plane) => crate::enrollment::ensure(plane, &sandbox).await?,
+        None => None,
+    };
 
     let mut runtime = ai.runtime().clone();
     let project_root = resolve_project_root(config.threads.project_root.as_deref())?;
@@ -232,11 +233,16 @@ pub async fn build_setup(
     let router = spawn_router(&mut runtime).await;
     let supervisor = spawn_supervisor(&mut runtime).await;
     let lsp = spawn_lsp(&mut runtime, config, &project_root).await;
+    let audit = spawn_audit(&mut runtime, ai, config, enrolled).await?;
 
     // Ordered lists, because order is the contract: gates are asked first to
     // last and the first refusal wins; describers fill the status in sequence.
-    let gates: Vec<ActorHandle> = Vec::new();
-    let describers: Vec<ActorHandle> = vec![supervisor.clone()];
+    let mut gates: Vec<ActorHandle> = Vec::new();
+    let mut describers: Vec<ActorHandle> = vec![supervisor.clone()];
+    if let Some(keeper) = audit {
+        gates.push(keeper.clone());
+        describers.push(keeper);
+    }
 
     Ok(ServerSetup {
         supervisor,
@@ -258,6 +264,20 @@ async fn spawn_router(runtime: &mut ActorRuntime) -> ActorHandle {
 /// The session supervisor.
 async fn spawn_supervisor(runtime: &mut ActorRuntime) -> ActorHandle {
     ThreadSupervisor::spawn(runtime).await
+}
+
+/// The audit anchor keeper, which is also a turn gate.
+///
+/// Refuses to start when a required trail is not armed, or when the trail and
+/// its anchor disagree; see [`crate::audit::spawn`], which owns both rules.
+async fn spawn_audit(
+    runtime: &mut ActorRuntime,
+    ai: &ActonAI,
+    config: &GarrisonConfig,
+    enrolled: Option<crate::enrollment::Record>,
+) -> Result<Option<ActorHandle>, GarrisonError> {
+    let install = enrolled.map(|record| record.install);
+    crate::audit::spawn(runtime, ai, config, install).await
 }
 
 /// The configured language servers.

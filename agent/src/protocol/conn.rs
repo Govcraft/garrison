@@ -156,6 +156,13 @@ pub struct Describe;
 pub enum StatusPart {
     /// From the session supervisor.
     Threads(acp::ThreadsStatus),
+    /// From the audit anchor keeper: the writer's health, what the trail
+    /// promises, and where the head is anchored.
+    ///
+    /// Boxed because it is by far the widest part, and every `StatusPart` in
+    /// flight — one per describer, on every status request — would otherwise
+    /// be sized for it.
+    Audit(Box<acp::AuditStatus>),
 }
 
 impl Request for Describe {
@@ -990,10 +997,7 @@ fn own_status(context: &Dispatch) -> acp::GarrisonStatus {
             approval_timeout_secs: defaults.approval_timeout.as_secs(),
             auto_approve: defaults.auto_approve.as_ref().clone(),
         },
-        audit: acp::AuditStatus {
-            enabled: context.setup.audited,
-            chain_head: None,
-        },
+        audit: acp::AuditStatus::undescribed(context.setup.audited),
         sandbox: context.setup.sandbox.clone(),
         threads: None,
     }
@@ -1047,6 +1051,11 @@ fn assemble(
     for part in parts {
         match part {
             StatusPart::Threads(threads) => status.threads = Some(threads),
+            // The keeper asked the writer itself, so its answer replaces the
+            // head this connection read on its own — including the head,
+            // which the keeper reports from the same barrier that produced
+            // the health beside it.
+            StatusPart::Audit(audit) => status.audit = *audit,
         }
     }
     status
@@ -1238,10 +1247,7 @@ mod tests {
                 approval_timeout_secs: 1,
                 auto_approve: Vec::new(),
             },
-            audit: acp::AuditStatus {
-                enabled: true,
-                chain_head: None,
-            },
+            audit: acp::AuditStatus::undescribed(true),
             sandbox: acp::SandboxStatus::disabled(),
             threads: None,
         }

@@ -728,10 +728,7 @@ mod tests {
                 approval_timeout_secs: 30,
                 auto_approve: Vec::new(),
             },
-            audit: acp::AuditStatus {
-                enabled: true,
-                chain_head: None,
-            },
+            audit: acp::AuditStatus::undescribed(true),
             sandbox: acp::SandboxStatus {
                 enabled: true,
                 hardening: Some("enforce".to_string()),

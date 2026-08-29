@@ -90,7 +90,8 @@ pub mod error_code {
     pub const PLANE_UNREACHABLE: i32 = -32015;
     /// The policy in force forbids the turn.
     pub const POLICY_REFUSED: i32 = -32016;
-    /// The audit trail cannot be shipped and its backlog is past its bound.
+    /// The turn cannot be recorded: the local writer is degraded, or the
+    /// trail cannot be shipped and its backlog is past its bound.
     pub const AUDIT_SHIPPING_REFUSED: i32 = -32017;
     /// The session store is unavailable.
     pub const STORE_UNAVAILABLE: i32 = -32018;
