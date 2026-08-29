@@ -109,7 +109,9 @@ pub async fn build_ai(acton_config: Option<&Path>) -> Result<ActonAI, GarrisonEr
         .tool_policy(ToolPolicy::new().on_approval(approval_hook))
         .launch()
         .await
-        .map_err(|error| GarrisonError::configuration("acton-ai", error.to_string()))?;
+        .map_err(|error| {
+            GarrisonError::configuration("acton-ai", launch_refusal(&error.to_string()))
+        })?;
 
     if ai.provider_count() == 0 {
         return Err(GarrisonError::configuration(
@@ -119,6 +121,28 @@ pub async fn build_ai(acton_config: Option<&Path>) -> Result<ActonAI, GarrisonEr
     }
 
     Ok(ai)
+}
+
+/// Rewrites acton-ai's launch failure into something an operator can act on.
+///
+/// The one case that matters is the audit trail already being owned by
+/// another process: acton-ai refuses to spawn a second writer of a hash chain
+/// (an exclusive advisory lock on the trail), and the reason is almost always
+/// that a `garrison-agent serve` is already running for this user. The
+/// message says so and names the two ways out. Everything else passes
+/// through unchanged. Pure.
+fn launch_refusal(message: &str) -> String {
+    if message.contains("already owned by another process") {
+        format!(
+            "{message}. There is one daemon per user per machine and it owns the audit trail; \
+             another `garrison-agent serve` is most likely running (check `garrison-agent ping` \
+             or `systemctl --user status garrison-agent`). Stop it, or point this one at a \
+             different trail. This is a refusal to start (exit 2), not a crash: restarting \
+             will not change the answer"
+        )
+    } else {
+        message.to_string()
+    }
 }
 
 /// Refuses to launch when the default provider needs an API key it lacks.
@@ -466,6 +490,28 @@ mod tests {
         api_key_preflight(&config).expect("a keyed provider must pass");
 
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_locked_trail_is_explained_as_a_second_daemon() {
+        let upstream = "configuration error in 'audit.path': the audit trail at /x/audit.jsonl \
+                        is already owned by another process (its exclusive lock is held)";
+        let explained = launch_refusal(upstream);
+
+        assert!(
+            explained.starts_with(upstream),
+            "the upstream text is kept verbatim"
+        );
+        assert!(explained.contains("one daemon per user per machine"));
+        assert!(explained.contains("exit 2"));
+    }
+
+    #[test]
+    fn other_launch_failures_pass_through_unchanged() {
+        assert_eq!(
+            launch_refusal("no provider configured"),
+            "no provider configured"
+        );
     }
 
     #[test]

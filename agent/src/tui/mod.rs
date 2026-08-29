@@ -52,7 +52,7 @@ use acton_reactive::prelude::*;
 use crossterm::event::{Event, EventStream};
 use message::{FromAgent, KeyPressed, Pasted, ScreenResized, Shutdown, Wire};
 use ratatui::layout::Size;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::watch;
@@ -65,10 +65,16 @@ const CLIENT_NAME: &str = "garrison-chat";
 ///
 /// # Errors
 ///
-/// A socket that will not connect, a handshake the agent refuses, and any
-/// failure taking over or giving back the terminal.
-pub async fn run(socket: &Path, cwd: PathBuf, approve_all: bool) -> Result<(), GarrisonError> {
-    let mut client = DuplexClient::connect(socket).await?;
+/// A handshake the agent refuses, and any failure taking over or giving back
+/// the terminal. The connection is the caller's to make, so that whether a
+/// missing daemon gets started is decided in one place
+/// ([`crate::daemon::connect_or_start`]) and not here.
+pub async fn run(
+    stream: tokio::net::UnixStream,
+    cwd: PathBuf,
+    approve_all: bool,
+) -> Result<(), GarrisonError> {
+    let mut client = DuplexClient::from_stream(stream);
 
     let request = acp::InitializeRequest::new(acp::PROTOCOL_VERSION).client_info(
         acp::Implementation::new(CLIENT_NAME, env!("CARGO_PKG_VERSION")),

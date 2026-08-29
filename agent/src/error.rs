@@ -174,6 +174,24 @@ impl GarrisonError {
         matches!(self.kind, GarrisonErrorKind::Configuration { .. })
     }
 
+    /// Whether this is an enrollment failure.
+    #[must_use]
+    pub const fn is_enrollment(&self) -> bool {
+        matches!(self.kind, GarrisonErrorKind::Enrollment { .. })
+    }
+
+    /// Whether the daemon refused to start, as opposed to failing while it ran.
+    ///
+    /// A configuration the daemon will not accept, or a control plane that
+    /// turned the install away, are decisions and not malfunctions: nothing
+    /// about restarting the process changes the answer. A supervisor that
+    /// sees this must stop and let an operator look, which is why `serve`
+    /// maps it to its own exit code and the systemd unit refuses to retry it.
+    #[must_use]
+    pub const fn is_refusal_to_start(&self) -> bool {
+        self.is_configuration() || self.is_enrollment()
+    }
+
     /// Whether this is a refusal rather than a malfunction.
     ///
     /// A rejected patch is a decision the system made on purpose. Callers that
@@ -227,6 +245,16 @@ mod tests {
         // system broke or whether it refused on purpose.
         assert!(GarrisonError::patch_rejected("outside the project root").is_rejection());
         assert!(!GarrisonError::runtime("provider unreachable").is_rejection());
+    }
+
+    #[test]
+    fn a_refusal_to_start_is_a_decision_not_a_crash() {
+        // Restarting cannot fix either of these; a supervisor must not try.
+        assert!(GarrisonError::configuration("audit.path", "locked").is_refusal_to_start());
+        assert!(GarrisonError::enrollment("token already spent").is_refusal_to_start());
+        assert!(GarrisonError::enrollment("token already spent").is_enrollment());
+        assert!(!GarrisonError::transport("/run/x.sock", "refused").is_refusal_to_start());
+        assert!(!GarrisonError::runtime("provider unreachable").is_refusal_to_start());
     }
 
     #[test]

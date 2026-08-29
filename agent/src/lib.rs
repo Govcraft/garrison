@@ -6,6 +6,7 @@ pub mod auth;
 pub mod boundary;
 pub mod client;
 pub mod config;
+pub mod daemon;
 pub mod duplex;
 pub mod enrollment;
 pub mod error;

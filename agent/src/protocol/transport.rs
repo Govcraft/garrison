@@ -54,19 +54,19 @@ pub struct UnixListener {
 impl UnixListener {
     /// Binds a Unix domain socket at `path`.
     ///
-    /// A socket file left behind by a previous process is removed first. This
-    /// is a deliberate choice and not an entirely safe one: if another agent
-    /// really is listening, this steals its endpoint. The alternative — refuse
-    /// to start when the file exists — is worse in practice, because the file
-    /// outlives any process killed with `SIGKILL` and the common case by far
-    /// is a stale socket rather than a live rival. A connect probe would
-    /// distinguish them; that is worth adding when the daemon grows a
-    /// supervisor that might genuinely race itself.
+    /// A socket file already at `path` is probed before anything is done to
+    /// it. If something answers, another daemon owns this endpoint and this
+    /// process refuses to start: there is one engine per user, and stealing
+    /// its socket would leave two of them holding one audit trail. If nothing
+    /// answers, the file is what a process killed with `SIGKILL` leaves
+    /// behind, and it is removed with a warning. The probe is what makes the
+    /// two cases distinguishable; refusing on the mere presence of the file
+    /// would make every crash a manual clean-up.
     ///
     /// # Errors
     ///
-    /// Returns an error if the parent directory cannot be created, or if the
-    /// socket cannot be bound.
+    /// Returns an error if the parent directory cannot be created, if a live
+    /// daemon already answers at `path`, or if the socket cannot be bound.
     pub fn bind(path: impl AsRef<Path>) -> Result<Self, crate::error::GarrisonError> {
         let path = path.as_ref().to_path_buf();
         let endpoint = path.display().to_string();
@@ -82,16 +82,24 @@ impl UnixListener {
             }
         }
 
-        match std::fs::remove_file(&path) {
-            Ok(()) => {
-                tracing::warn!(path = %endpoint, "removed a stale socket file before binding");
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => {
+        match probe(&path) {
+            Probe::Absent => {}
+            Probe::Live => {
                 return Err(crate::error::GarrisonError::transport(
                     &endpoint,
-                    format!("could not remove the existing socket file: {e}"),
+                    "another garrison-agent is already listening here; this process will not \
+                     start a second engine (stop it with `systemctl --user stop garrison-agent`, \
+                     or point this one at a different --socket)",
                 ));
+            }
+            Probe::Stale => {
+                std::fs::remove_file(&path).map_err(|e| {
+                    crate::error::GarrisonError::transport(
+                        &endpoint,
+                        format!("could not remove the stale socket file: {e}"),
+                    )
+                })?;
+                tracing::warn!(path = %endpoint, "removed a stale socket file before binding");
             }
         }
 
@@ -105,6 +113,32 @@ impl UnixListener {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+/// What a connect probe found at a socket path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Probe {
+    /// No file there.
+    Absent,
+    /// A file, and a process answering on it.
+    Live,
+    /// A file nobody answers on.
+    Stale,
+}
+
+/// Asks whether anyone is listening at `path`, without keeping a connection.
+///
+/// A blocking connect on purpose: this runs once, before the listener exists,
+/// and a Unix-socket connect to a local path either succeeds or is refused
+/// immediately.
+fn probe(path: &Path) -> Probe {
+    if !path.exists() {
+        return Probe::Absent;
+    }
+    match std::os::unix::net::UnixStream::connect(path) {
+        Ok(_live) => Probe::Live,
+        Err(_) => Probe::Stale,
     }
 }
 
@@ -182,14 +216,37 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("creates the directory");
         let path = dir.join("agent.sock");
 
-        let first = UnixListener::bind(&path).expect("binds once");
-        std::mem::forget(first); // Skip the Drop unlink, imitating SIGKILL.
+        // A std listener closes its descriptor on drop but leaves the file,
+        // which is exactly the state SIGKILL leaves behind: a path nobody
+        // answers on.
+        let dead = std::os::unix::net::UnixListener::bind(&path).expect("binds once");
+        drop(dead);
         assert!(path.exists(), "the stale file is present");
 
         let second = UnixListener::bind(&path).expect("binds over the stale file");
         assert_eq!(second.endpoint(), path.display().to_string());
 
         drop(second);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn binding_over_a_live_socket_is_refused() {
+        // Two engines on one endpoint would be two writers of one trail. The
+        // second one must not start, and must say who is in its way.
+        let dir = std::env::temp_dir().join(format!("garrison-live-{}", std::process::id()));
+        let path = dir.join("agent.sock");
+
+        let first = UnixListener::bind(&path).expect("binds once");
+        let error = UnixListener::bind(&path).expect_err("must refuse the second bind");
+
+        assert!(
+            error.to_string().contains("already listening"),
+            "unexpected message: {error}"
+        );
+        assert!(path.exists(), "the refusal leaves the live socket alone");
+
+        drop(first);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

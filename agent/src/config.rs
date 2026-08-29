@@ -63,19 +63,45 @@ pub struct PlaneConfig {
     pub operator_upn: Option<String>,
 }
 
-/// Listener settings.
+/// Listener settings, and how a client behaves when nothing is listening.
+///
+/// There is one daemon per user per machine; `acp` and `chat` are clients of
+/// it. Whether a client may bring the daemon up when it finds the socket dead
+/// is a decision this section owns, because it decides who may start an
+/// engine on this machine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
     /// The Unix socket path. A `--socket` argument overrides it.
     pub socket: PathBuf,
+    /// Whether a client that finds no daemon may start one.
+    ///
+    /// `true` (the default) lets an editor's `garrison-agent acp` relay bring
+    /// the daemon up: through the user's systemd unit when one is loaded,
+    /// otherwise as a detached child rooted at `$HOME` that reads only the
+    /// XDG configuration files. `false` means a missing daemon is an error
+    /// the relay reports and nothing more, for hosts where only an operator
+    /// or systemd may start the engine.
+    pub autostart: bool,
+    /// How long a client waits for an autostarted daemon to answer.
+    pub start_timeout_secs: u64,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             socket: default_socket(),
+            autostart: true,
+            start_timeout_secs: 10,
         }
+    }
+}
+
+impl ServerConfig {
+    /// How long a client waits for an autostarted daemon.
+    #[must_use]
+    pub const fn start_timeout(&self) -> Duration {
+        Duration::from_secs(self.start_timeout_secs)
     }
 }
 
@@ -309,6 +335,41 @@ mod tests {
         assert_eq!(config.server.socket, PathBuf::from("/run/garrison.sock"));
         assert_eq!(config.approval_timeout(), Duration::from_secs(30));
         assert_eq!(config.approval.auto_approve, vec!["read_file".to_string()]);
+    }
+
+    #[test]
+    fn a_client_may_start_the_daemon_by_default() {
+        let server = GarrisonConfig::from_toml("").unwrap().server;
+
+        assert!(server.autostart);
+        assert_eq!(server.start_timeout(), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn autostart_can_be_switched_off() {
+        let config = GarrisonConfig::from_toml(
+            r#"
+            [server]
+            autostart = false
+            start_timeout_secs = 3
+            "#,
+        )
+        .unwrap();
+
+        assert!(!config.server.autostart);
+        assert_eq!(config.server.start_timeout(), Duration::from_secs(3));
+    }
+
+    #[test]
+    fn a_misspelled_server_key_is_refused_rather_than_ignored() {
+        let error = GarrisonConfig::from_toml(
+            "[server]
+auto_start = false
+",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("auto_start"));
     }
 
     #[test]
