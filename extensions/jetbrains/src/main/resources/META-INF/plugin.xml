@@ -1,0 +1,23 @@
+<idea-plugin>
+    <id>com.govcraft.garrison</id>
+    <name>Garrison</name>
+    <vendor url="https://github.com/Govcraft/garrison">Govcraft</vendor>
+    <description><![CDATA[
+        Governed agentic coding inside your JetBrains IDE. Connects to the
+        Garrison agent over ACP for streamed chat, tool activity, approvals,
+        cancellation, and governance status.
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <toolWindow id="Garrison"
+                    anchor="right"
+                    icon="/icons/garrison.svg"
+                    factoryClass="com.govcraft.garrison.GarrisonToolWindowFactory"/>
+        <applicationService serviceImplementation="com.govcraft.garrison.GarrisonSettings"/>
+        <applicationConfigurable id="com.govcraft.garrison.settings"
+                                 displayName="Garrison"
+                                 instance="com.govcraft.garrison.GarrisonConfigurable"/>
+    </extensions>
+</idea-plugin>

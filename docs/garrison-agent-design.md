@@ -168,7 +168,7 @@ renders the approve/deny UI), turn diffs as events.
 over stdio and Unix-domain sockets. It implements initialize; session create,
 load, list, prompt, and cancel; token and tool events; approval round-trips;
 and a namespaced status method. Windows named pipes, turn diffs, plan events,
-and the editor extensions remain planned.
+and first VS Code and JetBrains clients now exercise that protocol.
 
 ## 2. What acton-ai already provides (don't rebuild)
 

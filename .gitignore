@@ -12,6 +12,7 @@ keys/
 .env
 *.pcap
 target/
+build/
 node_modules/
 dist/
 *.vsix
