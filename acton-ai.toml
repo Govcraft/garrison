@@ -81,3 +81,23 @@ hardening = "best-effort"
 [sandbox.limits]
 max_execution_ms = 120000
 max_memory_mb = 1024
+
+# The hardened child's landlock ruleset covers the system directories, the
+# per-call TMPDIR and the session root. Everything installed under this
+# user's home is outside it, so a `uv` on PATH would be found by the shell
+# and then refused by the kernel as a bare "Permission denied". These are
+# the directories uv actually needs: itself and the interpreters it manages
+# to read and execute, its cache to write.
+[sandbox.paths]
+read_exec = ["~/.local/bin", "~/.local/share/uv"]
+read_write = ["~/.cache/uv"]
+
+# The tamper-evident invocation trail. The section's presence arms it: every
+# tool call is appended as a hash-chained JSONL entry recording the gate's
+# verdict (approved, and by whom) alongside the outcome, so refusals are on
+# the record exactly as successes are. `acton-ai audit verify` walks the chain.
+#
+# Kept inside the checkout during development so the trail travels with the
+# work; a deployment points this at a durable path outside the project tree.
+[audit]
+path = ".garrison/audit.jsonl"
