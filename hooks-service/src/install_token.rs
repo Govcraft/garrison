@@ -696,6 +696,7 @@ mod tests {
             install_id: "inst_01".to_string(),
             organization: "organization_01".to_string(),
             status: "active".to_string(),
+            operator: Some("operator_01".to_string()),
         }
     }
 

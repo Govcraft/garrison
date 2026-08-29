@@ -32,6 +32,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod audit;
+
 use base64::alphabet;
 use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 use base64::Engine as _;

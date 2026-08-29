@@ -30,6 +30,7 @@ mod hooks;
 mod install_token;
 mod plane;
 mod reconcile;
+mod silence;
 mod sync;
 
 mod pb {
@@ -59,6 +60,7 @@ use crate::hooks::redemption::DirectoryGate;
 use crate::install_token::{Exchange, NonceLedger};
 use crate::plane::Plane;
 use crate::reconcile::Policy;
+use crate::silence::{SilenceSettings, SilenceSweep};
 use crate::sync::{DirectorySync, SyncSettings};
 
 #[tokio::main]
@@ -100,6 +102,24 @@ async fn main() -> Result<()> {
     // bearer, which is authorized for a handful of operations and nothing else.
     let plane = Plane::new(&garrison.url, &garrison.token)
         .map_err(|e| Error::ValidationError(e.to_string()))?;
+
+    // A second client for the audit ingest and the liveness sweep. Same
+    // bearer, which therefore has to carry `audit_service` beside
+    // `enrollment_service`; a separate `Plane` value rather than a shared one
+    // so the two paths cannot come to depend on each other's state.
+    let audit_plane = Plane::new(&garrison.url, &garrison.token)
+        .map_err(|e| Error::ValidationError(e.to_string()))?;
+
+    // The sweep that notices an install which stopped shipping. Parked where
+    // the supervised actor's `after_start` finds it on every incarnation. Both
+    // intervals are floored at a second: a zero would arm no schedule at all
+    // and the liveness signal would be silently absent.
+    silence::install(Arc::new(SilenceSettings {
+        plane: Plane::new(&garrison.url, &garrison.token)
+            .map_err(|e| Error::ValidationError(e.to_string()))?,
+        silence: Duration::from_secs(garrison.silence.max(1)),
+        sweep: Duration::from_secs(garrison.sweep.max(1)),
+    }));
 
     // The install-token exchange: the one authenticated path from a daemon to
     // the plane. It mints with the same `[token]` key this service verifies
@@ -166,7 +186,7 @@ async fn main() -> Result<()> {
         // SCHEMAFORGE_HOOKS_SERVICES_BEGIN — DO NOT REMOVE (additive insertion marker)
         .add_service(
             pb::audit_event::audit_event_hooks_server::AuditEventHooksServer::new(
-                hooks::audit_event::Service,
+                hooks::audit_event::Service::new(audit_plane),
             ),
         )
         .add_service(
@@ -196,6 +216,7 @@ async fn main() -> Result<()> {
     let mut builder = ServiceBuilder::new()
         .with_config(config)
         .with_actor::<NonceLedger>()
+        .with_actor::<SilenceSweep>()
         .with_routes(routes)
         .with_grpc_services(grpc_services);
     if directory.enabled() {

@@ -162,6 +162,15 @@ pub struct GarrisonStatus {
     /// is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<ContextStatus>,
+    /// Whether the audit trail is reaching the control plane, and how far
+    /// behind it is if not.
+    ///
+    /// Absent on a standalone agent, which has no plane to ship to, and when
+    /// the shipper could not be asked. [`Self::audit`] answers "is this
+    /// machine recording"; this answers "does anybody else have a copy", and
+    /// an auditor needs both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shipping: Option<ShippingStatus>,
 }
 
 /// What the daemon's credential holder reports about reaching the plane.
@@ -400,6 +409,114 @@ pub struct AnchorStatus {
     /// stops advancing while the trail grows is a finding in its own right.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+}
+
+/// Where the trail stands on its way to the control plane.
+///
+/// The local trail says what happened; this says whether anybody else knows.
+/// An auditor's question is not "is there a chain" but "is there a copy of it
+/// somewhere the machine that wrote it cannot reach", and these are the
+/// fields that answer it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ShippingStatus {
+    /// Whether this install ships at all. False on a standalone agent and on
+    /// a governed one with `[plane.shipping] enabled = false`.
+    pub enabled: bool,
+    /// Where shipping stands, in one word.
+    pub state: ShipState,
+    /// The trail being shipped, as acton-ai sealed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trail_id: Option<String>,
+    /// The plane's `AuditTrail` row for it, once one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trail: Option<String>,
+    /// The highest sequence the plane has accepted.
+    pub shipped_through: u64,
+    /// The highest sequence on disk, as the writer last reported it.
+    pub local_head: u64,
+    /// How many sealed entries have not been accepted yet.
+    pub backlog: u64,
+    /// When the oldest unshipped entry was written, RFC 3339.
+    ///
+    /// This is the field the backlog bound is measured against, and the one
+    /// an auditor reads to answer "how long has this machine been keeping
+    /// evidence to itself".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_unshipped_at: Option<String>,
+    /// When the plane last accepted an entry, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_shipped_at: Option<String>,
+    /// What the last failed attempt said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// Why shipping stopped for good, when it has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halted_reason: Option<String>,
+    /// When the next attempt is due while backing off, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_at: Option<String>,
+}
+
+impl ShippingStatus {
+    /// What a daemon that ships nothing reports.
+    ///
+    /// Said plainly rather than omitted: "this install does not send its
+    /// audit anywhere" is an answer an auditor needs, and an absent field is
+    /// not one.
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            state: ShipState::Disabled,
+            trail_id: None,
+            trail: None,
+            shipped_through: 0,
+            local_head: 0,
+            backlog: 0,
+            oldest_unshipped_at: None,
+            last_shipped_at: None,
+            last_error: None,
+            halted_reason: None,
+            retry_at: None,
+        }
+    }
+}
+
+/// Where shipping stands, in one word.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ShipState {
+    /// Nothing is being shipped, and nothing is expected to be.
+    #[default]
+    Disabled,
+    /// Everything sealed so far has been accepted by the plane.
+    Current,
+    /// There is a backlog and the shipper is working through it.
+    Behind,
+    /// The last attempt failed and the next one is waiting out a delay.
+    Backoff,
+    /// Shipping has stopped and will not resume without a human.
+    ///
+    /// Reached when the plane refused an entry as forked or edited, when the
+    /// local trail was rewritten under the cursor, or when the credential was
+    /// rejected. All three are findings, not outages.
+    Halted,
+}
+
+impl std::fmt::Display for ShipState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let word = match self {
+            Self::Disabled => "disabled",
+            Self::Current => "current",
+            Self::Behind => "behind",
+            Self::Backoff => "backoff",
+            Self::Halted => "halted",
+        };
+        f.write_str(word)
+    }
 }
 
 /// What Garrison attaches to a `session/prompt` response's `_meta`.

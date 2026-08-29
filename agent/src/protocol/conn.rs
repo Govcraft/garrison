@@ -172,6 +172,8 @@ pub enum StatusPart {
     /// flight — one per describer, on every status request — would otherwise
     /// be sized for it.
     Audit(Box<acp::AuditStatus>),
+    /// From the trail shipper: whether the audit is still leaving the box.
+    Shipping(acp::ShippingStatus),
 }
 
 impl Request for Describe {
@@ -1025,6 +1027,7 @@ fn own_status(context: &Dispatch) -> acp::GarrisonStatus {
         threads: None,
         plane: None,
         context: None,
+        shipping: None,
     }
 }
 
@@ -1083,6 +1086,7 @@ fn assemble(
             // which the keeper reports from the same barrier that produced
             // the health beside it.
             StatusPart::Audit(audit) => status.audit = *audit,
+            StatusPart::Shipping(shipping) => status.shipping = Some(shipping),
         }
     }
     status
@@ -1329,6 +1333,7 @@ mod tests {
             threads: None,
             plane: None,
             context: None,
+            shipping: None,
         }
     }
 

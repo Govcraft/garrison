@@ -128,3 +128,55 @@ auto_approve = ["read_file", "glob", "grep", "list_directory", "calculate", "get
 # consulted once, at first enrollment: the install binds to the operator's
 # row, so a later rename in the directory does not affect an enrolled install.
 # operator_upn = "dev@agency.gov"
+
+# [plane.shipping]
+# Getting the audit trail off the machine that wrote it.
+#
+# The local trail is hash-chained, which proves nobody edited the middle of it.
+# It proves nothing about the end, because a prefix of a valid chain is itself
+# a valid chain: an operator who deletes the last hour and restarts leaves a
+# file that verifies perfectly. The only defence is a copy the machine cannot
+# reach. A shipper walks the trail forward and posts each sealed entry to the
+# plane, which re-links it against what it already holds and refuses forks and
+# edits.
+#
+# Every value below is a default; the section may be omitted entirely.
+#
+# Whether to ship at all. Off, the daemon still writes and verifies its local
+# trail, and _garrison/status reports shipping as "disabled" rather than
+# omitting it: an absent answer is not one an auditor can use.
+# enabled = true
+#
+# How often to look for new entries, in seconds. The shipper also ships at the
+# end of every turn, so this is the floor rather than the usual cadence.
+# poll_interval_secs = 5
+#
+# How often to report the trail's own row (local head, shipped-through), in
+# seconds. That row is what the plane's liveness sweep watches for silence.
+# report_interval_secs = 60
+#
+# How many entries one batch may carry. Entries go up one at a time in chain
+# order regardless; this bounds how long one batch holds the shipper.
+# batch = 50
+#
+# When an unshipped backlog stops the work. This is the part worth reading
+# twice, because the shipper is a gate: past either bound, and with
+# fail_closed set, AdmitTurn refuses and the daemon stops taking turns.
+#
+#   - An unreachable control plane never stops a turn on its own. The trail
+#     file is the buffer, a laptop on a train is not a governance failure, and
+#     a daemon that stopped working whenever a VPN dropped would be turned off
+#     within a week.
+#   - A backlog past its bound does stop turns. A day, or ten thousand
+#     entries, is not an outage anybody is still calling an outage.
+#   - A halt stops turns always, whatever fail_closed says. The plane refused
+#     an entry as forked or edited, the credential was rejected, or the local
+#     trail was rewritten under the cursor. None of those heal by waiting.
+#
+# max_unshipped_age_secs = 86400
+# max_unshipped_entries = 10000
+# fail_closed = true
+#
+# How long to wait after a failed batch, doubling to the ceiling, in seconds.
+# backoff_base_secs = 1
+# backoff_ceiling_secs = 300

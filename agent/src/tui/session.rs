@@ -730,6 +730,7 @@ mod tests {
             },
             audit: acp::AuditStatus::undescribed(true),
             context: None,
+            shipping: None,
             sandbox: acp::SandboxStatus {
                 enabled: true,
                 hardening: Some("enforce".to_string()),
