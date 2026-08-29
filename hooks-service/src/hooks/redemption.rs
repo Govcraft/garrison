@@ -1,4 +1,4 @@
-//! `Redemption.before_validate` — admit a daemon to the fleet, or refuse it.
+//! `Redemption.before_validate`: admit a daemon to the fleet, or refuse it.
 //!
 //! SchemaForge has already done three things before this runs: Cedar checked
 //! that the caller holds `enrollee`, the `@require` on `token_id` checked that
@@ -19,24 +19,52 @@
 //! revoked token at 03:00 is precisely the record a security officer wants.
 //! The daemon is told `outcome = refused` and nothing else; it holds no read
 //! grant on this schema, so the create response is all it ever sees.
+//!
+//! The token names a person; the second half of the decision is whether that
+//! person may hold a machine today (R4). The install binds to the operator's
+//! row id, never to the UPN, so a directory rename after enrollment changes
+//! nothing here. The reported UPN is consulted exactly once, now.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use chrono::Utc;
 use serde_json::{json, Value};
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
-use crate::adjudicate::{adjudicate, operator_source, spend, OperatorSource, Verdict};
+use crate::adjudicate::{
+    adjudicate, directory_fresh, operator_admissible, operator_source, spend, OperatorSource,
+    Verdict,
+};
 use crate::pb::redemption::redemption_hooks_server::RedemptionHooks;
 use crate::pb::redemption::*;
-use crate::plane::{Plane, PlaneError};
+use crate::plane::{OperatorRow, Plane, PlaneError};
+
+/// Whether the directory is the authority for operators, and how recent its
+/// view must be for an enrollment to trust it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectoryGate {
+    pub enabled: bool,
+    pub staleness: Duration,
+}
+
+impl Default for DirectoryGate {
+    /// No directory: hand-typed operators are admitted on status alone.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            staleness: Duration::from_secs(900),
+        }
+    }
+}
 
 /// How this service reaches the plane and what it expects to see there.
 pub struct Service {
     plane: Plane,
     /// The `iss` an enrollment artifact must have been minted under.
     expected_issuer: String,
+    gate: DirectoryGate,
 }
 
 impl Service {
@@ -46,7 +74,15 @@ impl Service {
         Self {
             plane,
             expected_issuer: expected_issuer.into(),
+            gate: DirectoryGate::default(),
         }
+    }
+
+    /// Make the directory the authority for who may enrol.
+    #[must_use]
+    pub fn with_directory(mut self, gate: DirectoryGate) -> Self {
+        self.gate = gate;
+        self
     }
 }
 
@@ -66,7 +102,7 @@ impl RedemptionHooks for Service {
 
         match self.provision(&req).await {
             Ok(response) => Ok(Response::new(response)),
-            // The plane being unreachable is not a refusal — refusing would
+            // The plane being unreachable is not a refusal. Refusing would
             // write a permanent verdict on a transient fault. Abort instead,
             // so the daemon retries and nothing is recorded.
             Err(error) => {
@@ -94,7 +130,7 @@ impl Service {
         let Some(token) = self.plane.enrollment_token(&req.token_id).await? else {
             // No such token. The @require proved the caller holds an artifact
             // whose `sub` is this value, so a missing row means the row was
-            // deleted or never created — worth recording, not worth detail.
+            // deleted or never created: worth recording, not worth detail.
             return Ok(refused(&now, "no enrollment token matches this artifact"));
         };
 
@@ -110,36 +146,37 @@ impl Service {
                 ));
             }
         };
+        let within = Some(organization.clone());
 
-        let operator =
-            match operator_source(&token, req.operator_upn.as_deref().unwrap_or_default()) {
-                OperatorSource::Bound(id) => id,
-                OperatorSource::ReportedUpn(upn) => match self.plane.operator_by_upn(&upn).await? {
-                    Some(row) => row.id,
-                    None => {
-                        return Ok(refused_within(
-                            &now,
-                            &Some(organization.clone()),
-                            &token.id,
-                            &format!("no operator is registered as '{upn}'"),
-                        ))
-                    }
-                },
-                OperatorSource::Unknown => {
-                    return Ok(refused_within(
-                        &now,
-                        &Some(organization.clone()),
-                        &token.id,
-                        "the request identifies no operator and the token names none",
-                    ))
-                }
+        let operator = match self.resolve_operator(&token, req).await? {
+            Ok(row) => row,
+            Err(reason) => {
+                info!(token_id = %req.token_id, %reason, "enrollment refused");
+                return Ok(refused_within(&now, &within, &token.id, &reason));
+            }
+        };
+
+        if let Err(reason) = operator_admissible(&operator, self.gate.enabled) {
+            info!(token_id = %req.token_id, operator = %operator.id, %reason, "enrollment refused");
+            return Ok(refused_within(&now, &within, &token.id, &reason));
+        }
+
+        if self.gate.enabled {
+            let fresh = match self.plane.organization_by_id(&organization).await? {
+                Some(org) => directory_fresh(&org, now, self.gate.staleness),
+                None => Err("organization is not visible to the enrollment service".into()),
             };
+            if let Err(reason) = fresh {
+                info!(token_id = %req.token_id, %organization, %reason, "enrollment refused");
+                return Ok(refused_within(&now, &within, &token.id, &reason));
+            }
+        }
 
         let install = self
             .plane
             .create(
                 "AgentInstall",
-                install_fields(req, &organization, &operator, &token.id),
+                install_fields(req, &organization, &operator.id, &token.id),
             )
             .await?;
 
@@ -182,6 +219,31 @@ impl Service {
             ..Default::default()
         })
     }
+
+    /// The operator row the token or the daemon points at, or the refusal.
+    ///
+    /// The outer `Result` is the plane failing (abort, retry); the inner one
+    /// is a decision (persist).
+    async fn resolve_operator(
+        &self,
+        token: &crate::plane::EnrollmentTokenRow,
+        req: &RedemptionBeforeValidateRequest,
+    ) -> Result<Result<OperatorRow, String>, PlaneError> {
+        let source = operator_source(token, req.operator_upn.as_deref().unwrap_or_default());
+        Ok(match source {
+            OperatorSource::Bound(id) => match self.plane.operator_by_id(&id).await? {
+                Some(row) => Ok(row),
+                None => Err(format!("the operator this token names ({id}) no longer exists")),
+            },
+            OperatorSource::ReportedUpn(upn) => match self.plane.operator_by_upn(&upn).await? {
+                Some(row) => Ok(row),
+                None => Err(format!("no operator is registered as '{upn}'")),
+            },
+            OperatorSource::Unknown => {
+                Err("the request identifies no operator and the token names none".into())
+            }
+        })
+    }
 }
 
 /// The install this daemon is asking to become.
@@ -219,7 +281,7 @@ fn install_fields(
 ///
 /// `status` is `active` because an install that just proved it holds a
 /// spendable token has proved everything this credential is for. Public
-/// material only — the private half never left the machine.
+/// material only: the private half never left the machine.
 fn credential_fields(
     req: &RedemptionBeforeValidateRequest,
     organization: &str,
@@ -381,5 +443,17 @@ mod tests {
         assert_eq!(response.organization, Some("org_1".into()));
         assert_eq!(response.enrollment_token, Some("tok_row".into()));
         assert_eq!(response.outcome, Some("refused".into()));
+    }
+
+    #[test]
+    fn the_gate_is_off_by_default_and_can_be_turned_on() {
+        let plane = Plane::new("https://plane.gov", "tok").unwrap();
+        let service = Service::new(plane, "garrison-enrollment");
+        assert!(!service.gate.enabled);
+        let gate = DirectoryGate {
+            enabled: true,
+            staleness: Duration::from_secs(60),
+        };
+        assert_eq!(service.with_directory(gate).gate, gate);
     }
 }

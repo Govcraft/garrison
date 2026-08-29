@@ -8,7 +8,7 @@
 //!
 //! Every field is one word for that reason. The framework's env provider is
 //! `Env::prefixed("ACTON_").split("_")`, so a `service_token` field would only
-//! be reachable as `garrison.service.token` — which is not where it lives, so
+//! be reachable as `garrison.service.token`, which is not where it lives, so
 //! the variable would be ignored and the file value would quietly win. A
 //! single-word name is the difference between an override that works and one
 //! that only appears to.
@@ -20,11 +20,15 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The `[garrison]` section of `config.toml`.
+pub use crate::directory::config::{DirectoryConfig, DirectoryMode};
+
+/// The `[garrison]` and `[directory]` sections of `config.toml`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HooksConfig {
     #[serde(default)]
     pub garrison: GarrisonConfig,
+    #[serde(default)]
+    pub directory: DirectoryConfig,
 }
 
 /// Where the control plane is, and what this service presents to it.
@@ -133,5 +137,24 @@ mod tests {
         let parsed: HooksConfig = toml::from_str(toml).expect("section parses");
         assert_eq!(parsed.garrison.url, "https://plane.gov");
         assert_eq!(parsed.garrison.issuer, "garrison-enrollment");
+        assert_eq!(parsed.directory.mode, DirectoryMode::Off);
+    }
+
+    #[test]
+    fn the_directory_table_sits_beside_the_garrison_one() {
+        let toml = r#"
+            [garrison]
+            url = "https://plane.gov"
+            token = "v4.local.abc"
+
+            [directory]
+            mode = "file"
+            path = "/etc/garrison/directory.json"
+            token = "v4.local.dir"
+            organization = "organization_01example"
+        "#;
+        let parsed: HooksConfig = toml::from_str(toml).expect("section parses");
+        assert_eq!(parsed.directory.mode, DirectoryMode::File);
+        assert!(parsed.directory.missing().is_empty());
     }
 }

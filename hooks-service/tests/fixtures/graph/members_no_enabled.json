@@ -1,0 +1,11 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#users(id,userPrincipalName,displayName,mail,accountEnabled)",
+  "value": [
+    {
+      "id": "dddddddd-4444-4444-4444-444444444444",
+      "userPrincipalName": "dana@example-agency.gov",
+      "displayName": "Dana Diaz",
+      "mail": "dana@example-agency.gov"
+    }
+  ]
+}

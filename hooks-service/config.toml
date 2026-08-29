@@ -84,3 +84,77 @@ token = ""
 # on Redemption and nothing else anywhere in the bundle.
 issuer = "garrison-control-plane"
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# The directory: Entra ID as the authority for who may hold a machine.
+#
+# With `mode = "off"` (the default) operators are hand-typed rows and nothing
+# ever deprovisions them; the service logs a warning at boot to say so. With
+# any other mode a supervised actor lists the directory every `interval`
+# seconds and makes the plane's Operator rows agree with it, under these
+# rules (docs/control-plane.md, "Directory"):
+#
+#   R1  The join key is `entra_object_id`. A member with no row is created
+#       `active`; a row whose member is absent is `offboarded`.
+#   R2  A hand-typed row with no object id is linked once, by case-insensitive
+#       UPN match. After that the UPN is a directory-owned attribute: a rename
+#       patches the same row, so every install, session, and audit entry keeps
+#       pointing at the same person.
+#   R3  A disabled account is `suspended`; the seat is revoked with the reason
+#       "directory: account disabled" (removed: "directory: account removed")
+#       and the console login is deactivated. `platform_admin` is never
+#       deactivated by the sync.
+#   R4  Enrollment refuses an operator who is not `active`, and, while the
+#       directory is on, one with no `entra_object_id` or whose organization
+#       has not synced successfully within `staleness` seconds.
+#   R5  An empty listing is a failure, never "everyone left". A listing that
+#       would suspend or offboard more than `fraction` of the active operators
+#       is refused whole and recorded on the Organization as `failed`.
+#   R6  An unreachable directory or plane fails the tick; the next one retries.
+#   R7  Enrollment carries no directory identity: the machine reports a UPN
+#       once, the plane resolves it to a row, and the row's object id is the
+#       identity from then on.
+#
+# `mode = "file"` reads a JSON array of members from `path` on every tick:
+#   [{"object_id": "...", "upn": "...", "display_name": "...",
+#     "mail": "...", "enabled": true}]
+# It exists for tests and for a deployment that already exports its
+# directory; edit the file and the next tick picks it up.
+#
+# `mode = "graph"` lists Microsoft Graph with an app registration holding
+# `User.Read.All` and `GroupMember.Read.All` (application permissions,
+# admin-consented). The tenant comes from each Organization's
+# `entra_tenant_id`; the group from its `entra_group_id`, or every user in
+# the tenant when that is blank. Graph has been exercised against recorded
+# responses only; see docs/control-plane.md for what a real tenant must
+# still confirm.
+#
+# `token` is a plane bearer for the `directory_service` role, distinct from
+# `[garrison] token`, so the sync cannot spend the enrollment grant and the
+# hook cannot spend the sync's. `ACTON_DIRECTORY_TOKEN` and
+# `ACTON_DIRECTORY_SECRET` override the two secrets. Mint the bearer with:
+#   schemaforge token generate --sub garrison-directory \
+#     --issuer garrison-control-plane --roles directory_service \
+#     --lifetime 2592000 --tenant-chain "$CHAIN"
+[directory]
+mode = "off"
+token = ""
+# The Organization row this reconciler serves, by id. The bearer is scoped to
+# that tenant and the plane does not list tenant-root rows to a tenant-scoped
+# bearer, so it is named here rather than discovered. One hooks service
+# reconciles one organization.
+organization = ""
+# Seconds between listings, and how old the last successful sync may be
+# before enrollment is refused (R4). `staleness` must be at least `interval`.
+interval  = 300
+staleness = 900
+# The largest share of active operators one tick may suspend or offboard.
+fraction = 0.5
+# mode = "file"
+# path = "/etc/garrison/directory.json"
+# mode = "graph"
+# client    = "00000000-0000-0000-0000-000000000000"
+# secret    = ""
+# authority = "https://login.microsoftonline.com"
+# graph     = "https://graph.microsoft.com/v1.0"
+# ---------------------------------------------------------------------------

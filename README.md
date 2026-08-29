@@ -52,9 +52,10 @@ described below is direction, not checkout.
 
 These components are not present in this repository today:
 
-- The rest of the control-plane *services*: Entra ID integration, policy
-  distribution to installs, and audit ingest. The model those services will
-  speak is in `schemas/`; enrollment is the only path wired against it so far.
+- The rest of the control-plane *services*: policy distribution to installs
+  and audit ingest. The model those services will speak is in `schemas/`;
+  enrollment and the Entra ID directory sync are the paths wired against it
+  so far.
 - The federal-ui administration site.
 - Infrastructure, SIEM integration, and compliance document sets.
 - Command-prefix policy, turn diffs, repository context,
@@ -93,7 +94,7 @@ architecture in [docs/garrison-agent-design.md](docs/garrison-agent-design.md).
 | `acton-ai.toml` | Implemented | Provider, context, sandbox, and acton-ai runtime configuration |
 | `config.toml` | Implemented | Control-plane (SchemaForge on acton-service) configuration |
 | `Taskfile.yml` | Implemented | Tasks that operate on this checkout |
-| `hooks-service/` | Working | The enrollment hook: adjudicates a token, provisions the install and its credential |
+| `hooks-service/` | Working | The enrollment hook and the Entra ID directory sync: adjudicates a token, provisions the install and its credential, keeps operators in step with the directory |
 | `site/` | Planned | Control-plane administration site |
 | `extensions/vscode/` | Implemented | VS Code ACP client, sidebar chat, approvals, and status |
 | `extensions/jetbrains/` | Implemented | JetBrains ACP client, tool-window chat, approvals, and status |

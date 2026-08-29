@@ -1,0 +1,20 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#users(id,userPrincipalName,displayName,mail,accountEnabled)",
+  "@odata.nextLink": "https://graph.microsoft.com/v1.0/groups/1b2c3d4e-0000-0000-0000-000000000001/members/microsoft.graph.user?$select=id,userPrincipalName,displayName,mail,accountEnabled&$top=999&$skiptoken=X%27445370740200001A00000000000000000000%27",
+  "value": [
+    {
+      "id": "aaaaaaaa-1111-1111-1111-111111111111",
+      "userPrincipalName": "alice@example-agency.gov",
+      "displayName": "Alice Anderson",
+      "mail": "alice@example-agency.gov",
+      "accountEnabled": true
+    },
+    {
+      "id": "bbbbbbbb-2222-2222-2222-222222222222",
+      "userPrincipalName": "bob_contractor.example.com#EXT#@exampleagency.onmicrosoft.com",
+      "displayName": "Bob Baker (Contractor)",
+      "mail": null,
+      "accountEnabled": true
+    }
+  ]
+}

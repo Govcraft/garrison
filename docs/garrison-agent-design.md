@@ -209,6 +209,9 @@ GarrisonRuntime (acton-ai / acton-reactive)
 ├── TurnDiff              — planned
 ├── RepoContext           — planned
 └── PlaneSync             — planned control-plane policy/audit/seat integration
+                            (the plane side already deprovisions: the directory
+                            sync in hooks-service revokes a seat when Entra
+                            disables the account; the daemon side reads it)
 ```
 
 Approval round-trip: policy gate → callback → ProtocolServer → IDE dialog →

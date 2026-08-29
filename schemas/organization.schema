@@ -58,7 +58,12 @@ schema Organization {
     seats_licensed:  integer(min: 0) default(0) @field_access(write: ["org_admin"])
     active:          boolean default(true) @field_access(write: ["org_admin"])
 
-    owner_id:        text required @owner
+    // Who created the boundary. Deliberately not `@owner`: that annotation
+    // generates a Cedar forbid on Read, List, Update and Delete for every
+    // principal other than the owner, which would hide the row from the very
+    // roles listed in `@access(read: ...)` above. The row is fenced by the
+    // tenant guard and by the `@field_access` writes instead.
+    owner_id:        text required @field_access(write: ["org_admin"])
     created_at:      datetime @default("now")
 
     teams:           -> Team[]
