@@ -1,8 +1,7 @@
 version: '3'
 
 # Tasks in this file intentionally operate only on components present in this
-# checkout. Hooks, site, and extension tasks should be added when their
-# directories land rather than pointing at planned paths.
+# checkout. Hooks and site tasks should be added when their directories land.
 #
 # The plane:* tasks drive the SchemaForge control plane in schemas/ and
 # policies/. They need the `schemaforge` CLI on PATH.
@@ -47,6 +46,24 @@ tasks:
     desc: Check Rust formatting without changing files
     cmds:
       - cargo fmt --all -- --check
+
+  extension:install:
+    desc: Install the VS Code extension's development dependencies
+    dir: extensions/vscode
+    cmds:
+      - npm install
+
+  extension:check:
+    desc: Type-check the VS Code extension
+    dir: extensions/vscode
+    cmds:
+      - npm run check
+
+  extension:package:
+    desc: Build a VSIX package for the VS Code extension
+    dir: extensions/vscode
+    cmds:
+      - npm run package
 
   # --- Control plane -------------------------------------------------------
 

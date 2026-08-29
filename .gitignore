@@ -1,6 +1,8 @@
 # Hidden files and directories (except .gitignore)
 .*
 !.gitignore
+!extensions/vscode/.vscode/
+!extensions/vscode/.vscode/launch.json
 
 # Text and markdown files (except README.md)
 *.txt
@@ -12,6 +14,7 @@ keys/
 target/
 node_modules/
 dist/
+*.vsix
 !README.md
 !docs/**/*.md
 !CHANGELOG.md

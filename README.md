@@ -48,7 +48,7 @@ These components are not present in this repository today:
 - Control-plane *services*: Entra ID integration, policy distribution to
   installs, and audit ingest. The model those services will speak is in
   `schemas/`; nothing pushes or pulls against it yet.
-- VS Code and JetBrains extensions.
+- JetBrains extension.
 - Hooks service and federal-ui administration site.
 - Infrastructure, SIEM integration, and compliance document sets.
 - Command-prefix policy, turn diffs, repository context,
@@ -88,7 +88,8 @@ architecture in [docs/garrison-agent-design.md](docs/garrison-agent-design.md).
 | `config.toml` | Implemented | Control-plane (SchemaForge on acton-service) configuration |
 | `Taskfile.yml` | Implemented | Tasks that operate on this checkout |
 | `hooks-service/`, `site/` | Planned | Control-plane hook services and administration site |
-| `extensions/` | Planned | VS Code and JetBrains clients |
+| `extensions/vscode/` | Implemented | VS Code ACP client, sidebar chat, approvals, and status |
+| `extensions/jetbrains/` | Planned | JetBrains client |
 | `infra/`, `docs/compliance/` | Planned | Deployment and compliance material |
 
 ## Development quickstart
@@ -129,6 +130,6 @@ capabilities rather than this repository's runnable state.
 
 ## Status
 
-Pre-alpha. The agent daemon is implemented and tested. The control plane
-exists as a validated entity model with no services behind it yet, and the
-editor products remain roadmap work.
+Pre-alpha. The agent daemon and a first VS Code client are implemented. The
+control plane exists as a validated entity model with no services behind it
+yet, and the JetBrains editor product remains roadmap work.

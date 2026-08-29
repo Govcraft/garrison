@@ -1,0 +1,76 @@
+{
+  "name": "garrison-vscode",
+  "displayName": "Garrison",
+  "description": "Governed agentic coding inside your VS Code workspace.",
+  "version": "0.1.0",
+  "publisher": "govcraft",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Govcraft/garrison.git",
+    "directory": "extensions/vscode"
+  },
+  "engines": {
+    "vscode": "^1.96.0"
+  },
+  "categories": ["AI", "Other"],
+  "activationEvents": ["onView:garrison.chat"],
+  "main": "./dist/extension.js",
+  "files": ["dist", "media", "README.md"],
+  "scripts": {
+    "compile": "tsc -p ./",
+    "check": "tsc -p ./ --noEmit",
+    "watch": "tsc -p ./ -w",
+    "package": "npm run compile && vsce package"
+  },
+  "contributes": {
+    "commands": [
+      { "command": "garrison.newSession", "title": "Garrison: New Session", "icon": "$(add)" },
+      { "command": "garrison.cancelTurn", "title": "Garrison: Cancel Turn", "icon": "$(debug-stop)" },
+      { "command": "garrison.showStatus", "title": "Garrison: Show Governance Status", "icon": "$(shield)" }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        { "id": "garrison", "title": "Garrison", "icon": "media/garrison.svg" }
+      ]
+    },
+    "views": {
+      "garrison": [
+        { "type": "webview", "id": "garrison.chat", "name": "Chat" }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        { "command": "garrison.newSession", "when": "view == garrison.chat", "group": "navigation" },
+        { "command": "garrison.cancelTurn", "when": "view == garrison.chat", "group": "navigation" },
+        { "command": "garrison.showStatus", "when": "view == garrison.chat", "group": "navigation" }
+      ]
+    },
+    "configuration": {
+      "title": "Garrison",
+      "properties": {
+        "garrison.agentPath": {
+          "type": "string",
+          "default": "garrison-agent",
+          "description": "Path to the garrison-agent executable."
+        },
+        "garrison.configPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional path to garrison.toml."
+        },
+        "garrison.actonConfigPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional path to acton-ai.toml."
+        }
+      }
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/vscode": "^1.96.0",
+    "@vscode/vsce": "^3.2.1",
+    "typescript": "^5.7.2"
+  }
+}
