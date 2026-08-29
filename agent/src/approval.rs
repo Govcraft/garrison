@@ -32,9 +32,12 @@
 //! chain identically. The `ask` here carries a longer deadline purely as a
 //! backstop for a connection actor that has stopped answering at all.
 
+use crate::admission::GATE_DEADLINE;
+use crate::policy::agent::Decide;
 use crate::types::{ApprovalId, ClientId, ThreadId, TurnId};
 use acton_ai::policy::{name_matches, ApprovalDecision, ToolInvocation};
 use acton_reactive::prelude::*;
+use garrison_policy::Disposition;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -56,6 +59,14 @@ pub const CANCELLED_REASON: &str = "the operator cancelled this permission reque
 /// Told to the model when the asking client vanished mid-call.
 pub const DISCONNECTED_REASON: &str =
     "approval could not be answered: the client that owns this session disconnected";
+
+/// Told to the model when the policy in force could not be consulted.
+///
+/// A denial, not a prompt. The gate that decides what this call is allowed to
+/// do did not answer, and a call that runs because the policy could not be
+/// asked is a call nobody authorized.
+pub const NO_POLICY_REASON: &str =
+    "this tool call was denied because the policy agent could not be consulted";
 
 /// How much longer than the connection's own deadline the hook waits.
 ///
@@ -86,7 +97,17 @@ pub struct TurnScope {
     ///
     /// Shared rather than cloned per turn because it is read-only for the
     /// life of the process and a turn may consult it many times.
+    ///
+    /// Read only when there is no [`policy`](Self::policy) agent to ask.
+    /// While an install is governed by the control plane this list is not
+    /// consulted at all, and the policy agent is what enforces that: a local
+    /// file must not be able to widen a centrally managed policy.
     pub auto_approve: Arc<Vec<String>>,
+    /// The policy agent this turn's tool calls are put to.
+    ///
+    /// `None` in a stack brought up without one, where the local
+    /// auto-approve list is the whole policy.
+    pub policy: Option<ActorHandle>,
 }
 
 impl TurnScope {
@@ -143,6 +164,11 @@ pub struct RequestApproval {
     pub arguments: serde_json::Value,
     /// How long the client has to answer.
     pub timeout: Duration,
+    /// Why the policy in force wants a human to look at this, when a rule
+    /// said so. Surfaced to the client in `_meta.garrison`.
+    pub justification: Option<String>,
+    /// Which rule said so, by name.
+    pub rule: Option<String>,
 }
 
 /// What the connection came back with.
@@ -175,14 +201,33 @@ pub async fn approval_hook(invocation: ToolInvocation) -> ApprovalDecision {
         return ApprovalDecision::deny(NO_OWNER_REASON);
     };
 
-    if scope.is_auto_approved(&invocation.tool_name) {
-        tracing::debug!(
-            tool = %invocation.tool_name,
-            thread_id = %scope.thread_id,
-            "auto-approved by name",
-        );
-        return ApprovalDecision::Approve;
-    }
+    // The policy in force gets the first word. On a governed install that is
+    // the bundle the control plane assigned; on a standalone one it is the
+    // local auto-approve list, applied by the same actor so there is one code
+    // path rather than two.
+    let (justification, rule) = match consult(&scope, &invocation).await {
+        Consulted::Approve => {
+            tracing::debug!(
+                tool = %invocation.tool_name,
+                thread_id = %scope.thread_id,
+                "approved by the policy in force",
+            );
+            return ApprovalDecision::Approve;
+        }
+        Consulted::Deny(reason) => {
+            tracing::info!(
+                tool = %invocation.tool_name,
+                thread_id = %scope.thread_id,
+                %reason,
+                "denied by the policy in force",
+            );
+            return ApprovalDecision::deny(reason);
+        }
+        Consulted::Ask {
+            justification,
+            rule,
+        } => (justification, rule),
+    };
 
     // A patch can often be decided without troubling anybody: one that only
     // creates files inside the session root destroys nothing, and one that
@@ -213,6 +258,8 @@ pub async fn approval_hook(invocation: ToolInvocation) -> ApprovalDecision {
         tool_name: invocation.tool_name,
         arguments: invocation.arguments,
         timeout: scope.timeout,
+        justification,
+        rule,
     };
 
     match scope
@@ -230,6 +277,80 @@ pub async fn approval_hook(invocation: ToolInvocation) -> ApprovalDecision {
             tracing::warn!(%error, "approval backstop fired");
             ApprovalDecision::deny(TIMEOUT_REASON)
         }
+    }
+}
+
+/// What the policy in force said about one call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Consulted {
+    /// Run it. Nobody is asked.
+    Approve,
+    /// Do not, and tell the model this.
+    Deny(String),
+    /// A human decides, with this reason shown to them.
+    Ask {
+        justification: Option<String>,
+        rule: Option<String>,
+    },
+}
+
+/// Asks the policy agent what to do about this call.
+///
+/// Falls back to the scope's own auto-approve list when there is no policy
+/// agent, which is the pre-policy behaviour and what a stack brought up
+/// without one gets. A policy agent that does not answer is a denial: a gate
+/// that could not be asked has not said yes.
+async fn consult(scope: &TurnScope, invocation: &ToolInvocation) -> Consulted {
+    let Some(policy) = scope.policy.as_ref() else {
+        return if scope.is_auto_approved(&invocation.tool_name) {
+            Consulted::Approve
+        } else {
+            Consulted::Ask {
+                justification: None,
+                rule: None,
+            }
+        };
+    };
+
+    let request = Decide {
+        tool_name: invocation.tool_name.clone(),
+        arguments: invocation.arguments.clone(),
+        idempotent: is_idempotent(&invocation.tool_name),
+    };
+
+    match policy.ask_with_timeout(request, GATE_DEADLINE).await {
+        Ok(disposition) => disposition_for(disposition),
+        Err(error) => {
+            tracing::error!(%error, tool = %invocation.tool_name, "the policy agent did not answer");
+            Consulted::Deny(NO_POLICY_REASON.to_string())
+        }
+    }
+}
+
+/// Whether acton-ai declares this tool idempotent.
+///
+/// Upstream's word about its own tools, which is why it may exempt one from
+/// prompting: a bundle that wants `read_file` to prompt says so with a
+/// `ToolRule`, and that rule wins. A tool the runtime does not know — anything
+/// MCP added, or Garrison's own — is not idempotent, because not knowing what
+/// a call does is no reason to let it run unseen.
+fn is_idempotent(tool_name: &str) -> bool {
+    acton_ai::tools::builtins::get_tool_definition(tool_name)
+        .is_ok_and(|definition| definition.idempotent)
+}
+
+/// Translates a policy verdict into what the hook does next. Pure.
+fn disposition_for(disposition: Disposition) -> Consulted {
+    match disposition {
+        Disposition::AutoApprove { .. } => Consulted::Approve,
+        Disposition::Deny { reason, .. } => Consulted::Deny(reason),
+        Disposition::Prompt {
+            rule,
+            justification,
+        } => Consulted::Ask {
+            justification,
+            rule,
+        },
     }
 }
 
@@ -285,6 +406,7 @@ mod tests {
             conn: ActorHandle::default(),
             timeout: Duration::from_secs(1),
             auto_approve: Arc::new(vec!["read_file".to_string(), "mcp__*".to_string()]),
+            policy: None,
         };
 
         assert!(scope.is_auto_approved("read_file"));
@@ -326,6 +448,7 @@ mod tests {
             conn,
             timeout: Duration::from_secs(1),
             auto_approve: Arc::new(Vec::new()),
+            policy: None,
         };
 
         let seen = with_turn_scope(scope, async {

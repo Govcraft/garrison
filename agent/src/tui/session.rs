@@ -727,6 +727,7 @@ mod tests {
             policy: acp::PolicyStatus {
                 approval_timeout_secs: 30,
                 auto_approve: Vec::new(),
+                governance: None,
             },
             audit: acp::AuditStatus::undescribed(true),
             context: None,

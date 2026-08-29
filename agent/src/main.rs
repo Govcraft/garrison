@@ -460,6 +460,9 @@ async fn ping(socket: Option<PathBuf>) -> Result<(), GarrisonError> {
         status.policy.approval_timeout_secs,
         status.policy.auto_approve.join(", "),
     );
+    for line in governance_lines(status.policy.governance.as_ref()) {
+        println!("{line}");
+    }
     println!("  audit:      {}", audit_line(&status.audit));
     println!(
         "  sandbox:    {}",
@@ -475,6 +478,57 @@ async fn ping(socket: Option<PathBuf>) -> Result<(), GarrisonError> {
     );
 
     Ok(())
+}
+
+/// What `ping` prints about the policy in force. Pure.
+///
+/// Three things an operator needs and one they are owed. The state, so they
+/// know whether this machine is governed at all; the bundle's identity and
+/// checksum, so they can say which policy it is running; and the reason, when
+/// there is none, because "refused" without a reason is what makes people
+/// disable governance. The one they are owed is the "not enforced" line: those
+/// bundle fields are part of the published policy and part of its checksum,
+/// and this release does not act on them. Saying nothing would let an author
+/// believe otherwise.
+fn governance_lines(status: Option<&acp::GovernanceStatus>) -> Vec<String> {
+    let Some(status) = status else {
+        return vec!["  governance: not reported (the policy agent did not answer)".to_string()];
+    };
+
+    let mut lines = vec![format!("  governance: {}", status.state)];
+
+    if let Some(bundle) = status.bundle.as_ref() {
+        let checksum = &bundle.checksum[..bundle.checksum.len().min(12)];
+        lines.push(format!(
+            "  bundle:     {} v{} {} (from {}, fetched {})",
+            bundle.name, bundle.version, checksum, bundle.source, bundle.fetched_at,
+        ));
+    }
+    if let Some(reason) = status.reason.as_deref() {
+        lines.push(format!("  reason:     {reason}"));
+    }
+    if !status.approved_providers.is_empty() {
+        lines.push(format!(
+            "  providers:  approved=[{}] default={}",
+            status.approved_providers.join(", "),
+            status.default_provider.as_deref().unwrap_or("none"),
+        ));
+    }
+    if status.local_auto_approve_ignored {
+        lines.push(
+            "  note:       [approval].auto_approve in garrison.toml is ignored while this \
+             install is governed"
+                .to_string(),
+        );
+    }
+    if !status.not_enforced.is_empty() {
+        lines.push(format!(
+            "  note:       recorded in the bundle and NOT enforced by this release: {}",
+            status.not_enforced.join(", "),
+        ));
+    }
+
+    lines
 }
 
 /// The audit summary `ping` prints, in one line. Pure.

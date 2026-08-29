@@ -251,6 +251,11 @@ pub struct ThreadSetup {
     /// wants a say in whether a turn starts adds its actor here and never
     /// touches the turn itself.
     pub gates: Vec<ActorHandle>,
+    /// The policy agent every tool call in this session is put to.
+    ///
+    /// `None` leaves the local auto-approve list as the whole policy, which
+    /// is what a stack brought up without a policy agent gets.
+    pub policy: Option<ActorHandle>,
 }
 
 /// One conversation.
@@ -590,6 +595,7 @@ async fn drive_turn(
         conn: setup.conn.clone(),
         timeout: setup.approval_timeout,
         auto_approve: Arc::clone(&setup.auto_approve),
+        policy: setup.policy.clone(),
     };
 
     let sink = setup.sink.clone();

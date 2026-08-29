@@ -95,6 +95,14 @@ pub struct ThreadDefaults {
     ///
     /// See [`crate::admission`]. Empty means every turn is admitted.
     pub gates: Vec<ActorHandle>,
+    /// The policy agent every tool call is put to.
+    ///
+    /// `None` only in a `Default`-constructed value; a daemon brought up
+    /// through `launch::build_setup` always has one, standalone or governed.
+    /// Its absence makes the approval hook fall back to the local
+    /// auto-approve list, which is the pre-policy behaviour and what the
+    /// protocol tests exercise.
+    pub policy: Option<ActorHandle>,
 }
 
 impl Default for ThreadDefaults {
@@ -107,6 +115,7 @@ impl Default for ThreadDefaults {
             auto_approve: Arc::new(Vec::new()),
             lsp: Arc::new(crate::lsp::LspRegistry::default()),
             gates: Vec::new(),
+            policy: None,
         }
     }
 }
@@ -172,6 +181,12 @@ pub enum StatusPart {
     /// flight — one per describer, on every status request — would otherwise
     /// be sized for it.
     Audit(Box<acp::AuditStatus>),
+    /// From the policy agent: what the control plane says governs this
+    /// install, and the bundle it is enforcing.
+    ///
+    /// Boxed for the same reason [`Self::Audit`] is: it is wide, and every
+    /// `StatusPart` in flight would otherwise be sized for it.
+    Governance(Box<acp::GovernanceStatus>),
 }
 
 impl Request for Describe {
@@ -571,11 +586,25 @@ fn permission_request(request: &RequestApproval) -> acp::RequestPermissionReques
         .status(acp::ToolCallStatus::Pending)
         .raw_input(request.arguments.clone());
 
-    acp::RequestPermissionRequest::new(
+    let built = acp::RequestPermissionRequest::new(
         acp::session_id(&request.thread_id),
         acp::ToolCallUpdate::new(tool_call_id, fields),
         acp::permission_options(),
-    )
+    );
+
+    // Why the bundle wants a human to look at this, in the security officer's
+    // own words. A dialog that says "allow bash?" and one that says "allow
+    // bash? this rule exists because deleting files is not reviewable after
+    // the fact" get different answers, and the second is the one an
+    // organization actually decided. Omitted entirely when no rule matched,
+    // rather than sent empty.
+    match &request.justification {
+        None => built,
+        Some(justification) => built.meta(Some(acp::garrison_meta(&acp::ApprovalMeta {
+            justification: justification.clone(),
+            rule: request.rule.clone(),
+        }))),
+    }
 }
 
 /// Answers a parked `session/prompt` with however its turn ended.
@@ -823,6 +852,7 @@ async fn session_new(context: &Dispatch, raw: Option<Value>) -> Result<Value, Er
         auto_approve: Arc::clone(&context.setup.defaults.auto_approve),
         lsp: Arc::clone(&context.setup.defaults.lsp),
         gates: context.setup.defaults.gates.clone(),
+        policy: context.setup.defaults.policy.clone(),
     };
 
     let created = context
@@ -1019,6 +1049,9 @@ fn own_status(context: &Dispatch) -> acp::GarrisonStatus {
         policy: acp::PolicyStatus {
             approval_timeout_secs: defaults.approval_timeout.as_secs(),
             auto_approve: defaults.auto_approve.as_ref().clone(),
+            // Filled by the policy agent's own part, so the local settings
+            // above survive rather than being overwritten by it.
+            governance: None,
         },
         audit: acp::AuditStatus::undescribed(context.setup.audited),
         sandbox: context.setup.sandbox.clone(),
@@ -1083,6 +1116,7 @@ fn assemble(
             // which the keeper reports from the same barrier that produced
             // the health beside it.
             StatusPart::Audit(audit) => status.audit = *audit,
+            StatusPart::Governance(governance) => status.policy.governance = Some(*governance),
         }
     }
     status
@@ -1109,6 +1143,8 @@ mod tests {
             tool_name: tool_name.to_string(),
             arguments: json!({"command": "ls"}),
             timeout: Duration::from_secs(1),
+            justification: None,
+            rule: None,
         }
     }
 
@@ -1323,6 +1359,7 @@ mod tests {
             policy: acp::PolicyStatus {
                 approval_timeout_secs: 1,
                 auto_approve: Vec::new(),
+                governance: None,
             },
             audit: acp::AuditStatus::undescribed(true),
             sandbox: acp::SandboxStatus::disabled(),
