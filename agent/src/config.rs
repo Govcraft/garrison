@@ -41,8 +41,70 @@ pub struct GarrisonConfig {
     /// the anchor lives in the default place. The section exists for the
     /// deployment that wants to say more than acton-ai's file can.
     pub audit: AuditConfig,
+    /// What this install requires of the sessions acton-ai stores.
+    ///
+    /// Absent — no `[sessions]` section — follows the same rule the audit
+    /// section does: a store is required when this install answers to a
+    /// control plane, and optional when it does not. How long a session is
+    /// then kept is this section's own business.
+    pub sessions: SessionConfig,
     /// Language servers to run, keyed by a name of the operator's choosing.
     pub lsp_servers: std::collections::HashMap<String, LspServerConfig>,
+}
+
+/// What Garrison requires of the sessions acton-ai stores.
+///
+/// acton-ai owns the store: which database file, what a checkpoint holds, how
+/// a turn is resumed. This section owns the two questions acton-ai has no
+/// opinion about, because they are the agency's questions rather than the
+/// runtime's: whether a store is required at all, and how long an operator's
+/// conversations are kept once it has one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionConfig {
+    /// Whether the daemon may start without a session store.
+    ///
+    /// `None` means "required when a `[plane]` section is present", exactly as
+    /// [`AuditConfig::required`] reads. See
+    /// [`GarrisonConfig::sessions_required`], which is the only place this
+    /// rule is decided.
+    pub required: Option<bool>,
+
+    /// Days a session may go untouched before the daemon deletes it.
+    ///
+    /// Persistence without retention is a growing disk and a growing
+    /// disclosure. Zero is read as one: a same-day sweep is an operator asking
+    /// for the shortest window there is, not for sessions that vanish while
+    /// they are being typed into.
+    pub retain_days: u32,
+
+    /// How often that window is enforced, in hours. Zero is read as one.
+    pub sweep_interval_hours: u32,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            required: None,
+            retain_days: 30,
+            sweep_interval_hours: 24,
+        }
+    }
+}
+
+impl SessionConfig {
+    /// This section as the sweep reads it.
+    ///
+    /// Pure, and the one place the zero clamp lives.
+    #[must_use]
+    pub fn retention(&self) -> crate::session::RetentionPolicy {
+        crate::session::RetentionPolicy {
+            retain_days: self.retain_days.max(1),
+            sweep_interval: std::time::Duration::from_secs(
+                u64::from(self.sweep_interval_hours.max(1)) * 60 * 60,
+            ),
+        }
+    }
 }
 
 /// What Garrison requires of the audit trail acton-ai writes.
@@ -456,6 +518,22 @@ impl GarrisonConfig {
     #[must_use]
     pub fn audit_required(&self) -> bool {
         self.audit.required.unwrap_or(self.plane.is_some())
+    }
+
+    /// Whether this daemon may start without a session store.
+    ///
+    /// The same rule [`Self::audit_required`] states, about the other half of
+    /// what an agency expects to still be there tomorrow: **a `[plane]`
+    /// section present while acton-ai arms no `[checkpoint]` database is a
+    /// refusal to start.** An operator whose work vanishes on every upgrade
+    /// has not been given a governed agent, they have been given an
+    /// unreliable one. `[sessions] required` overrides the inference in
+    /// either direction.
+    ///
+    /// Pure, and deliberately the only place this is decided.
+    #[must_use]
+    pub fn sessions_required(&self) -> bool {
+        self.sessions.required.unwrap_or(self.plane.is_some())
     }
 }
 

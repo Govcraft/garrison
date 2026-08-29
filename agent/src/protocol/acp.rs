@@ -109,6 +109,17 @@ pub mod ext {
     /// it from an answer that forgot something.
     pub const SESSION_COMPACTED: &str = "_garrison/session/compacted";
 
+    /// Picks a turn a restart interrupted back up where it stopped.
+    ///
+    /// A request, and the only way a turn that outlived its daemon reaches a
+    /// model again: the resume policy this agent runs under never resumes on
+    /// its own, because a turn resumed in the background would settle pending
+    /// tool calls with no client to ask for permission.
+    pub const SESSION_RESUME: &str = "_garrison/session/resume";
+
+    /// Gives up on a turn a restart interrupted, unblocking the session.
+    pub const SESSION_ABANDON: &str = "_garrison/session/abandon";
+
     /// The key Garrison uses inside any ACP `_meta` object.
     ///
     /// One key, one nested object: a `_meta` is shared with every other
@@ -162,6 +173,96 @@ pub struct GarrisonStatus {
     /// is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<ContextStatus>,
+    /// Whether sessions survive a restart, and what the store holds.
+    ///
+    /// Absent when this daemon persists nothing — `acton-ai.toml` arms no
+    /// `[checkpoint]` section — and when the store could not be asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_store: Option<SessionStoreStatus>,
+}
+
+/// What the session store holds, and whether it can be reached.
+///
+/// The field an operator reads when a `session/prompt` comes back refused
+/// with `-32018`: a store that cannot answer refuses every turn, on purpose,
+/// rather than running turns whose history would be lost at the next restart.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct SessionStoreStatus {
+    /// Whether the store answered when it was last asked.
+    ///
+    /// `false` is the refusing state: turns are being turned away until it
+    /// answers again.
+    pub healthy: bool,
+    /// Sessions this agent can read back after a restart.
+    pub sessions: usize,
+    /// Of those, how many hold a turn a restart interrupted. Each one is a
+    /// session that will refuse a new prompt until it is resumed or
+    /// abandoned.
+    pub interrupted: usize,
+    /// The most recent turn checkpoint written, by identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_checkpoint: Option<String>,
+    /// Days a session may go untouched before the sweep removes it.
+    pub retain_days: u32,
+    /// When the retention sweep last ran, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_swept: Option<String>,
+    /// What the store last failed at, if it has failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+/// What a client is told about a turn a restart interrupted.
+///
+/// Rides in `_meta.garrison` on the `session/load` response, so an editor
+/// reattaching to a session learns immediately that it cannot prompt until
+/// the operator decides, and has the turn identifier to decide *about*.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct InterruptedTurnMeta {
+    /// The turn left half-done.
+    pub turn_id: String,
+    /// When it started, RFC 3339.
+    pub started_at: String,
+    /// What the operator had asked for.
+    pub prompt: String,
+    /// How many provider rounds it had already spent, from its checkpoint.
+    /// Absent when the turn left no record to read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rounds_completed: Option<usize>,
+    /// Whether the saved progress can still be picked up. `false` means the
+    /// only way forward is to abandon it.
+    pub resumable: bool,
+}
+
+/// The `_meta.garrison` payload on a `session/load` that found an
+/// interrupted turn.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct LoadMeta {
+    /// The turn a restart interrupted, when there is one.
+    pub interrupted_turn: InterruptedTurnMeta,
+}
+
+/// What `_garrison/session/resume` and `_garrison/session/abandon` are given.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InterruptedTurnRequest {
+    /// The session holding the interrupted turn.
+    pub session_id: SessionId,
+}
+
+/// What `_garrison/session/abandon` answers with.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct AbandonResponse {
+    /// The turn that was given up on.
+    pub turn_id: String,
 }
 
 /// What the daemon's credential holder reports about reaching the plane.

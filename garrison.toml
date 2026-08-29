@@ -90,6 +90,46 @@ auto_approve = ["read_file", "glob", "grep", "list_directory", "calculate", "get
 # Set it explicitly to override the inference in either direction.
 # required = true
 
+[sessions]
+# What Garrison requires of the sessions acton-ai stores. acton-ai owns the
+# store itself: which database file, what a checkpoint holds, how a turn is
+# resumed. That is `[checkpoint]` in acton-ai.toml, and its presence is what
+# arms persistence. This section owns the two questions it has no opinion
+# about, because they are the agency's questions rather than the runtime's.
+
+# Whether the daemon may start without a session store. Omitted, a store is
+# required exactly when a [plane] section is present, which is the same rule
+# [audit] required follows and for the same reason: an operator whose work
+# vanishes on every upgrade has not been given a governed agent, only an
+# unreliable one. A required store that acton-ai.toml does not arm is a
+# refusal to start (exit 2). Set it explicitly to override the inference in
+# either direction.
+# required = true
+
+# Days a session may go untouched before the daemon deletes it, with its
+# conversation and every message in it. Persistence without retention is a
+# growing disk and a growing disclosure: every prompt an operator ever typed,
+# kept forever, on a machine an agency has to be able to say something
+# definite about.
+#
+# One thing is never swept, at any age: a session holding a turn a restart
+# interrupted. The operator has not yet said whether to resume or abandon it,
+# and deleting it would make that decision for them.
+retain_days = 30
+
+# How often that window is enforced. The first sweep runs at startup. Zero in
+# either key is read as one rather than as "never" and rather than as
+# "immediately".
+sweep_interval_hours = 24
+
+# What a client does about an interrupted turn is not configured here; it is
+# asked for, per turn, over the protocol. `session/load` reports the turn in
+# `_meta.garrison.interruptedTurn`, and the client answers with
+# `_garrison/session/resume` (carry on from the round the checkpoint stopped
+# at) or `_garrison/session/abandon` (give up on it and unblock the session).
+# Until one of those arrives the session refuses new prompts with JSON-RPC
+# code -32019, and a resume or abandon with nothing to act on is -32021.
+
 # [plane]
 # Enrolling with a control plane. Omit this section entirely and the agent runs
 # standalone, exactly as it did before enrollment existed.

@@ -357,6 +357,73 @@ impl AgentClient {
             .await
     }
 
+    /// Reopens a session by identity, replaying its history first.
+    ///
+    /// The one call that reaches a session this connection never opened, which
+    /// after a restart is every session there is. The response's
+    /// `_meta.garrison.interruptedTurn` is how the agent says a turn was cut
+    /// short and the session will refuse prompts until it is resumed or
+    /// abandoned.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::request`]. `-32020` when the session's stored root is no
+    /// longer inside the approved tree.
+    pub async fn load_session(
+        &mut self,
+        session_id: acp::SessionId,
+        cwd: impl Into<std::path::PathBuf>,
+        interactions: &mut impl Interactions,
+    ) -> Result<acp::LoadSessionResponse, GarrisonError> {
+        self.request(
+            acp::method::SESSION_LOAD,
+            &acp::LoadSessionRequest::new(session_id, cwd),
+            interactions,
+        )
+        .await
+    }
+
+    /// Picks an interrupted turn back up where its checkpoint left it.
+    ///
+    /// Waits exactly as [`Self::prompt`] does, because it is the same turn
+    /// carrying on rather than a new one: the rounds already spent are not
+    /// spent again.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::request`]. `-32021` when the session has no interrupted turn,
+    /// which is the agent refusing to invent one rather than silently starting
+    /// the work over.
+    pub async fn resume(
+        &mut self,
+        session_id: acp::SessionId,
+        interactions: &mut impl Interactions,
+    ) -> Result<acp::PromptResponse, GarrisonError> {
+        self.request(
+            acp::ext::SESSION_RESUME,
+            &acp::InterruptedTurnRequest { session_id },
+            interactions,
+        )
+        .await
+    }
+
+    /// Gives up on an interrupted turn, making the session promptable again.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::request`]. `-32021` when there is nothing to abandon.
+    pub async fn abandon(
+        &mut self,
+        session_id: acp::SessionId,
+    ) -> Result<acp::AbandonResponse, GarrisonError> {
+        self.request(
+            acp::ext::SESSION_ABANDON,
+            &acp::InterruptedTurnRequest { session_id },
+            &mut Quiet,
+        )
+        .await
+    }
+
     /// Asks the agent to stop the session's running turn.
     ///
     /// # Errors

@@ -19,7 +19,10 @@ described below is direction, not checkout.
   and owning the runtime, the sandbox host and the audit trail.
 - ACP v1 over stdin/stdout for editor-spawned hosts, as a relay to that
   daemon: the spawned process runs no engine of its own.
-- In-memory session create, load, list, prompt, and cancellation.
+- Session create, load, list, prompt, and cancellation, over sessions that
+  survive the daemon: history and turn checkpoints are written to a libSQL
+  store as the work happens, so a restart reopens the conversation and reports
+  the turn it interrupted instead of losing both.
 - Streaming model text and tool lifecycle events.
 - Plans and context compaction as protocol events: an `update_plan` call
   reaches the one session that owns the turn as an ACP `plan` update, a
@@ -87,7 +90,8 @@ Active tracking issues include
 editor ─ garrison-agent acp (relay) ─┐
 terminal ─ garrison-agent chat ──────┤ $XDG_RUNTIME_DIR/garrison-agent.sock
 socket client ───────────────────────┘
-  └─ garrison-agent serve (one per user; owns runtime, socket, audit trail)
+  └─ garrison-agent serve (one per user; owns runtime, socket, audit trail,
+     session store)
       └─ ClientConn actor
       └─ ThreadSupervisor / Thread actor
           └─ acton-ai prompt and tool loop
@@ -187,9 +191,10 @@ Cloud providers require credentials configured in `acton-ai.toml`; use
 `cargo run -p garrison-agent -- login <anthropic|openai>` where supported, or
 populate the provider's configured key file. Ollama can be selected for a local
 deployment. `garrison.toml` configures the project root, approval behavior,
-optional language servers, an optional `[audit]` section, and an optional
-`[plane]` section naming the control plane to enroll with. Without that last
-section the agent runs standalone.
+optional language servers, an optional `[audit]` section, an optional
+`[sessions]` section governing how long stored conversations are kept, and an
+optional `[plane]` section naming the control plane to enroll with. Without
+that last section the agent runs standalone.
 
 ## The audit trail
 
@@ -237,6 +242,36 @@ A `[plane]` section present while `acton-ai.toml` arms no trail is a refusal to
 start: an install that answers to an agency and records nothing is the failure
 an audit exists to prevent. `[audit] required` overrides that inference either
 way.
+
+## Sessions that survive a restart
+
+`acton-ai.toml`'s `[checkpoint]` section arms a libSQL store, and its presence
+is what turns persistence on. Every session is written down before its id is
+handed to the client, its history is saved as turns finish, and each turn
+checkpoints after every provider round. A daemon that comes back up reopens a
+session on `session/load` and replays its history, having held nothing in
+memory across the restart.
+
+Two rules fail closed. A store that cannot be reached refuses every turn with
+`-32018`, rather than running work no restart could find. A session whose
+record names a turn that was still open refuses *new* prompts with `-32019`
+until an operator settles the old one, because restarting it silently would
+re-run tools that already ran and dropping it silently would throw away work
+somebody asked for. `session/load` reports the interrupted turn in
+`_meta.garrison.interruptedTurn`, and `_garrison/session/resume` picks it up
+from the round its checkpoint reached while `_garrison/session/abandon` gives
+up on it and makes the session promptable again. For the same reason,
+`[checkpoint] policy` must be `resume_on_request`; `resume_auto` refuses to
+start, since a turn resumed in the background would settle its tool calls with
+no client connected to approve them.
+
+`garrison.toml`'s `[sessions]` owns the window sessions are kept for
+(`retain_days`, swept every `sweep_interval_hours`, starting at launch). A
+session holding an interrupted turn is never swept at any age: the operator has
+not yet said what to do with it. As with the trail, a `[plane]` section present
+while no store is armed is a refusal to start, and `[sessions] required`
+overrides that inference either way. `_garrison/status` reports the store under
+`sessionStore`, including how many sessions are waiting on a decision.
 
 ## Target architecture
 

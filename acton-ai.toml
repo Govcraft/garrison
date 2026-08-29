@@ -147,10 +147,41 @@ read_write = ["~/.cache/uv"]
 # `garrison-agent audit verify` for the finding.
 durability = "strict"
 
-# Interrupted-turn checkpoints (session persistence). The same rule applies
-# when this section is enabled: `db_path` is resolved against the daemon's
-# working directory and is not tilde-expanded, so give it an absolute
-# per-user path, never a workspace-relative one.
+# Session persistence. The section's presence is what arms it: every session
+# the daemon opens is written to this database, and every turn checkpoints
+# after each provider round, so a restart finds the conversation and whatever
+# turn was in flight rather than losing both.
+#
+# This is the section `[sessions] required` in garrison.toml is about. An
+# install with a `[plane]` section and no `[checkpoint]` here refuses to
+# start (exit 2): an agency that governs its agents expects its operators'
+# work to still be there after an upgrade.
+#
+# Left commented because there is no correct value to ship. WRITE AN ABSOLUTE
+# PER-USER PATH: `db_path` is resolved against the daemon's working directory
+# and is not tilde-expanded, and that directory is $HOME under systemd and
+# under relay autostart. Unlike `[audit] path` above, omitting the key does
+# not fall back to an XDG location — acton-ai uses `acton-ai-checkpoints.db`
+# beside wherever the daemon happened to start, so an operator would get a
+# different set of sessions per directory. Uncommenting all four lines below
+# with a real path is what arms persistence on this install.
 # [checkpoint]
 # db_path = "/home/<user>/.local/share/garrison/sessions.db"
-# policy = "abandon"
+
+# What a restart does about the turns it finds interrupted. Garrison ships
+# and requires `resume_on_request`: the daemon reports an interrupted turn to
+# the client and waits to be told, through `_garrison/session/resume` or
+# `_garrison/session/abandon`, which is which. Until that answer arrives the
+# session refuses new prompts with JSON-RPC code -32019, rather than silently
+# restarting work that has already run tools and already been paid for.
+#
+# `resume_auto` is refused at startup (exit 2). A turn resumed in the
+# background would settle its pending tool calls with no client connected to
+# approve them, which is the one thing a governed agent may never do.
+# `abandon` is acton-ai's default and throws the work away unasked.
+# policy = "resume_on_request"
+
+# How many failed attempts one turn is granted before an unattended sweep
+# gives up on it and records it abandoned. A resume an operator asked for by
+# name is never subject to this ceiling.
+# max_resume_attempts = 3

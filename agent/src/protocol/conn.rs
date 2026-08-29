@@ -58,11 +58,14 @@ use crate::approval::{ApprovalOutcome, RequestApproval, CANCELLED_REASON, REJECT
 use crate::protocol::acp::{self, Permission};
 use crate::protocol::codec::EventSink;
 use crate::protocol::jsonrpc::{encode, error_code, params, ErrorObject, Inbound, RequestId};
+use crate::session;
 use crate::thread::{
-    CreateThread, DescribeThread, FindThread, InterruptTurn, ListThreads, Reattach, StartTurn,
-    ThreadList, ThreadLookup, ThreadSetup, TurnAdmission, TurnFinished, TurnResult,
+    AbandonTurn, CreateThread, DescribeThread, FindThread, InterruptTurn, ListThreads, Reattach,
+    ResumeAdmission, ResumeTurn, StartTurn, ThreadList, ThreadLookup, ThreadSetup, TurnAdmission,
+    TurnFinished, TurnResult,
 };
 use crate::types::{ClientId, ThreadId};
+use acton_ai::checkpoint::CheckpointStatus;
 use acton_ai::facade::ActonAI;
 use acton_reactive::prelude::*;
 use serde_json::Value;
@@ -95,6 +98,18 @@ pub struct ThreadDefaults {
     ///
     /// See [`crate::admission`]. Empty means every turn is admitted.
     pub gates: Vec<ActorHandle>,
+    /// Where sessions are written so they survive a restart.
+    ///
+    /// `None` on an install that arms no session store, which is the
+    /// standalone developer install: its sessions live in their actors and die
+    /// with the process, exactly as they did before persistence existed.
+    pub store: Option<session::SessionStore>,
+    /// Who every session this daemon opens belongs to.
+    ///
+    /// Settled once at launch and stamped onto each stored session, so a row
+    /// shipped to the fleet view later carries its tenant chain rather than
+    /// landing unattributed and invisible.
+    pub attribution: session::Attribution,
 }
 
 impl Default for ThreadDefaults {
@@ -107,6 +122,8 @@ impl Default for ThreadDefaults {
             auto_approve: Arc::new(Vec::new()),
             lsp: Arc::new(crate::lsp::LspRegistry::default()),
             gates: Vec::new(),
+            store: None,
+            attribution: session::Attribution::default(),
         }
     }
 }
@@ -172,6 +189,9 @@ pub enum StatusPart {
     /// flight — one per describer, on every status request — would otherwise
     /// be sized for it.
     Audit(Box<acp::AuditStatus>),
+    /// From the session keeper: whether sessions survive a restart, and how
+    /// many of them are waiting on a decision about an interrupted turn.
+    SessionStore(acp::SessionStoreStatus),
 }
 
 impl Request for Describe {
@@ -297,7 +317,11 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, ClientConn>) {
                 // race the turn: a turn that finished before its id was stored
                 // would find nothing to answer, and the client would wait
                 // forever on a prompt that had already completed.
-                let parked = if method == acp::method::SESSION_PROMPT {
+                // A resume is parked exactly as a prompt is, because it is
+                // answered exactly as a prompt is: by the turn it starts.
+                let parked = if method == acp::method::SESSION_PROMPT
+                    || method == acp::ext::SESSION_RESUME
+                {
                     match park_prompt(actor, &id, params.as_ref()) {
                         Parked::Busy => {
                             setup.sink.fail(Some(id), busy_error());
@@ -746,7 +770,9 @@ async fn handle(
         acp::method::SESSION_LOAD => session_load(context, raw).await.map(Answer::Result),
         acp::method::SESSION_LIST => session_list(context, raw).await.map(Answer::Result),
         acp::ext::STATUS => status(context).await.map(Answer::Result),
+        acp::ext::SESSION_ABANDON => session_abandon(context, raw).await.map(Answer::Result),
         acp::method::SESSION_PROMPT => session_prompt(context, raw).await,
+        acp::ext::SESSION_RESUME => session_resume(context, raw).await,
         other => Err(ErrorObject::method_not_found().data(Value::String(other.to_string()))),
     }
 }
@@ -810,20 +836,10 @@ async fn session_new(context: &Dispatch, raw: Option<Value>) -> Result<Value, Er
     let project_root = project_root(context, &request.cwd)?;
     let thread_id = ThreadId::new();
 
-    let setup = ThreadSetup {
-        thread_id,
-        owner: context.setup.client_id.clone(),
-        sink: context.setup.sink.clone(),
-        conn: context.conn.clone(),
-        runtime: context.setup.runtime.clone(),
-        router: context.setup.router.clone(),
-        project_root: Arc::new(project_root),
-        system_prompt: context.setup.defaults.system_prompt.clone(),
-        approval_timeout: context.setup.defaults.approval_timeout,
-        auto_approve: Arc::clone(&context.setup.defaults.auto_approve),
-        lsp: Arc::clone(&context.setup.defaults.lsp),
-        gates: context.setup.defaults.gates.clone(),
-    };
+    // Written down before the client is told the id, so the session the client
+    // holds and the session a restart can find are the same session.
+    let meta = record_session(context, &thread_id, &project_root).await?;
+    let setup = thread_setup(context, thread_id, project_root);
 
     let created = context
         .setup
@@ -831,6 +847,8 @@ async fn session_new(context: &Dispatch, raw: Option<Value>) -> Result<Value, Er
         .ask(CreateThread {
             setup,
             history: Vec::new(),
+            meta,
+            appended: 0,
         })
         .await
         .map_err(|error| internal(&format!("could not create a session: {error}")))?;
@@ -899,7 +917,9 @@ async fn session_load(context: &Dispatch, raw: Option<Value>) -> Result<Value, E
         .map_err(|error| internal(&format!("session lookup failed: {error}")))?;
 
     let Some(handle) = handle else {
-        return Err(acp::unknown_session(&request.session_id));
+        // Not live is not the same as unknown. A daemon that has restarted
+        // holds no sessions at all, and the store is what remembers them.
+        return hydrate(context, &request.session_id, &thread_id).await;
     };
 
     // The replay is emitted from inside this `ask`, so the FIFO sink puts every
@@ -964,9 +984,10 @@ async fn session_cancel(context: &Dispatch, raw: Option<Value>) -> Result<(), Er
 
 /// `session/list`: describe every session this client holds.
 async fn session_list(context: &Dispatch, raw: Option<Value>) -> Result<Value, ErrorObject> {
-    // Parsed and discarded: the request's only fields are a cwd filter and a
-    // cursor, and a connection's session set is small enough to answer whole.
-    let _request: acp::ListSessionsRequest = params(raw)?;
+    // The cursor is discarded: a connection's session set is small enough to
+    // answer whole. The cwd is not, because it decides which stored sessions
+    // are worth offering back.
+    let request: acp::ListSessionsRequest = params(raw)?;
 
     let ThreadList { threads } = context
         .setup
@@ -976,10 +997,12 @@ async fn session_list(context: &Dispatch, raw: Option<Value>) -> Result<Value, E
         .map_err(|error| internal(&format!("could not list sessions: {error}")))?;
 
     let mut sessions = Vec::new();
+    let mut live = Vec::new();
     for (thread_id, handle) in threads {
         if !context.sessions.contains(&thread_id) {
             continue;
         }
+        live.push(thread_id.clone());
         match handle.ask(DescribeThread).await {
             Ok(summary) => sessions.push(acp::SessionInfo::new(
                 acp::session_id(&thread_id),
@@ -991,7 +1014,331 @@ async fn session_list(context: &Dispatch, raw: Option<Value>) -> Result<Value, E
         }
     }
 
+    // Appended rather than merged in place: what is live comes first, in the
+    // order it was created, and what can be reopened follows it.
+    let stored = stored_sessions(context, request.cwd.as_deref(), &live).await;
+    sessions.extend(stored);
+
     encode(&acp::ListSessionsResponse::new(sessions))
+}
+
+// =============================================================================
+// Sessions that outlive the process
+// =============================================================================
+
+/// Everything a session actor needs, built once for both ways in.
+///
+/// `session/new` and a `session/load` that hydrates from the store want the
+/// identical configuration; the only thing that differs between them is which
+/// identity and which root it is built around. Factored out so the two paths
+/// cannot drift, which is how one of them would quietly end up with the wrong
+/// gates or no store.
+fn thread_setup(context: &Dispatch, thread_id: ThreadId, project_root: PathBuf) -> ThreadSetup {
+    let defaults = &context.setup.defaults;
+
+    ThreadSetup {
+        thread_id,
+        owner: context.setup.client_id.clone(),
+        sink: context.setup.sink.clone(),
+        conn: context.conn.clone(),
+        runtime: context.setup.runtime.clone(),
+        router: context.setup.router.clone(),
+        project_root: Arc::new(project_root),
+        system_prompt: defaults.system_prompt.clone(),
+        approval_timeout: defaults.approval_timeout,
+        auto_approve: Arc::clone(&defaults.auto_approve),
+        lsp: Arc::clone(&defaults.lsp),
+        gates: defaults.gates.clone(),
+        store: defaults.store.clone(),
+    }
+}
+
+/// The refusal a client sees when the session store will not answer.
+///
+/// The same code the turn gate refuses with, because it is the same fact: a
+/// daemon that cannot write a session down does not open one, rather than
+/// opening one whose history the next restart will not find.
+fn store_unavailable(error: &crate::error::GarrisonError) -> ErrorObject {
+    ErrorObject::new(
+        error_code::STORE_UNAVAILABLE,
+        format!("the session store is unavailable: {error}"),
+    )
+}
+
+/// Writes a new session down before the client is told it exists.
+///
+/// Ordered that way on purpose. A session the client holds an id for but the
+/// store has never heard of is a session that vanishes at the next restart
+/// with nothing to say about why, so the write is what the id is issued
+/// against. Returns `None` on an install with no store armed, which is the
+/// standalone developer install and behaves exactly as it did before.
+async fn record_session(
+    context: &Dispatch,
+    thread_id: &ThreadId,
+    project_root: &Path,
+) -> Result<Option<session::SessionMeta>, ErrorObject> {
+    let defaults = &context.setup.defaults;
+    let Some(store) = &defaults.store else {
+        return Ok(None);
+    };
+
+    let conversation = store
+        .create(thread_id, defaults.system_prompt.clone())
+        .await
+        .map_err(|error| store_unavailable(&error))?;
+
+    let meta = session::SessionMeta::opening(
+        conversation,
+        project_root.to_path_buf(),
+        session::CLIENT_SOCKET,
+    )
+    .attributed(&defaults.attribution);
+
+    store
+        .write_meta(thread_id, &meta)
+        .await
+        .map_err(|error| store_unavailable(&error))?;
+
+    Ok(Some(meta))
+}
+
+/// Brings a stored session back as a live actor, or says it is unknown.
+///
+/// The boundary is re-checked here rather than trusted from the record. The
+/// approved roots are an administrator's decision and may have narrowed since
+/// the session was written; a session rooted outside them now is refused, and
+/// a stored record is not a way around that.
+async fn hydrate(
+    context: &Dispatch,
+    session_id: &acp::SessionId,
+    thread_id: &ThreadId,
+) -> Result<Value, ErrorObject> {
+    let Some(store) = &context.setup.defaults.store else {
+        return Err(acp::unknown_session(session_id));
+    };
+
+    let stored = store
+        .resolve(thread_id)
+        .await
+        .map_err(|error| store_unavailable(&error))?;
+    let Some(stored) = stored else {
+        return Err(acp::unknown_session(session_id));
+    };
+
+    let project_root = approved_root(context, &stored.meta.project_root)?;
+    let history = store
+        .history(&stored.meta.conversation)
+        .await
+        .map_err(|error| store_unavailable(&error))?;
+    let appended = history.len();
+
+    let setup = thread_setup(context, thread_id.clone(), project_root);
+    let created = context
+        .setup
+        .supervisor
+        .ask(CreateThread {
+            setup,
+            history,
+            meta: Some(stored.meta.clone()),
+            appended,
+        })
+        .await
+        .map_err(|error| internal(&format!("could not restore the session: {error}")))?;
+
+    // Reattaching a session this connection just created looks redundant and
+    // is not: the replay is emitted from inside the `ask`, so the history
+    // reaches the socket before the response ACP says it must precede.
+    created
+        .handle
+        .ask(Reattach {
+            owner: context.setup.client_id.clone(),
+            sink: context.setup.sink.clone(),
+            conn: context.conn.clone(),
+        })
+        .await
+        .map_err(|error| internal(&format!("could not load the session: {error}")))?;
+
+    context
+        .notify_self(OwnSession {
+            thread_id: thread_id.clone(),
+        })
+        .await;
+
+    tracing::info!(
+        %thread_id,
+        messages = appended,
+        interrupted = stored.meta.interrupted().is_some(),
+        "restored a session written before this process started",
+    );
+
+    let response = acp::LoadSessionResponse::new();
+    match interrupted_meta(store, &stored.meta).await {
+        Some(interrupted) => encode(&response.meta(Some(acp::garrison_meta(&acp::LoadMeta {
+            interrupted_turn: interrupted,
+        })))),
+        None => encode(&response),
+    }
+}
+
+/// Re-checks a stored session's root against the roots approved *now*.
+///
+/// Separate from [`project_root`] because the refusal is a different one. A
+/// `session/new` naming a bad directory is a client mistake and reads as
+/// invalid parameters; a stored session whose root has since been de-approved
+/// is an administrator's decision catching up with history, and `-32020`
+/// SESSION_ROOT_UNAPPROVED is the code that says so. The record is left
+/// alone either way: the session is not deleted, it is simply not opened
+/// here, and re-approving the tree brings it back.
+fn approved_root(context: &Dispatch, stored: &Path) -> Result<PathBuf, ErrorObject> {
+    let defaults = &context.setup.defaults;
+
+    crate::boundary::resolve(stored, &defaults.project_root, &defaults.approved_roots).map_err(
+        |rejection| {
+            tracing::warn!(
+                root = %stored.display(),
+                rejection = %rejection,
+                "refused to reopen a stored session",
+            );
+            ErrorObject::new(
+                error_code::SESSION_ROOT_UNAPPROVED,
+                format!(
+                    "this session was opened at '{}', which is no longer inside an approved                      tree: {rejection}. Approve it again under [threads] workspace_roots to                      reopen the session",
+                    stored.display()
+                ),
+            )
+        },
+    )
+}
+
+/// What a client is told about a turn a restart cut short.
+///
+/// The record's open turn is the fact; the checkpoint adds how far it got and
+/// whether there is anything left to pick up. A checkpoint that cannot be read
+/// makes the turn unresumable rather than unreportable: the operator still
+/// needs to know the session is blocked, and abandoning it is still open to
+/// them.
+async fn interrupted_meta(
+    store: &session::SessionStore,
+    meta: &session::SessionMeta,
+) -> Option<acp::InterruptedTurnMeta> {
+    let open = meta.interrupted()?;
+    let record = match session::checkpoint_id_for(&open.turn_id) {
+        Ok(id) => store.checkpoint(&id).await.ok().flatten(),
+        Err(_) => None,
+    };
+
+    Some(acp::InterruptedTurnMeta {
+        turn_id: open.turn_id.to_string(),
+        started_at: open.started_at.clone(),
+        prompt: open.content.clone(),
+        rounds_completed: record.as_ref().map(|record| record.rounds_completed),
+        resumable: record.as_ref().is_some_and(|record| {
+            matches!(
+                record.status,
+                CheckpointStatus::InProgress | CheckpointStatus::Failed
+            )
+        }),
+    })
+}
+
+/// Stored sessions this client is not already holding live, for `session/list`.
+///
+/// Filtered by the requested `cwd` when the client named one, because a client
+/// asking what it can reopen is asking about the project in front of it rather
+/// than about every project this daemon has ever served.
+async fn stored_sessions(
+    context: &Dispatch,
+    cwd: Option<&Path>,
+    live: &[ThreadId],
+) -> Vec<acp::SessionInfo> {
+    let Some(store) = &context.setup.defaults.store else {
+        return Vec::new();
+    };
+
+    let sessions = match store.list().await {
+        Ok(sessions) => sessions,
+        // A store that will not answer costs the client the resumable
+        // sessions, not the live ones it can already see.
+        Err(error) => {
+            tracing::warn!(%error, "could not list stored sessions");
+            return Vec::new();
+        }
+    };
+
+    sessions
+        .into_iter()
+        .filter(|stored| cwd.is_none_or(|cwd| stored.meta.project_root == cwd))
+        .filter_map(|stored| {
+            // A name that is not one of Garrison's identities belongs to some
+            // other writer of this database and is not this daemon's to offer.
+            let thread_id = ThreadId::parse(&stored.name).ok()?;
+            (!live.contains(&thread_id)).then(|| {
+                acp::SessionInfo::new(
+                    acp::session_id(&thread_id),
+                    stored.meta.project_root.clone(),
+                )
+                .updated_at(Some(stored.last_active.clone()))
+            })
+        })
+        .collect()
+}
+
+/// `_garrison/session/resume`: pick an interrupted turn back up.
+///
+/// Answers like `session/prompt` does — deferred, resolved when the turn ends
+/// — because that is what it is: the same turn, under the same identity,
+/// carrying on from the round its checkpoint stopped at. A session with
+/// nothing to resume is `-32021`, never a silently restarted turn.
+async fn session_resume(context: &Dispatch, raw: Option<Value>) -> Result<Answer, ErrorObject> {
+    let request: acp::InterruptedTurnRequest = params(raw)?;
+    let thread_id = acp::thread_id(&request.session_id)?;
+    let session = context.find(&thread_id).await?;
+
+    let admission = session
+        .ask(ResumeTurn)
+        .await
+        .map_err(|error| internal(&format!("could not resume: {error}")))?;
+
+    match admission {
+        ResumeAdmission::Resumed { .. } => Ok(Answer::Deferred),
+        ResumeAdmission::Nothing => Err(ErrorObject::new(
+            error_code::NO_INTERRUPTED_TURN,
+            "this session has no interrupted turn to resume",
+        )),
+        ResumeAdmission::Busy { turn_id } => {
+            Err(busy_error().data(serde_json::json!({ "turnId": turn_id.to_string() })))
+        }
+    }
+}
+
+/// `_garrison/session/abandon`: give up on an interrupted turn.
+///
+/// The escape hatch that keeps fail-closed from meaning stuck: a session whose
+/// interrupted turn cannot or should not be resumed is promptable again the
+/// moment an operator says so, and the record says the turn was abandoned
+/// rather than forgotten.
+async fn session_abandon(context: &Dispatch, raw: Option<Value>) -> Result<Value, ErrorObject> {
+    let request: acp::InterruptedTurnRequest = params(raw)?;
+    let thread_id = acp::thread_id(&request.session_id)?;
+    let session = context.find(&thread_id).await?;
+
+    let abandoned = session
+        .ask(AbandonTurn)
+        .await
+        .map_err(|error| internal(&format!("could not abandon: {error}")))?;
+
+    let Some(turn_id) = abandoned.turn_id else {
+        return Err(ErrorObject::new(
+            error_code::NO_INTERRUPTED_TURN,
+            "this session has no interrupted turn to abandon",
+        ));
+    };
+
+    tracing::info!(%thread_id, %turn_id, "an operator abandoned an interrupted turn");
+
+    encode(&acp::AbandonResponse {
+        turn_id: turn_id.to_string(),
+    })
 }
 
 /// `_garrison/status`: what this agent is, and what it is enforcing.
@@ -1025,6 +1372,7 @@ fn own_status(context: &Dispatch) -> acp::GarrisonStatus {
         threads: None,
         plane: None,
         context: None,
+        session_store: None,
     }
 }
 
@@ -1083,6 +1431,7 @@ fn assemble(
             // which the keeper reports from the same barrier that produced
             // the health beside it.
             StatusPart::Audit(audit) => status.audit = *audit,
+            StatusPart::SessionStore(store) => status.session_store = Some(store),
         }
     }
     status
@@ -1328,6 +1677,7 @@ mod tests {
             sandbox: acp::SandboxStatus::disabled(),
             threads: None,
             plane: None,
+            session_store: None,
             context: None,
         }
     }
