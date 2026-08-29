@@ -8,8 +8,9 @@ Rust agent that speaks the Agent Client Protocol (ACP), routes tool approvals
 to its client, provides structural patching and language-server queries, and
 can use agency-approved model endpoints.
 
-The broader federal control plane described below is the product direction,
-not part of this checkout yet.
+The control plane's entity model has landed as SchemaForge schemas; the
+services that would carry data between it and the agent have not. The rest of
+the federal product described below is direction, not checkout.
 
 ## What is implemented
 
@@ -32,6 +33,11 @@ not part of this checkout yet.
   `edit_file` run in a re-exec'd child with resource limits and, on Linux,
   landlock and seccomp hardening, confined to the session's root.
 - Provider login/logout helpers and a `ping` smoke client.
+- The control plane's administrative entity model: 13 SchemaForge schemas
+  covering tenancy, operators and seats, the install fleet, policy bundles and
+  command rules, approved model endpoints, and audit-chain aggregation —
+  lowering into 129 strict-mode-validated Cedar policies. See
+  [docs/control-plane.md](docs/control-plane.md).
 - acton-ai policy, accounting, audit, planning, context, MCP, and tool-loop
   primitives where enabled by configuration.
 
@@ -39,8 +45,9 @@ not part of this checkout yet.
 
 These components are not present in this repository today:
 
-- SchemaForge control plane, Entra ID integration, Cedar administration, seat
-  management, policy distribution, and audit aggregation.
+- Control-plane *services*: Entra ID integration, policy distribution to
+  installs, and audit ingest. The model those services will speak is in
+  `schemas/`; nothing pushes or pulls against it yet.
 - VS Code and JetBrains extensions.
 - Hooks service and federal-ui administration site.
 - Infrastructure, SIEM integration, and compliance document sets.
@@ -74,10 +81,13 @@ architecture in [docs/garrison-agent-design.md](docs/garrison-agent-design.md).
 |---|---|---|
 | `agent/` | Implemented | `garrison-agent` Rust library, daemon, ACP client, tools, and tests |
 | `docs/` | Implemented | Architecture and design notes |
+| `schemas/` | Implemented | Control-plane entity model in the SchemaForge DSL |
+| `policies/` | Implemented | Role ranks and hand-written Cedar policies |
 | `garrison.toml` | Implemented | Server, approval, thread, and LSP configuration |
 | `acton-ai.toml` | Implemented | Provider, context, sandbox, and acton-ai runtime configuration |
+| `config.toml` | Implemented | Control-plane (SchemaForge on acton-service) configuration |
 | `Taskfile.yml` | Implemented | Tasks that operate on this checkout |
-| `schemas/`, `policies/`, `hooks-service/`, `site/` | Planned | Control-plane services and policy assets |
+| `hooks-service/`, `site/` | Planned | Control-plane hook services and administration site |
 | `extensions/` | Planned | VS Code and JetBrains clients |
 | `infra/`, `docs/compliance/` | Planned | Deployment and compliance material |
 
@@ -111,13 +121,14 @@ optional language servers.
 
 ## Target architecture
 
-The roadmap adds a SchemaForge control plane for identity, centrally managed
-policy, seats, and audit aggregation, plus editor extensions that consume the
-same ACP service. Until those components land, claims about centralized
+The roadmap connects the agent to the control plane whose model now lives in
+`schemas/` — identity, centrally managed policy, seats, and audit aggregation —
+and adds editor extensions that consume the same ACP service. Until those components land, claims about centralized
 governance, SIEM export, or compliance certification describe intended product
 capabilities rather than this repository's runnable state.
 
 ## Status
 
-Pre-alpha. The agent daemon is implemented and tested; the control plane and
+Pre-alpha. The agent daemon is implemented and tested. The control plane
+exists as a validated entity model with no services behind it yet, and the
 editor products remain roadmap work.

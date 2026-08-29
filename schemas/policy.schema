@@ -1,0 +1,197 @@
+// Garrison control plane — centrally managed policy.
+//
+// A PolicyBundle is the distributable unit: a versioned, checksummed set of
+// command rules, tool rules, and approved model endpoints that an install
+// pulls and puts in force. Bundles are drafted, published, and retired; an
+// install never edits one, it only reports the checksum it is running, which
+// is what makes drift detectable rather than deniable.
+
+@version(1)
+@tenant(parent: "Organization")
+@display("name")
+@access(
+    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin"],
+    write:  ["security_officer", "org_admin"],
+    delete: ["org_admin"]
+)
+schema PolicyBundle {
+    name:                  text(max: 255) required indexed
+    version:               integer(min: 1) required @list(column)
+    organization:          -> Organization required
+
+    status:                enum("draft", "published", "retired")
+                           default("draft")
+                           @enum_colors(draft: "gray", published: "green", retired: "neutral")
+                           @list(column)
+
+    description:           richtext
+
+    // Codex's approval modes, kept as the vocabulary because the escalation
+    // flow they describe is the one garrison-agent implements.
+    default_approval_mode: enum("untrusted", "on_failure", "on_request", "never", "granular")
+                           default("on_request")
+    network_egress:        enum("deny", "approved_hosts", "allow") default("deny")
+    allow_unsandboxed_escalation: boolean default(false)
+
+    // BLAKE3 of the serialized bundle as distributed. An install reports the
+    // checksum it loaded; a mismatch is drift.
+    checksum:              text(max: 128) indexed
+                           @require(
+                               "status != 'published' || size(checksum) == 64",
+                               "a published bundle must carry its BLAKE3 checksum"
+                           )
+
+    published_at:          datetime
+    published_by:          text(max: 320)
+    created_at:            datetime @default("now")
+
+    command_rules:         -> CommandRule[]
+    tool_rules:            -> ToolRule[]
+
+    // Stored list of refs, not a derived view: an endpoint is approved once at
+    // the organization level and cited by any number of bundles.
+    allowed_endpoints:     -> ModelEndpoint[]
+
+    assignments:           -> PolicyAssignment[]
+}
+
+// A command-prefix rule, the execpolicy shape: match the canonicalized argv,
+// not the shell string, so `bash -lc "git status"` cannot launder a decision.
+// `match_examples` and `not_match_examples` are unit tests the agent runs when
+// it loads the bundle — a rule that does not match its own examples refuses to
+// load.
+@version(1)
+@tenant(parent: "Organization")
+@display("name")
+@access(
+    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin"],
+    write:  ["security_officer", "org_admin"],
+    delete: ["security_officer", "org_admin"]
+)
+schema CommandRule {
+    name:               text(max: 255) required indexed
+    bundle:             -> PolicyBundle required
+    organization:       -> Organization required
+
+    // Canonicalized argv[0], e.g. "git".
+    program:            text(max: 128) required indexed @list(column)
+    // Remaining argv pattern, e.g. ["status", "log"].
+    argv_pattern:       text[]
+
+    decision:           enum("allow", "prompt", "forbid")
+                        required
+                        @enum_colors(allow: "green", prompt: "amber", forbid: "red")
+                        @list(column)
+
+    // Surfaces verbatim in the audit entry and in the approval dialog. A rule
+    // without a stated reason is a rule nobody can review.
+    justification:      text(max: 1024) required
+
+    match_examples:     text[]
+    not_match_examples: text[]
+
+    priority:           integer(min: 0) default(100)
+    enabled:            boolean default(true)
+    created_at:         datetime @default("now")
+}
+
+// Per-tool disposition for the agent's own tool surface: apply_patch,
+// write_file, edit_file, bash, the lsp_* queries, and anything MCP adds.
+@version(1)
+@tenant(parent: "Organization")
+@display("tool_name")
+@access(
+    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin"],
+    write:  ["security_officer", "org_admin"],
+    delete: ["security_officer", "org_admin"]
+)
+schema ToolRule {
+    tool_name:        text(max: 128) required indexed @list(primary)
+    bundle:           -> PolicyBundle required
+    organization:     -> Organization required
+
+    decision:         enum("auto_approve", "prompt", "deny")
+                      required
+                      @enum_colors(auto_approve: "green", prompt: "amber", deny: "red")
+                      @list(column)
+
+    justification:    text(max: 1024) required
+    sandbox_required: boolean default(true)
+    enabled:          boolean default(true)
+    created_at:       datetime @default("now")
+}
+
+// An agency-approved model endpoint. Authorization state is recorded here
+// rather than implied by the endpoint's presence, so "which models are we
+// allowed to send code to, and on whose signature" has one answer.
+@version(1)
+@tenant(parent: "Organization")
+@display("name")
+@access(
+    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin"],
+    write:  ["security_officer", "org_admin"],
+    delete: ["org_admin"]
+)
+schema ModelEndpoint {
+    name:                text(max: 255) required unique indexed
+    organization:        -> Organization required
+
+    provider_type:       enum("anthropic", "openai", "kimi", "ollama", "openai_compatible") required
+    model:               text(max: 128) required @list(column)
+    base_url:            text(max: 512) @widget("url")
+
+    hosting:             enum("on_prem", "agency_hosted", "govcloud", "commercial_cloud")
+                         required
+                         @enum_colors(
+                             on_prem: "green",
+                             agency_hosted: "teal",
+                             govcloud: "blue",
+                             commercial_cloud: "amber"
+                         )
+
+    authorization:       enum("pilot", "interim_ato", "ato", "denied")
+                         default("pilot")
+                         @enum_colors(pilot: "gray", interim_ato: "amber", ato: "green", denied: "red")
+                         @list(column)
+
+    max_context_tokens:  integer(min: 0)
+    data_retention_days: integer(min: 0) default(0)
+
+    approved_at:         datetime
+    approved_by:         text(max: 320)
+                         @require(
+                             "authorization != 'ato' || size(approved_by) > 0",
+                             "an ATO endpoint must record who authorized it"
+                         )
+
+    status:              enum("approved", "suspended", "retired")
+                         default("approved")
+                         @enum_colors(approved: "green", suspended: "amber", retired: "gray")
+}
+
+// Binds a bundle to a scope. Organization-wide, one team, or one operator;
+// the agent resolves the narrowest active assignment that covers it.
+@version(1)
+@tenant(parent: "Organization")
+@access(
+    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin"],
+    write:  ["security_officer", "org_admin"],
+    delete: ["security_officer", "org_admin"]
+)
+schema PolicyAssignment {
+    bundle:       -> PolicyBundle required
+    organization: -> Organization required
+
+    scope:        enum("organization", "team", "operator")
+                  required
+                  @enum_colors(organization: "violet", team: "blue", operator: "teal")
+                  @list(column)
+
+    team:         -> Team
+    operator:     -> Operator
+
+    effective_at: datetime @default("now")
+    expires_at:   datetime
+    active:       boolean default(true)
+    created_at:   datetime @default("now")
+}

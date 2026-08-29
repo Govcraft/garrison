@@ -1,0 +1,63 @@
+// Garrison control plane — tenancy root.
+//
+// One Organization is one boundary: an agency, a bureau, or a program office
+// that runs its own Garrison deployment. Everything else in this directory is
+// scoped to it, so a control plane serving two agencies can never leak one's
+// policy, seats, or audit trail into the other's console.
+
+@version(1)
+@tenant(root)
+@display("name")
+@access(
+    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin"],
+    write:  ["org_admin"],
+    delete: ["org_admin"]
+)
+schema Organization {
+    name:            text(max: 255) required indexed
+    slug:            text(max: 100) required unique indexed @list(column)
+
+    // Entra ID directory (tenant) GUID. Operators are matched to this
+    // organization by the `tid` claim their agent presents.
+    entra_tenant_id: text(max: 64) indexed
+
+    impact_level:    enum("commercial", "fedramp_moderate", "fedramp_high", "il2", "il4", "il5")
+                     default("commercial")
+                     @enum_colors(
+                         commercial: "gray",
+                         fedramp_moderate: "blue",
+                         fedramp_high: "violet",
+                         il2: "teal",
+                         il4: "amber",
+                         il5: "red"
+                     )
+
+    seats_licensed:  integer(min: 0) default(0)
+    active:          boolean default(true)
+
+    owner_id:        text required @owner
+    created_at:      datetime @default("now")
+
+    teams:           -> Team[]
+}
+
+// A unit inside the boundary: a program, a squad, a contract. Teams exist so
+// policy can be assigned to a group rather than to every operator by name.
+@version(1)
+@tenant(parent: "Organization")
+@display("name")
+@access(
+    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin"],
+    write:  ["org_admin", "team_lead"],
+    delete: ["org_admin"]
+)
+schema Team {
+    name:         text(max: 255) required indexed
+    slug:         text(max: 100) required unique indexed
+    organization: -> Organization required
+    cost_center:  text(max: 64)
+    active:       boolean default(true)
+    created_at:   datetime @default("now")
+
+    operators:    -> Operator[]
+}

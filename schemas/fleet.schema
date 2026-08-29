@@ -1,0 +1,107 @@
+// Garrison control plane — the fleet.
+//
+// An AgentInstall is one garrison-agent daemon on one machine. It enrolls
+// once, heartbeats, and reports what it is actually running: version, platform,
+// and whether the process sandbox came up hardened or degraded. That last field
+// is the difference between "we require landlock and seccomp" as a policy
+// statement and as an observation.
+
+@version(1)
+@tenant(parent: "Organization")
+@display("hostname")
+@access(
+    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin"],
+    write:  ["operator", "org_admin"],
+    delete: ["org_admin"]
+)
+schema AgentInstall {
+    // Agent-generated, stable across restarts. The enrollment key.
+    install_id:        text(max: 64) required unique indexed
+    hostname:          text(max: 255) required indexed @list(primary)
+
+    operator:          -> Operator required
+    organization:      -> Organization required
+
+    platform:          enum("linux", "macos", "windows") required
+    agent_version:     text(max: 32) required @list(column)
+    acton_ai_version:  text(max: 32)
+
+    // Reported by `_garrison/status`, not asserted by the console: what the
+    // kernel actually granted this install.
+    sandbox_hardening: enum("enforce", "best_effort", "unavailable")
+                       required
+                       @enum_colors(enforce: "green", best_effort: "amber", unavailable: "red")
+                       @list(column)
+    isolation_active:  boolean default(false)
+
+    status:            enum("enrolled", "active", "quarantined", "retired")
+                       default("enrolled")
+                       @enum_colors(
+                           enrolled: "blue",
+                           active: "green",
+                           quarantined: "red",
+                           retired: "gray"
+                       )
+                       @list(column)
+
+    // The bundle this install last pulled and put in force.
+    policy_bundle:     -> PolicyBundle
+    bundle_checksum:   text(max: 128)
+
+    enrolled_at:       datetime @default("now")
+    last_heartbeat:    datetime
+
+    sessions:          -> AgentSession[]
+}
+
+// One coding conversation: an ACP session from create to close. This is the
+// unit seat utilization and cost accounting roll up to, and the parent every
+// audit entry hangs from.
+@version(1)
+@tenant(parent: "Organization")
+@display("session_id")
+@access(
+    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin"],
+    write:  ["operator", "org_admin"],
+    delete: ["org_admin"]
+)
+schema AgentSession {
+    session_id:          text(max: 64) required unique indexed
+    operator:            -> Operator required
+    install:             -> AgentInstall required
+    organization:        -> Organization required
+
+    // The session filesystem boundary the agent resolved and enforced.
+    project_root:        text(max: 1024)
+    repository:          text(max: 512) indexed
+    branch:              text(max: 255)
+
+    client:              enum("stdio", "socket", "cli", "vscode", "jetbrains") default("cli")
+    provider:            text(max: 64) indexed
+    model:               text(max: 128)
+
+    status:              enum("open", "closed", "cancelled", "failed")
+                         default("open")
+                         @enum_colors(
+                             open: "blue",
+                             closed: "green",
+                             cancelled: "gray",
+                             failed: "red"
+                         )
+                         @list(column)
+
+    started_at:          datetime @default("now")
+    ended_at:            datetime
+
+    turns:               integer(min: 0) default(0)
+    input_tokens:        integer(min: 0) default(0)
+    output_tokens:       integer(min: 0) default(0)
+    total_tokens:        integer(min: 0) default(0) @compute("input_tokens + output_tokens")
+    cost_usd:            float(precision: 4) default(0.0) @format("currency")
+
+    approvals_requested: integer(min: 0) default(0)
+    approvals_denied:    integer(min: 0) default(0)
+    escalations:         integer(min: 0) default(0)
+
+    events:              -> AuditEvent[]
+}

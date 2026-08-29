@@ -1,0 +1,130 @@
+// Garrison control plane — audit aggregation.
+//
+// The agent already keeps a BLAKE3 hash-chained JSONL trail locally. This is
+// where those entries land centrally, chain links intact: `entry_hash` is
+// unique, `prev_hash` names its predecessor, and `chain_seq` orders them, so
+// the control plane can re-verify a session's chain instead of trusting the
+// install that shipped it. A gap or a broken link is visible as data.
+//
+// Access is deliberately lopsided. Operators (the agents) may append and may
+// not read; auditors may read and may not append. Nobody may delete: an
+// append-only trail with a delete verb is a trail with an eraser in the drawer.
+//
+// Bulk export for SIEM handoff is deliberately absent here: `@export` /
+// `@exportable` landed in schemaforge 0.37, and the binary on this machine is
+// 0.35.0. Add them to this schema when the toolchain moves up — the field set
+// below is already the one worth exporting.
+
+@version(1)
+@tenant(parent: "Organization")
+@display("tool_name")
+@access(
+    read:   ["team_lead", "auditor", "security_officer", "org_admin"],
+    write:  ["operator"],
+    delete: []
+)
+schema AuditEvent {
+    organization:  -> Organization required
+    session:       -> AgentSession required
+    operator:      -> Operator required
+    install:       -> AgentInstall required
+
+    // Chain position as the agent recorded it. Unique per tenant, so a
+    // replayed entry collides instead of duplicating.
+    chain_seq:     integer(min: 0) required indexed
+    entry_hash:    text(max: 128) required unique indexed
+    prev_hash:     text(max: 128) required
+
+    occurred_at:   datetime required indexed @format("relative")
+    recorded_at:   datetime @default("now")
+
+    kind:          enum("session_start", "session_end", "tool_call", "approval", "escalation", "policy_load")
+                   required
+                   @enum_colors(
+                       session_start: "blue",
+                       session_end: "gray",
+                       tool_call: "neutral",
+                       approval: "teal",
+                       escalation: "amber",
+                       policy_load: "violet"
+                   )
+                   @list(column)
+                  
+
+    tool_name:     text(max: 128) indexed
+    // Canonicalized argv as the policy gate saw it, not the raw shell string.
+    command:       text(max: 2048)
+
+    decision:      enum("auto_approved", "approved", "denied", "forbidden", "timed_out")
+                   required
+                   @enum_colors(
+                       auto_approved: "green",
+                       approved: "teal",
+                       denied: "red",
+                       forbidden: "red",
+                       timed_out: "amber"
+                   )
+                   @list(column)
+                  
+
+    // Which gate produced the verdict, and the identity behind it when a human
+    // was in the loop.
+    decider:       enum("policy", "callback", "operator", "default")
+                   required
+                  
+    decided_by:    text(max: 320)
+    justification: text(max: 1024)
+
+    outcome:       enum("success", "error", "aborted")
+                   @enum_colors(success: "green", error: "red", aborted: "gray")
+                  
+
+    sandboxed:     boolean default(true)
+    elapsed:       duration
+
+    // The rule that fired, when one did.
+    command_rule:  -> CommandRule
+    tool_rule:     -> ToolRule
+
+    detail:        json
+}
+
+// Per-session chain state, maintained by the control plane as entries arrive.
+// Verification is a background job, not a read-path cost: `head_hash` and
+// `entry_count` say where the chain is, `verified_through` says how far it has
+// been re-walked, and `integrity` says what the last walk found.
+@version(1)
+@tenant(parent: "Organization")
+@display("session_id")
+@access(
+    read:   ["team_lead", "auditor", "security_officer", "org_admin"],
+    write:  ["operator"],
+    delete: []
+)
+schema AuditChain {
+    session_id:       text(max: 64) required unique indexed
+    session:          -> AgentSession required
+    organization:     -> Organization required
+    install:          -> AgentInstall required
+
+    head_hash:        text(max: 128) required
+    entry_count:      integer(min: 0) default(0)
+    verified_through: integer(min: 0) default(0)
+
+    integrity:        enum("unverified", "intact", "gap", "broken")
+                      default("unverified")
+                      @enum_colors(unverified: "gray", intact: "green", gap: "amber", broken: "red")
+                      @list(column)
+
+    // Set when integrity leaves 'intact'; a broken chain that says nothing is
+    // worse than no chain at all.
+    finding:          text(max: 1024)
+                      @require(
+                          "integrity == 'unverified' || integrity == 'intact' || size(finding) > 0",
+                          "a gap or a broken chain must record what was found"
+                      )
+
+    first_seen_at:    datetime @default("now")
+    last_entry_at:    datetime
+    last_verified_at: datetime
+}

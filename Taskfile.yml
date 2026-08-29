@@ -1,8 +1,11 @@
 version: '3'
 
 # Tasks in this file intentionally operate only on components present in this
-# checkout. Control-plane, hooks, site, and extension tasks should be added when
-# their directories land rather than pointing at planned paths.
+# checkout. Hooks, site, and extension tasks should be added when their
+# directories land rather than pointing at planned paths.
+#
+# The plane:* tasks drive the SchemaForge control plane in schemas/ and
+# policies/. They need the `schemaforge` CLI on PATH.
 
 tasks:
   default:
@@ -44,3 +47,49 @@ tasks:
     desc: Check Rust formatting without changing files
     cmds:
       - cargo fmt --all -- --check
+
+  # --- Control plane -------------------------------------------------------
+
+  plane:parse:
+    desc: Parse and validate the control-plane .schema files
+    cmds:
+      - schemaforge parse schemas
+
+  plane:policies:
+    desc: Strict-mode validate the Cedar bundle (generated + custom) and role ranks
+    cmds:
+      - schemaforge policies validate schemas --custom-dir policies/custom --role-ranks policies/role_ranks.toml
+
+  plane:check:
+    desc: Run every control-plane gate that needs no database
+    cmds:
+      - task: plane:parse
+      - task: plane:policies
+
+  plane:key:
+    desc: Mint the control plane's PASETO v4 symmetric key into keys/ (gitignored)
+    cmds:
+      - schemaforge token init-key --output ./keys/paseto.key
+
+  plane:plan:
+    desc: Show the migration plan for the control plane without executing it
+    cmds:
+      - schemaforge apply schemas --dry-run
+
+  plane:apply:
+    desc: Apply the control-plane schemas and generate their Cedar policies
+    # --force because every `unique` field lands as an AddUnique step, which the
+    # migration planner classifies requires_confirmation: the DDL fails against
+    # existing duplicate rows. On an empty database there is nothing to clean.
+    cmds:
+      - schemaforge apply schemas --with-policies --force
+
+  plane:serve:
+    desc: Serve the control-plane REST API and admin surface
+    cmds:
+      - schemaforge serve --schemas schemas
+
+  plane:openapi:
+    desc: Export the control plane's OpenAPI specification
+    cmds:
+      - schemaforge export openapi schemas -o control-plane.openapi.json

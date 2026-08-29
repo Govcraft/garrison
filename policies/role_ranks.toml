@@ -1,0 +1,21 @@
+# Garrison control plane — role hierarchy.
+#
+# Ranks drive the no-upward-visibility rule for user management and for any
+# Cedar policy that compares `principal.role_rank` against `resource.role_rank`:
+# a principal may manage or see another user only when its own rank is at least
+# the target's. `platform_admin` is reserved at i64::MAX and must not appear
+# here; it is the SchemaForge operator role, not a Garrison role.
+#
+# The ordering below is the boundary's chain of authority, not a convenience:
+#   org_admin        runs the deployment — seats, teams, installs, retirement
+#   security_officer authors and publishes policy bundles and endpoint approvals
+#   auditor          reads the audit trail and chain verification, writes nothing
+#   team_lead        sees their team's operators, installs, and sessions
+#   operator         a developer's agent: pulls policy, appends audit, nothing more
+
+[roles]
+org_admin        = 1000
+security_officer = 800
+auditor          = 600
+team_lead        = 400
+operator         = 100

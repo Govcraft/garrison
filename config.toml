@@ -1,0 +1,70 @@
+# Garrison control plane — SchemaForge service configuration (development).
+#
+# SchemaForge is an application on acton-service, so everything outside the
+# `[schema_forge.*]` extension is acton-service's canonical config surface.
+# Discovery order, highest first: `--config <PATH>`, then `./config.toml`
+# (this file), `~/.config/acton-service/schemaforge/config.toml`,
+# `/etc/acton-service/schemaforge/config.toml`, with `ACTON_*` env vars
+# layering over whichever file was loaded.
+#
+# This file configures the control plane only. The agent daemon reads
+# `garrison.toml` and `acton-ai.toml`; the two do not share a config.
+
+# PostgreSQL backend. The `schemaforge` CLI ships one backend per build and the
+# binary in use here is the PostgreSQL flavor; a SurrealDB URL would be refused
+# at startup with "backend not enabled in this build". Override the URL per
+# environment with `ACTON_DATABASE_URL` rather than editing this file.
+[database]
+url             = "postgres://garrison:garrison@127.0.0.1:5432/garrison_plane"
+max_connections = 50
+min_connections = 5
+
+# SurrealDB backend, for a SurrealDB-flavored build. Mutually exclusive with
+# [database] above — declaring both is a startup error, on purpose.
+# [surrealdb]
+# url       = "ws://localhost:8000"
+# namespace = "garrison"
+# database  = "dev"
+# Credentials belong in the environment, not here:
+#   ACTON_SURREALDB_USERNAME / ACTON_SURREALDB_PASSWORD
+
+# PASETO v4 local tokens. Mint the key with `task plane:key` — `keys/` is
+# gitignored and the file must be mode 0600.
+[token]
+format   = "paseto"
+version  = "v4"
+purpose  = "local"
+key_path = "./keys/paseto.key"
+issuer   = "garrison-control-plane"
+
+# ---------------------------------------------------------------------------
+# Principal claims — Entra ID identity projected onto Cedar.
+#
+# These map PASETO `custom` claims onto optional attributes of
+# `Forge::Principal` so hand-written policies in policies/custom/ can compare
+# e.g. `principal.entra_object_id` against a resource field. The `source =
+# { user_field = "..." }` form reads the column off the console User row at
+# every login and refresh, which means it requires those columns to exist on
+# the system User schema first. Left commented until the operator extends User
+# — an unresolvable source aborts startup, and that is the correct failure.
+#
+# [schema_forge.authz.principal_claims.entra_object_id]
+# type     = "string"
+# required = true
+# source   = { user_field = "entra_object_id" }
+#
+# [schema_forge.authz.principal_claims.org_slug]
+# type     = "string"
+# required = true
+# source   = { user_field = "org_slug" }
+#
+# Mappings are read at startup only. Changing them needs a daemon restart.
+# ---------------------------------------------------------------------------
+
+# Lifecycle hooks are not wired yet. When audit ingest needs to fan out to a
+# SIEM, or seat activation needs to call Entra, the binding goes here and the
+# service is scaffolded with `schemaforge hooks generate`.
+# [schema_forge.hooks]
+# enabled            = true
+# default_timeout_ms = 5000
+# max_concurrent_async = 100

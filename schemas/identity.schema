@@ -1,0 +1,84 @@
+// Garrison control plane — who may run the agent, and under what entitlement.
+//
+// Operator is the human developer as the control plane knows them: an Entra ID
+// principal, not a console login. SchemaForge's system `User` schema remains
+// the login store for this administrative console; an Operator is the subject
+// a running garrison-agent acts *for*, and the identity every audit entry and
+// every seat charge resolves back to.
+
+@version(1)
+@tenant(parent: "Organization")
+@display("upn")
+@access(
+    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin"],
+    write:  ["org_admin"],
+    delete: ["org_admin"]
+)
+schema Operator {
+    // userPrincipalName from Entra ID. The natural key an agent presents.
+    upn:             text(max: 320) required unique indexed
+    display_name:    text(max: 255) required @list(column)
+    email:           text(max: 320) indexed
+
+    // Entra ID objectId (GUID). Stable across UPN changes, so this is what
+    // long-lived records should join on.
+    entra_object_id: text(max: 64) unique indexed
+
+    organization:    -> Organization required
+    team:            -> Team
+
+    status:          enum("invited", "active", "suspended", "offboarded")
+                     default("invited")
+                     @enum_colors(
+                         invited: "blue",
+                         active: "green",
+                         suspended: "amber",
+                         offboarded: "gray"
+                     )
+                     @list(column)
+
+    onboarded_at:    datetime
+    last_seen_at:    datetime
+    created_at:      datetime @default("now")
+
+    installs:        -> AgentInstall[]
+    sessions:        -> AgentSession[]
+}
+
+// The entitlement. A seat is what makes an enrolled install allowed to prompt
+// a model: no active seat, no turns. Revocation is the offboarding lever, and
+// it is deliberately expensive to do silently — a revoked seat must say why.
+@version(1)
+@tenant(parent: "Organization")
+@access(
+    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin"],
+    write:  ["org_admin"],
+    delete: ["org_admin"]
+)
+schema Seat {
+    operator:          -> Operator required
+    organization:      -> Organization required
+
+    tier:              enum("standard", "elevated") default("standard")
+
+    status:            enum("assigned", "active", "revoked", "expired")
+                       default("assigned")
+                       @enum_colors(
+                           assigned: "blue",
+                           active: "green",
+                           revoked: "red",
+                           expired: "gray"
+                       )
+                       @list(column)
+
+    assigned_at:       datetime @default("now")
+    activated_at:      datetime
+    expires_at:        datetime
+    revoked_at:        datetime
+
+    revocation_reason: text(max: 512)
+                       @require(
+                           "status != 'revoked' || size(revocation_reason) > 0",
+                           "revoking a seat requires a recorded reason"
+                       )
+}
