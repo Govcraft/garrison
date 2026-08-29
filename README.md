@@ -47,6 +47,14 @@ described below is direction, not checkout.
   identity the plane assigns. A machine the plane turns away does not start;
   one already enrolled never calls the plane again. The plane side is a
   `before_validate` gRPC hook in `hooks-service/`.
+- One authenticated path from an enrolled daemon to the plane: it signs a
+  120-second assertion with its install key, trades it at
+  `POST /api/v1/install/token` for a 15-minute bearer scoped to its
+  organization, and every governed subsystem spends that bearer rather than
+  holding a credential of its own. Replay, clock skew, a revoked credential
+  and a retired install are each their own refusal, and a refusal is never
+  reported as an outage. See
+  [docs/control-plane.md](docs/control-plane.md).
 - acton-ai policy, accounting, audit, planning, context, MCP, and tool-loop
   primitives where enabled by configuration.
 
@@ -135,12 +143,13 @@ client of its socket (`$XDG_RUNTIME_DIR/garrison-agent.sock`):
 | `docs/` | Implemented | Architecture and design notes |
 | `schemas/` | Implemented | Control-plane entity model in the SchemaForge DSL |
 | `policies/` | Implemented | Role ranks and hand-written Cedar policies |
-| `garrison.toml` | Implemented | Server, approval, thread, and LSP configuration |
+| `garrison.toml` | Implemented | Server, approval, thread, plane, and LSP configuration |
+| `wire/` | Implemented | `garrison-wire`: the install assertion both the daemon and the hook service compile against, with its test vector |
 | `acton-ai.toml` | Implemented | Provider, context, sandbox, and acton-ai runtime configuration |
 | `config.toml` | Implemented | Control-plane (SchemaForge on acton-service) configuration |
 | `Taskfile.yml` | Implemented | Tasks that operate on this checkout |
 | `packaging/` | Implemented | The per-user systemd unit and packaging notes |
-| `hooks-service/` | Working | The enrollment hook and the Entra ID directory sync: adjudicates a token, provisions the install and its credential, keeps operators in step with the directory |
+| `hooks-service/` | Working | The enrollment hook, the install-token exchange, and the Entra ID directory sync: adjudicates a token, provisions the install and its credential, mints the bearers enrolled daemons spend, keeps operators in step with the directory |
 | `site/` | Planned | Control-plane administration site |
 | `extensions/vscode/` | Implemented | VS Code ACP client, sidebar chat, approvals, and status |
 | `extensions/jetbrains/` | Implemented | JetBrains ACP client, tool-window chat, approvals, and status |

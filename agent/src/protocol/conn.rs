@@ -135,6 +135,11 @@ pub struct ConnSetup {
     /// Every actor that contributes a part to `_garrison/status`, asked in
     /// order. See [`Describe`].
     pub describers: Vec<ActorHandle>,
+    /// The daemon's credential holder, on a governed install.
+    ///
+    /// A subsystem that needs the control plane asks this handle for an
+    /// authenticated client and never builds one; see [`crate::plane`].
+    pub plane: Option<ActorHandle>,
 }
 
 /// Asks a subsystem to describe itself for `_garrison/status`.
@@ -156,6 +161,8 @@ pub struct Describe;
 pub enum StatusPart {
     /// From the session supervisor.
     Threads(acp::ThreadsStatus),
+    /// From the plane session, when this daemon is governed.
+    Plane(acp::PlaneStatus),
 }
 
 impl Request for Describe {
@@ -996,6 +1003,7 @@ fn own_status(context: &Dispatch) -> acp::GarrisonStatus {
         },
         sandbox: context.setup.sandbox.clone(),
         threads: None,
+        plane: None,
     }
 }
 
@@ -1047,6 +1055,7 @@ fn assemble(
     for part in parts {
         match part {
             StatusPart::Threads(threads) => status.threads = Some(threads),
+            StatusPart::Plane(plane) => status.plane = Some(plane),
         }
     }
     status
@@ -1244,6 +1253,7 @@ mod tests {
             },
             sandbox: acp::SandboxStatus::disabled(),
             threads: None,
+            plane: None,
         }
     }
 

@@ -119,8 +119,11 @@ dependencies = [
  "acton-reactive",
  "anyhow",
  "arc-swap",
+ "argon2",
  "async-trait",
  "axum 0.8.9",
+ "base64 0.22.1",
+ "blake3",
  "chrono",
  "dashmap",
  "figment",
@@ -134,6 +137,7 @@ dependencies = [
  "opentelemetry_sdk 0.31.0",
  "prost 0.14.4",
  "prost-build",
+ "rand 0.10.2",
  "regex",
  "reqwest 0.12.28",
  "rustls 0.23.43",
@@ -329,6 +333,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
 dependencies = [
  "rustversion",
+]
+
+[[package]]
+name = "argon2"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c3610892ee6e0cbce8ae2700349fcf8f98adb0dbfbee85aec3c9179d29cc072"
+dependencies = [
+ "base64ct",
+ "blake2",
+ "cpufeatures 0.2.17",
+ "password-hash",
 ]
 
 [[package]]
@@ -2149,9 +2165,11 @@ dependencies = [
  "acton-service-client",
  "agent-client-protocol-schema",
  "base64 0.23.1",
+ "chrono",
  "clap",
  "crossterm",
  "ed25519-dalek 3.0.0",
+ "garrison-wire",
  "getrandom 0.4.3",
  "hostname",
  "lsp-types",
@@ -2182,7 +2200,10 @@ dependencies = [
  "acton-reactive",
  "acton-service",
  "acton-service-client",
+ "base64 0.23.1",
  "chrono",
+ "ed25519-dalek 3.0.0",
+ "garrison-wire",
  "prost 0.14.4",
  "reqwest 0.13.4",
  "serde",
@@ -2196,6 +2217,16 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "tracing",
+]
+
+[[package]]
+name = "garrison-wire"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "ed25519-dalek 3.0.0",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3926,6 +3957,17 @@ dependencies = [
  "regex-syntax",
  "structmeta",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "password-hash"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "346f04948ba92c43e8469c1ee6736c7563d71012b17d40745260fe106aac2166"
+dependencies = [
+ "base64ct",
+ "rand_core 0.6.4",
+ "subtle",
 ]
 
 [[package]]

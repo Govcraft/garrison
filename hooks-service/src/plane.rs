@@ -148,6 +148,37 @@ pub struct SeatRow {
     pub status: String,
 }
 
+/// The standing identity a daemon presents, in the fields the install-token
+/// exchange reads.
+///
+/// `install` and `organization` are relation columns and arrive as the
+/// related row's id, which is exactly what the exchange needs: the identity
+/// it is about to mint a bearer for.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct InstallCredentialRow {
+    pub id: String,
+    pub credential_id: String,
+    pub install: String,
+    pub organization: String,
+    pub credential_kind: String,
+    pub public_key: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub use_count: i64,
+}
+
+/// One daemon in the fleet, in the fields that decide whether it may still
+/// authenticate.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AgentInstallRow {
+    pub id: String,
+    pub install_id: String,
+    pub organization: String,
+    #[serde(default)]
+    pub status: String,
+}
+
 fn yes() -> bool {
     true
 }
@@ -239,6 +270,22 @@ impl Plane {
     /// Every seat held by one operator.
     pub async fn seats_of(&self, operator: &str) -> Result<Vec<SeatRow>, PlaneError> {
         self.list_all("Seat", Some(("operator", operator))).await
+    }
+
+    /// Fetch one install credential by row id.
+    ///
+    /// `None` covers both "no such row" and "this bearer may not see it",
+    /// which for the exchange are the same refusal: an unknown credential.
+    pub async fn install_credential(
+        &self,
+        id: &str,
+    ) -> Result<Option<InstallCredentialRow>, PlaneError> {
+        self.get("InstallCredential", id).await
+    }
+
+    /// Fetch one install by row id.
+    pub async fn agent_install(&self, id: &str) -> Result<Option<AgentInstallRow>, PlaneError> {
+        self.get("AgentInstall", id).await
     }
 
     /// Create an entity and return its new id.

@@ -28,7 +28,26 @@ format = "paseto"
 # Development: the plane's own key, since it mints the credential on
 # inbound hook calls. In a deployment this is a copy of that key at a
 # path only this service can read.
+#
+# The same key mints install bearers on the route below, which is why a
+# daemon's bearer is indistinguishable from one `schemaforge token generate`
+# produced and needs no second trust root.
 key_path = "../keys/paseto.key"
+# The install-token exchange, and nothing else.
+#
+# A daemon presenting a signed assertion has no bearer by definition, so this
+# one route has to be exempt from the framework's token middleware.
+# Authentication is not skipped, it moves: the route verifies an Ed25519
+# signature against the public key the plane recorded at enrollment, checks a
+# 120-second window, and refuses a nonce it has already seen — see
+# src/install_token.rs.
+#
+# This is a PREFIX match. `/api/v1/install/token` also exempts
+# `/api/v1/install/tokens`, `/api/v1/install/token-anything`, and so on, so no
+# other route may start with this string. The service refuses to boot if the
+# exemption is missing, because without it every exchange 401s from middleware
+# the route never sees.
+public_paths = ["/api/v1/install/token"]
 
 # Mutual-TLS caller authorization. Uncomment to require that the caller
 # present a certificate whose subjectAltName is on the allowlist, in addition
@@ -83,6 +102,12 @@ token = ""
 # The separation that does hold is the `enrollee` role, which is granted write
 # on Redemption and nothing else anywhere in the bundle.
 issuer = "garrison-control-plane"
+
+# How long an install bearer lives, in seconds. Fifteen minutes: a daemon
+# re-signs an assertion whenever its bearer is nearly spent, so this costs one
+# round trip a quarter hour and makes a stolen bearer nearly worthless.
+# `ACTON_GARRISON_LIFETIME` overrides it.
+lifetime = 900
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------

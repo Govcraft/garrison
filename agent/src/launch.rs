@@ -13,7 +13,9 @@
 
 use crate::approval::approval_hook;
 use crate::config::GarrisonConfig;
+use crate::enrollment::key::InstallKey;
 use crate::error::GarrisonError;
+use crate::plane::session::{Identity, PlaneSession};
 use crate::protocol::acp::{
     AgentCapabilities, PromptCapabilities, SandboxStatus, SessionCapabilities,
     SessionListCapabilities,
@@ -222,9 +224,10 @@ pub async fn build_setup(
 
     // Before any actor, any listener, and any thread. An install the plane
     // turned away must not reach the point of having somewhere to run a turn.
-    if let Some(plane) = config.plane.as_ref() {
-        crate::enrollment::ensure(plane, &sandbox).await?;
-    }
+    let enrollment = match config.plane.as_ref() {
+        Some(plane) => crate::enrollment::ensure(plane, &sandbox).await?,
+        None => None,
+    };
 
     let mut runtime = ai.runtime().clone();
     let project_root = resolve_project_root(config.threads.project_root.as_deref())?;
@@ -232,11 +235,13 @@ pub async fn build_setup(
     let router = spawn_router(&mut runtime).await;
     let supervisor = spawn_supervisor(&mut runtime).await;
     let lsp = spawn_lsp(&mut runtime, config, &project_root).await;
+    let plane = spawn_plane(&mut runtime, config.plane.as_ref(), enrollment).await?;
 
     // Ordered lists, because order is the contract: gates are asked first to
     // last and the first refusal wins; describers fill the status in sequence.
     let gates: Vec<ActorHandle> = Vec::new();
-    let describers: Vec<ActorHandle> = vec![supervisor.clone()];
+    let mut describers: Vec<ActorHandle> = vec![supervisor.clone()];
+    describers.extend(plane.clone());
 
     Ok(ServerSetup {
         supervisor,
@@ -247,6 +252,7 @@ pub async fn build_setup(
         audited: ai.is_audited(),
         sandbox,
         describers,
+        plane,
     })
 }
 
@@ -258,6 +264,55 @@ async fn spawn_router(runtime: &mut ActorRuntime) -> ActorHandle {
 /// The session supervisor.
 async fn spawn_supervisor(runtime: &mut ActorRuntime) -> ActorHandle {
     ThreadSupervisor::spawn(runtime).await
+}
+
+/// The daemon's credential holder, on a governed install.
+///
+/// `None` on a standalone agent, which has no identity and nothing to
+/// authenticate as. Everything that reaches the plane goes through the handle
+/// this returns; see [`crate::plane`] for why that is a rule and not a habit.
+///
+/// # Why an unreadable key stops the daemon
+///
+/// Enrollment has already succeeded by the time this runs, so the plane holds
+/// the public half of a specific key and every subsystem downstream is about
+/// to assume this process can prove it holds the private half. A daemon that
+/// started anyway would come up looking healthy, refuse every turn the moment
+/// a gate asked the plane, and give an operator a symptom four layers from
+/// the cause. Refusing here says the actual thing, once, at exit 2. The key is
+/// loaded with [`InstallKey::load`] and never `load_or_create`: generating a
+/// replacement would leave a daemon that had quietly stopped being itself.
+///
+/// # Errors
+///
+/// [`GarrisonErrorKind::Enrollment`](crate::error::GarrisonErrorKind::Enrollment)
+/// when an enrolled install's key cannot be read.
+async fn spawn_plane(
+    runtime: &mut ActorRuntime,
+    config: Option<&crate::config::PlaneConfig>,
+    enrollment: Option<crate::enrollment::Record>,
+) -> Result<Option<ActorHandle>, GarrisonError> {
+    let (Some(config), Some(record)) = (config, enrollment) else {
+        return Ok(None);
+    };
+
+    let key = InstallKey::load(&crate::enrollment::key::key_path(
+        &crate::enrollment::config_dir(),
+    ))?;
+
+    let identity = Identity {
+        record,
+        key: Arc::new(key),
+        plane_url: config.url.clone(),
+        hooks_url: config.hooks_url().to_string(),
+    };
+    tracing::info!(
+        plane = %identity.plane_url,
+        exchange = %identity.hooks_url,
+        install = %identity.record.install,
+        "the install will authenticate to the control plane by signed assertion"
+    );
+    Ok(Some(PlaneSession::spawn(runtime, identity).await))
 }
 
 /// The configured language servers.

@@ -212,7 +212,8 @@ fn hardening(sandbox: &SandboxStatus) -> &'static str {
 }
 
 /// The `~/.config/garrison` directory, mirroring where provider keys live.
-fn config_dir() -> PathBuf {
+#[must_use]
+pub fn config_dir() -> PathBuf {
     resolve_config_dir(
         std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
         std::env::var_os("HOME").map(PathBuf::from),

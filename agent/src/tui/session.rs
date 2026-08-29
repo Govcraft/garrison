@@ -739,6 +739,7 @@ mod tests {
                 memory_limit_bytes: None,
             },
             threads: None,
+            plane: None,
         };
 
         let rendered: String = describe_status(&status)

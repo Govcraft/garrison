@@ -75,6 +75,17 @@ auto_approve = ["read_file", "glob", "grep", "list_directory", "calculate", "get
 #
 # url = "https://plane.agency.gov"
 #
+# Where the install-token exchange lives. Defaults to `url`, which is the
+# deployment the shipped control-plane config describes: garrison-hooks sits
+# behind the same name as the plane.
+#
+# Once enrolled the daemon holds an Ed25519 private key and no bearer. Before
+# every plane call it signs a 120-second assertion and posts it to
+# POST /api/v1/install/token here, receiving a 15-minute token scoped to this
+# install's organization. Set this only when that route is reverse-proxied
+# somewhere else, or when a developer runs the hook service on its own port.
+# hooks_url = "https://hooks.agency.gov"
+#
 # Where to look for the enrollment packet. Defaults to enrollment.toml in the
 # Garrison config directory (~/.config/garrison/enrollment.toml).
 # enrollment_packet = "/etc/garrison/enrollment.toml"

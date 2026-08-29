@@ -48,6 +48,17 @@ pub struct GarrisonConfig {
     /// other purpose against the same key is refused on this alone.
     #[serde(default = "default_issuer")]
     pub issuer: String,
+
+    /// How long an install bearer lives, in seconds.
+    ///
+    /// One word, like every other field here, so `ACTON_GARRISON_LIFETIME`
+    /// reaches it. Short on purpose: a daemon re-signs an assertion whenever
+    /// its bearer is nearly spent, which costs one round trip a quarter hour
+    /// and means a leaked bearer is worth almost nothing. Anything longer is
+    /// a standing credential on a workstation, which is the thing the install
+    /// key exists to avoid.
+    #[serde(default = "default_lifetime")]
+    pub lifetime: u64,
 }
 
 impl Default for GarrisonConfig {
@@ -56,12 +67,17 @@ impl Default for GarrisonConfig {
             url: String::new(),
             token: String::new(),
             issuer: default_issuer(),
+            lifetime: default_lifetime(),
         }
     }
 }
 
 fn default_issuer() -> String {
     "garrison-enrollment".to_string()
+}
+
+const fn default_lifetime() -> u64 {
+    900
 }
 
 impl GarrisonConfig {
@@ -94,6 +110,7 @@ mod tests {
             url: "https://plane.gov".into(),
             token: "v4.local.abc".into(),
             issuer: "garrison-enrollment".into(),
+            lifetime: default_lifetime(),
         }
     }
 
@@ -123,6 +140,7 @@ mod tests {
             url: String::new(),
             token: String::new(),
             issuer: String::new(),
+            lifetime: default_lifetime(),
         };
         assert_eq!(config.missing().len(), 3);
     }
@@ -137,6 +155,10 @@ mod tests {
         let parsed: HooksConfig = toml::from_str(toml).expect("section parses");
         assert_eq!(parsed.garrison.url, "https://plane.gov");
         assert_eq!(parsed.garrison.issuer, "garrison-enrollment");
+        assert_eq!(
+            parsed.garrison.lifetime, 900,
+            "an unstated bearer lifetime is fifteen minutes"
+        );
         assert_eq!(parsed.directory.mode, DirectoryMode::Off);
     }
 

@@ -34,7 +34,13 @@ passing and its failing branch. That database was discarded.
 Tooling: `schemaforge` 0.37.2, PostgreSQL flavor.
 
 The agent enrolls itself on first run (`agent/src/enrollment/`), against the
-same endpoint and the same hook.
+same endpoint and the same hook. It then authenticates every later call by
+signing a short-lived assertion with its install key and trading it for a
+15-minute bearer at `POST /api/v1/install/token` on `hooks-service/`; see
+"Authenticating after enrollment" below. That exchange is the single
+authenticated path from a daemon to the plane, and the policy pull, the seat
+check and the audit shipper are all consumers of it rather than of their own
+credentials.
 
 Entra ID is the authority for operators: `hooks-service/` runs a directory
 sync that creates, links, renames, suspends, and offboards `Operator` rows
@@ -409,6 +415,133 @@ An earlier attempt in this same run refused with `401 ... The claim 'iss'
 failed validation` and is the reason the constraint above is written down. The
 failure also exercised the path that matters most: the packet survived, no
 record was written, and the daemon did not start.
+
+### Authenticating after enrollment: the install-token exchange
+
+Enrollment answers "may this machine join". It does not answer the question
+every later call asks: what does an enrolled daemon present when it wants to
+read its policy bundle, check its seat, or ship an audit entry? It has an
+Ed25519 private key and nothing else. It cannot present a console bearer,
+because there is no human at 03:00, and it must not hold a long-lived one,
+because a standing credential in a file on a workstation is a file an attacker
+copies.
+
+So there is exactly one authenticated path from a daemon to the plane:
+
+```
+daemon                         garrison-hooks                 plane
+  |  sign a 120s assertion          |                            |
+  |  with the install key           |                            |
+  |-- POST /api/v1/install/token -->|                            |
+  |                                 |-- GET InstallCredential -->|
+  |                                 |-- GET AgentInstall ------->|
+  |                                 |  verify signature, window, |
+  |                                 |  nonce, both statuses      |
+  |<-- 200 { token, expires_at } ---|  mint a 15-minute PASETO   |
+  |                                                              |
+  |------------- GET/POST/PATCH with that bearer --------------->|
+```
+
+The exchange is the only route `garrison-hooks` serves over HTTP; everything
+else it does is a gRPC hook. It is registered through `VersionedApiBuilder`
+with `.with_base_path("/api")` and exempted from the framework's bearer
+middleware by `[token] public_paths = ["/api/v1/install/token"]`, because a
+daemon arriving there has no bearer by definition. That exemption is a
+**prefix** match, so no other route may begin with that string, and the
+service refuses to boot without it rather than answering every exchange with a
+401 raised by middleware the route never reaches.
+
+What is on the wire is one type, defined once, in the workspace crate
+`wire/` (`garrison-wire`) that both the daemon and the service depend on,
+with a pinned test vector both sides compile against:
+
+```json
+{ "credential_id": "...",
+  "assertion":  "base64url(JSON)",
+  "signature":  "base64url(Ed25519 over the raw assertion bytes)" }
+```
+
+The assertion's JSON keys are `credential_id`, `install_id`, `iat`, `exp`,
+`nonce`, in that order, and the signature covers the octets that arrived
+rather than a re-serialization of the parsed value, so no canonicalization
+step can disagree between the two ends.
+
+The decision is a pure function, `adjudicate_assertion(now, body, credential,
+install)` in `hooks-service/src/install_token.rs`. It takes a clock reading and
+two rows and performs no I/O, so every branch below is a unit test that needs
+neither a database nor a socket:
+
+| Refused because | Status | `error` |
+|---|---|---|
+| no such credential row, or none this service may see | 401 | `unknown_credential` |
+| the signature does not verify against the stored SPKI | 401 | `assertion_rejected` |
+| the assertion names an install its credential does not belong to | 401 | `assertion_rejected` |
+| `exp - iat > 120`, or `now` outside `[iat-30, exp+30]` | 401 | `assertion_window` / `assertion_expired` / `assertion_future` |
+| the nonce is shorter than 22 characters | 401 | `assertion_nonce` |
+| the nonce has been seen before | 401 | `assertion_replayed` |
+| `credential_kind != "ed25519"` | 403 | `unsupported_credential_kind` |
+| `credential.status != "active"` | 403 | `credential_rejected` |
+| `install.status` is `quarantined` or `retired` | 403 | `install_not_active` |
+
+The 401/403 split is the daemon's whole branch. A 401 is worth one retry with
+a fresh assertion; a 403 is a decision somebody made, and a daemon that
+retried it would turn a deliberate quarantine into a denial of service against
+its own control plane. A refusal is never reported as "the plane is
+unreachable", and an unreachable plane is never reported as a refusal.
+
+Replay is the one check that is not in the pure function, because "have I seen
+this before" is by construction a fact about state. It lives in a supervised
+`NonceLedger` actor, so no lock is held in a request path, and entries are
+dropped as they expire on the way through, so the ledger never holds more than
+one assertion window's worth of traffic and needs no timer. A restart empties
+it, which is bounded rather than a hole: an assertion outside its 120-second
+window is refused whether or not its nonce is remembered.
+
+The bearer is minted with the plane's own `[token]` key through
+`PasetoGenerator` + `ClaimsBuilder`, so it is indistinguishable from one
+`schemaforge token generate` produced and needs no second trust root:
+`sub = "install:{install_id}"`, `roles = ["operator"]`, a `tenant_chain` of
+the install's organization, and custom `install` and `credential_id` claims.
+Lifetime is `[garrison] lifetime`, 900 seconds. The tenant chain is not
+optional decoration: a bearer without it sees no tenant-scoped row at all.
+The exchange then best-effort PATCHes `InstallCredential` with `last_used_at`,
+`last_used_from` (the forwarded client address, when a proxy supplied one) and
+`use_count + 1`; a failure there costs an audit detail rather than the
+daemon's turn.
+
+On the daemon's side the whole thing lives in `agent/src/plane/`, and the
+invariant is worth stating plainly: **nothing outside that module builds an
+authenticated client**. Every subsystem asks the `PlaneSession` actor for an
+`Authenticate` and receives an `Api` that is already authenticated and already
+scoped. The actor hands back the bearer it holds while more than 60 seconds
+remain on it, and otherwise performs exactly one exchange with every other
+asker parked on the result. Serialization is a property of the mailbox, not
+of a lock somebody remembered to take. `_garrison/status` gains a `plane`
+block reporting reachability, the last exchange, the current expiry, and the
+last error, because when turns are being refused this is the first field an
+operator should read: every governed subsystem spends the same bearer.
+
+A daemon that has enrolled and then cannot read its install key does not
+start (exit 2). The key is loaded, never created: generating a replacement
+would leave a process that had quietly stopped being itself.
+
+Verified end to end against the live development plane, with throwaway rows
+and our own `garrison-hooks` on a free port:
+
+```
+POST /api/v1/install/token   valid assertion         200
+  GET AgentInstall with the minted bearer            200  (hostname read back)
+POST /api/v1/install/token   replayed nonce          401  assertion_replayed
+POST /api/v1/install/token   forged signature        401  assertion_rejected
+POST /api/v1/install/token   retired install         403  install_not_active
+POST /api/v1/install/token   revoked credential      403  credential_rejected
+POST /api/v1/install/token   unknown credential      401  unknown_credential
+```
+
+The same sequence runs in CI against a containerized plane
+(`hooks-service/tests/install_token.rs`): one PostgreSQL 16, one
+`schemaforge apply` and `serve`, one `garrison-hooks`, a keypair generated in
+the test whose SPKI goes onto a real `InstallCredential` row.
 
 ### Fleet — `schemas/fleet.schema`
 

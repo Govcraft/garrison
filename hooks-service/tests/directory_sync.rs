@@ -278,6 +278,10 @@ use_separate_port = false
 [token]
 format = "paseto"
 key_path = "{key}"
+# The install-token exchange, which a daemon reaches with no bearer. The
+# service refuses to boot without this line, so it belongs in every config
+# that starts one — including this fixture.
+public_paths = ["/api/v1/install/token"]
 
 [garrison]
 url    = "{plane}"
