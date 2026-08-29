@@ -5,13 +5,21 @@
 // the login store for this administrative console; an Operator is the subject
 // a running garrison-agent acts *for*, and the identity every audit entry and
 // every seat charge resolves back to.
+//
+// `directory_service` is the reconciler that projects the organization's
+// Entra ID group onto these rows. It owns `upn`, `display_name`, `email`, and
+// `status` from the directory's point of view: a rename patches the row in
+// place, a disabled account suspends it, a removed member offboards it. The
+// join key is `entra_object_id`; a hand-typed operator without one is linked
+// exactly once by case-insensitive UPN match, and after that the UPN is never
+// used as a join again.
 
 @version(1)
 @tenant(parent: "Organization")
 @display("upn")
 @access(
-    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin", "enrollment_service"],
-    write:  ["org_admin"],
+    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin", "enrollment_service", "directory_service"],
+    write:  ["org_admin", "directory_service"],
     delete: ["org_admin"]
 )
 schema Operator {
@@ -23,6 +31,10 @@ schema Operator {
     // Entra ID objectId (GUID). Stable across UPN changes, so this is what
     // long-lived records should join on.
     entra_object_id: text(max: 64) unique indexed
+
+    // When the directory last confirmed this row. Per-row proof that the
+    // reconciler saw this person, distinct from the organization-wide stamp.
+    directory_synced_at: datetime @format("relative")
 
     organization:    -> Organization required
     team:            -> Team
@@ -48,18 +60,24 @@ schema Operator {
 // The entitlement. A seat is what makes an enrolled install allowed to prompt
 // a model: no active seat, no turns. Revocation is the offboarding lever, and
 // it is deliberately expensive to do silently — a revoked seat must say why.
+//
+// The directory reconciler reads and writes here: it must find the seats an
+// operator holds before it can take them away, and the `@field_access` fences
+// bound what that means: it can move `status` to revoked and record when and
+// why, and nothing else. Who a seat belongs to, what tier it is, and when it
+// expires stay with org_admin. The sync can only take a seat away.
 @version(1)
 @tenant(parent: "Organization")
 @access(
-    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin"],
-    write:  ["org_admin"],
+    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin", "directory_service"],
+    write:  ["org_admin", "directory_service"],
     delete: ["org_admin"]
 )
 schema Seat {
-    operator:          -> Operator required
-    organization:      -> Organization required
+    operator:          -> Operator required @field_access(write: ["org_admin"])
+    organization:      -> Organization required @field_access(write: ["org_admin"])
 
-    tier:              enum("standard", "elevated") default("standard")
+    tier:              enum("standard", "elevated") default("standard") @field_access(write: ["org_admin"])
 
     status:            enum("assigned", "active", "revoked", "expired")
                        default("assigned")
@@ -77,8 +95,8 @@ schema Seat {
                        @list(column)
 
     assigned_at:       datetime @default("now")
-    activated_at:      datetime
-    expires_at:        datetime
+    activated_at:      datetime @field_access(write: ["org_admin"])
+    expires_at:        datetime @field_access(write: ["org_admin"])
     revoked_at:        datetime
 
     revocation_reason: text(max: 512)

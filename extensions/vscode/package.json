@@ -52,17 +52,17 @@
         "garrison.agentPath": {
           "type": "string",
           "default": "garrison-agent",
-          "description": "Path to the garrison-agent executable."
+          "description": "Path to the garrison-agent executable. The extension spawns `garrison-agent acp`, a relay that connects to the per-user daemon's socket and starts the daemon if none is running and [server].autostart allows. The daemon's configuration is the one in force."
+        },
+        "garrison.socket": {
+          "type": "string",
+          "default": "",
+          "description": "Optional path of the daemon's Unix socket, passed to the relay as --socket. Empty uses the daemon's configured socket ($XDG_RUNTIME_DIR/garrison-agent.sock)."
         },
         "garrison.configPath": {
           "type": "string",
           "default": "",
-          "description": "Optional path to garrison.toml."
-        },
-        "garrison.actonConfigPath": {
-          "type": "string",
-          "default": "",
-          "description": "Optional path to acton-ai.toml."
+          "description": "Optional path to a garrison.toml the relay reads for its [server] section (socket path, autostart). It is never passed to an autostarted daemon, which reads only the XDG configuration files."
         }
       }
     }

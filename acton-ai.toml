@@ -67,6 +67,27 @@ tokens_per_minute = 1000000
 # keeps only a recent tail and would.
 strategy = "keep-system-and-recent"
 
+# Auto-compaction. With auto_compact = true a history that reaches
+# compact_threshold of the window's available budget has its oldest exchanges
+# summarized by the turn's own provider and replaced with that summary,
+# instead of being truncated away unread. The summary is a paid request to the
+# same provider and faces the same budget and rate limits as the turn's own
+# rounds, so a long session costs a little more; what it buys is a model that
+# still knows what happened at the start of the conversation.
+#
+# Compaction is off unless auto_compact is true, and the other two keys are
+# inert without it. An out-of-range value (a threshold outside 0 < x <= 1, or
+# keep_recent_turns = 0) refuses the launch rather than being rounded.
+#
+# Garrison never sets this in code: this file is the only place it is decided.
+# What the daemon resolved is readable at `_garrison/status` under `context`,
+# and each pass is announced to the owning session as
+# `_garrison/session/compacted` and summarized in the prompt response's
+# `_meta.garrison.compactions`.
+auto_compact = true
+compact_threshold = 0.8
+keep_recent_turns = 3
+
 [defaults]
 max_tool_rounds = 25
 
@@ -97,7 +118,70 @@ read_write = ["~/.cache/uv"]
 # verdict (approved, and by whom) alongside the outcome, so refusals are on
 # the record exactly as successes are. `acton-ai audit verify` walks the chain.
 #
-# Kept inside the checkout during development so the trail travels with the
-# work; a deployment points this at a durable path outside the project tree.
+# One daemon per user owns this file, and it holds an exclusive lock on it
+# while it runs: a second daemon over the same trail refuses to start (exit
+# 2) instead of forking the chain. So the trail must be per user and must not
+# depend on where the daemon was started. With `path` omitted acton-ai uses
+# $XDG_DATA_HOME/acton-ai/audit.jsonl (~/.local/share/acton-ai/audit.jsonl),
+# which is exactly that. A relative path would resolve against the daemon's
+# working directory, which is $HOME under systemd and relay autostart, and
+# acton-ai does not expand `~` or `$XDG_DATA_HOME` in this key, so a
+# deployment that wants the garrison directory writes the absolute path:
+# path = "/home/<user>/.local/share/garrison/audit.jsonl"
+#
+# Keep the trail on a local filesystem: the lock is an advisory flock and is
+# not reliable on NFS.
 [audit]
-path = ".garrison/audit.jsonl"
+# What an append must have done before the loop moves on to the next tool
+# call. `best_effort` (acton-ai's default, for other embedders) appends and
+# flushes; a failed append is logged and the turn continues. `strict`, which
+# is what Garrison ships, fsyncs and waits for the acknowledgement, and once
+# an append has failed it refuses every tool not declared idempotent for the
+# rest of the process. Garrison then refuses the next turn outright, with
+# JSON-RPC code -32017, rather than running it unrecorded.
+#
+# The refusal is not self-healing by design. The record is incomplete until an
+# operator repairs the trail and restarts the daemon over it; the gap is the
+# evidence of what was lost. See "Audit durability, degraded state, and
+# anchoring" in docs/control-plane.md for the recovery steps, and
+# `garrison-agent audit verify` for the finding.
+durability = "strict"
+
+# Session persistence. The section's presence is what arms it: every session
+# the daemon opens is written to this database, and every turn checkpoints
+# after each provider round, so a restart finds the conversation and whatever
+# turn was in flight rather than losing both.
+#
+# This is the section `[sessions] required` in garrison.toml is about. An
+# install with a `[plane]` section and no `[checkpoint]` here refuses to
+# start (exit 2): an agency that governs its agents expects its operators'
+# work to still be there after an upgrade.
+#
+# Left commented because there is no correct value to ship. WRITE AN ABSOLUTE
+# PER-USER PATH: `db_path` is resolved against the daemon's working directory
+# and is not tilde-expanded, and that directory is $HOME under systemd and
+# under relay autostart. Unlike `[audit] path` above, omitting the key does
+# not fall back to an XDG location — acton-ai uses `acton-ai-checkpoints.db`
+# beside wherever the daemon happened to start, so an operator would get a
+# different set of sessions per directory. Uncommenting all four lines below
+# with a real path is what arms persistence on this install.
+# [checkpoint]
+# db_path = "/home/<user>/.local/share/garrison/sessions.db"
+
+# What a restart does about the turns it finds interrupted. Garrison ships
+# and requires `resume_on_request`: the daemon reports an interrupted turn to
+# the client and waits to be told, through `_garrison/session/resume` or
+# `_garrison/session/abandon`, which is which. Until that answer arrives the
+# session refuses new prompts with JSON-RPC code -32019, rather than silently
+# restarting work that has already run tools and already been paid for.
+#
+# `resume_auto` is refused at startup (exit 2). A turn resumed in the
+# background would settle its pending tool calls with no client connected to
+# approve them, which is the one thing a governed agent may never do.
+# `abandon` is acton-ai's default and throws the work away unasked.
+# policy = "resume_on_request"
+
+# How many failed attempts one turn is granted before an unattended sweep
+# gives up on it and records it abandoned. A resume an operator asked for by
+# name is never subject to this ceiling.
+# max_resume_attempts = 3

@@ -12,6 +12,10 @@ pub enum Command {
     New,
     /// Show the agent's governance settings.
     Status,
+    /// Pick up a turn a restart cut short, where its checkpoint left it.
+    Resume,
+    /// Give up on that turn, making the session promptable again.
+    Abandon,
     /// Clear the screen, keeping the session.
     Clear,
     /// Leave.
@@ -22,9 +26,11 @@ pub enum Command {
 ///
 /// Deliberately not alphabetical: this is presentation order, and the useful
 /// ones belong at the top.
-pub const ALL: [Command; 5] = [
+pub const ALL: [Command; 7] = [
     Command::Help,
     Command::New,
+    Command::Resume,
+    Command::Abandon,
     Command::Status,
     Command::Clear,
     Command::Quit,
@@ -38,6 +44,8 @@ impl Command {
             Self::Help => "help",
             Self::New => "new",
             Self::Status => "status",
+            Self::Resume => "resume",
+            Self::Abandon => "abandon",
             Self::Clear => "clear",
             Self::Quit => "quit",
         }
@@ -50,6 +58,8 @@ impl Command {
             Self::Help => "list these commands",
             Self::New => "start a new session, forgetting this conversation",
             Self::Status => "show the agent's approval policy and audit settings",
+            Self::Resume => "carry on with the turn a restart interrupted",
+            Self::Abandon => "give up on that turn and unblock this session",
             Self::Clear => "clear the screen",
             Self::Quit => "leave",
         }

@@ -1,10 +1,41 @@
-# Garrison server configuration — local development.
+# Garrison server configuration.
+#
+# One `garrison-agent serve` per user per machine reads this file. Editors
+# spawn `garrison-agent acp`, which is a relay to that daemon's socket and
+# runs no engine of its own, so this file is the one configuration in force
+# for every editor window and every terminal chat on this seat.
+#
+# Where the daemon looks: ./garrison.toml, then
+# $XDG_CONFIG_HOME/garrison/garrison.toml (~/.config/garrison/garrison.toml).
+# A daemon started by a relay, or by systemd, runs with its working directory
+# at $HOME and is handed only the XDG file; the relay's own --config flag is
+# never passed on, so a workspace-local file cannot become every later
+# editor's policy.
+
+[server]
+# The Unix socket the daemon listens on and every client connects to. The
+# default is $XDG_RUNTIME_DIR/garrison-agent.sock (per user, mode 0700), so
+# it is left unset here. A --socket flag overrides it on either side.
+# socket = "/run/user/1000/garrison-agent.sock"
+#
+# Whether a client that finds no daemon may start one. On (the default), the
+# relay starts the daemon through `systemctl --user start garrison-agent` when
+# that unit is loaded, otherwise as a detached child rooted at $HOME. Off, a
+# missing daemon is an error the client reports; only an operator or systemd
+# starts the engine. `garrison-agent ping` never starts anything either way.
+autostart = true
+# How long a client waits for an autostarted daemon to answer.
+start_timeout_secs = 10
 
 [threads]
-# project_root defaults to the working directory the server starts in. It is
-# the boundary, not a default: a client asking for a session anywhere else is
-# refused, and every tool a turn registers can reach that tree and nothing
-# else. List further trees in workspace_roots to approve them too.
+# The boundary rule for a shared daemon. project_root defaults to the working
+# directory the daemon starts in: under systemd that is %h, and under relay
+# autostart it is $HOME, so any workspace under the home directory can host a
+# session and each session is still confined to its own cwd. Workspaces
+# elsewhere (/srv, /opt) must be listed in workspace_roots or the session is
+# refused as "outside the approved roots". An administrator narrows the
+# default by setting project_root to one tree.
+# project_root = "/home/dev/projects"
 # workspace_roots = ["/srv/projects/other"]
 system_prompt = "You are Garrison, a governed coding agent. Work inside the project root. Read before you write, prefer small verifiable steps, and explain what you changed."
 
@@ -14,8 +45,143 @@ timeout_secs = 300
 # state still reaches the operator.
 auto_approve = ["read_file", "glob", "grep", "list_directory", "calculate", "get_context_remaining", "update_plan", "lsp_diagnostics", "lsp_hover", "lsp_definition", "lsp_references"]
 
-# Language servers, routed by file extension. All four lsp_* tools are
-# read-only queries, hence their place in auto_approve above.
-[lsp_servers.rust]
-command = "rust-analyzer"
-extensions = ["rs"]
+# Language servers, routed by file extension. Deliberately none by default.
+#
+# Servers are spawned once, at launch, rooted at the daemon's project root.
+# With one daemon per user that root is $HOME, not a workspace, so a server
+# started here would index the wrong tree and the lsp_* tools would answer
+# from nothing while looking as if they worked. Rather than ship that
+# silently degraded, the block is off until servers are spawned per session
+# root (a tracked follow-up). Enable it only on a daemon whose
+# [threads] project_root names the one tree the server should index.
+# [lsp_servers.rust]
+# command = "rust-analyzer"
+# extensions = ["rs"]
+
+[audit]
+# What Garrison requires of the trail acton-ai writes. acton-ai owns the trail
+# itself: where it is, what an append promises, who holds its lock. This
+# section owns the three questions it has no opinion about.
+
+# What an append must promise before a turn may run. Omitted, this follows
+# acton-ai.toml's own `[audit] durability`; naming it here is how a deployment
+# states the requirement in its own file. `strict` is what arms the turn gate.
+# durability = "strict"
+
+# Where the last verified chain head is written, outside the trail. This is
+# what makes a tail truncation detectable: the trail alone still verifies
+# after its last entries are deleted, because a prefix of a valid chain is a
+# valid chain. Only a record of where the chain used to end can notice.
+# Defaults to $XDG_STATE_HOME/garrison/audit-anchor.json (mode 0600), rewritten
+# after every finished turn.
+# anchor_path = "/home/dev/.local/state/garrison/audit-anchor.json"
+
+# What startup does when the trail and the anchor disagree. "refuse" (the
+# default) stops the daemon with exit 2 on a truncated, rewritten, or replaced
+# trail: starting over it would append to a record already known to be
+# incomplete. "warn" logs the same finding and starts anyway. A trail that
+# merely grew past its anchor is never a mismatch; that is what a daemon that
+# died before re-anchoring looks like.
+# on_anchor_mismatch = "refuse"
+
+# Whether the daemon may start without an armed trail. Omitted, a trail is
+# required exactly when a [plane] section is present: an install answering to
+# an agency records what it does, a standalone developer install need not.
+# Set it explicitly to override the inference in either direction.
+# required = true
+
+[sessions]
+# What Garrison requires of the sessions acton-ai stores. acton-ai owns the
+# store itself: which database file, what a checkpoint holds, how a turn is
+# resumed. That is `[checkpoint]` in acton-ai.toml, and its presence is what
+# arms persistence. This section owns the two questions it has no opinion
+# about, because they are the agency's questions rather than the runtime's.
+
+# Whether the daemon may start without a session store. Omitted, a store is
+# required exactly when a [plane] section is present, which is the same rule
+# [audit] required follows and for the same reason: an operator whose work
+# vanishes on every upgrade has not been given a governed agent, only an
+# unreliable one. A required store that acton-ai.toml does not arm is a
+# refusal to start (exit 2). Set it explicitly to override the inference in
+# either direction.
+# required = true
+
+# Days a session may go untouched before the daemon deletes it, with its
+# conversation and every message in it. Persistence without retention is a
+# growing disk and a growing disclosure: every prompt an operator ever typed,
+# kept forever, on a machine an agency has to be able to say something
+# definite about.
+#
+# One thing is never swept, at any age: a session holding a turn a restart
+# interrupted. The operator has not yet said whether to resume or abandon it,
+# and deleting it would make that decision for them.
+retain_days = 30
+
+# How often that window is enforced. The first sweep runs at startup. Zero in
+# either key is read as one rather than as "never" and rather than as
+# "immediately".
+sweep_interval_hours = 24
+
+# What a client does about an interrupted turn is not configured here; it is
+# asked for, per turn, over the protocol. `session/load` reports the turn in
+# `_meta.garrison.interruptedTurn`, and the client answers with
+# `_garrison/session/resume` (carry on from the round the checkpoint stopped
+# at) or `_garrison/session/abandon` (give up on it and unblock the session).
+# Until one of those arrives the session refuses new prompts with JSON-RPC
+# code -32019, and a resume or abandon with nothing to act on is -32021.
+
+# [plane]
+# Enrolling with a control plane. Omit this section entirely and the agent runs
+# standalone, exactly as it did before enrollment existed.
+#
+# The first start that finds this section and no install record redeems an
+# enrollment packet: a single-use grant left on this machine by whoever
+# provisions the fleet. The packet is deleted once spent, and the identity the
+# plane assigns is written to install.json beside this file's config directory.
+# Every later start reads that record and makes no call, so a plane outage
+# cannot ground a fleet that has already been admitted.
+#
+# A machine that has *not* enrolled and is refused, or cannot reach the plane,
+# does not start (exit 2, which the systemd unit does not retry). A governed
+# agent that runs anyway is not governed.
+#
+# url = "https://plane.agency.gov"
+#
+# Where the install-token exchange lives. Defaults to `url`, which is the
+# deployment the shipped control-plane config describes: garrison-hooks sits
+# behind the same name as the plane.
+#
+# Once enrolled the daemon holds an Ed25519 private key and no bearer. Before
+# every plane call it signs a 120-second assertion and posts it to
+# POST /api/v1/install/token here, receiving a 15-minute token scoped to this
+# install's organization. Set this only when that route is reverse-proxied
+# somewhere else, or when a developer runs the hook service on its own port.
+# hooks_url = "https://hooks.agency.gov"
+#
+# Where to look for the enrollment packet. Defaults to enrollment.toml in the
+# Garrison config directory (~/.config/garrison/enrollment.toml).
+# enrollment_packet = "/etc/garrison/enrollment.toml"
+#
+# Who this install belongs to, when the grant itself does not name an operator.
+# The plane resolves it to a registered operator and refuses if it cannot, or
+# if that operator is not active or is not known to the directory. It is
+# consulted once, at first enrollment: the install binds to the operator's
+# row, so a later rename in the directory does not affect an enrolled install.
+# operator_upn = "dev@agency.gov"
+#
+# How often the daemon reconfirms that it still holds a seat. Default 60
+# seconds, clamped to 15..900. One check is three reads through the same
+# bearer every other subsystem spends: this install's row, its operator's
+# seats, and the organization. A turn is gated on the answer already in hand,
+# so this is what decides how quickly a revocation reaches a running daemon,
+# not what a prompt waits on.
+# seat_check_secs = 60
+#
+# A ceiling on how long a confirmed seat may be spent while the plane cannot
+# be reached. The window itself comes from the organization's impact_level and
+# the seat's tier (72h down to zero; see docs/control-plane.md, "Seat
+# entitlement"). This setting may only shorten that window and can never
+# lengthen it: a deployment may be stricter than its impact level requires,
+# never more generous. A revoked seat gets no window at all, whatever this
+# says, because a refusal is an answer rather than an outage.
+# offline_grace_secs = 3600

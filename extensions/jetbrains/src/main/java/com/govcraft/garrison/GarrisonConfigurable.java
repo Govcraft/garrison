@@ -11,8 +11,8 @@ import java.util.Objects;
 
 public final class GarrisonConfigurable implements Configurable {
     private JBTextField agentPath;
+    private JBTextField socket;
     private JBTextField configPath;
-    private JBTextField actonConfigPath;
 
     @Override
     public @Nls String getDisplayName() { return "Garrison"; }
@@ -21,12 +21,15 @@ public final class GarrisonConfigurable implements Configurable {
     public @Nullable JComponent createComponent() {
         var state = GarrisonSettings.getInstance().getState();
         agentPath = new JBTextField(state.agentPath);
+        socket = new JBTextField(state.socket);
         configPath = new JBTextField(state.configPath);
-        actonConfigPath = new JBTextField(state.actonConfigPath);
+        agentPath.setToolTipText("Runs `garrison-agent acp`, a relay to the per-user daemon; starts the daemon if needed.");
+        socket.setToolTipText("The daemon's Unix socket; empty uses $XDG_RUNTIME_DIR/garrison-agent.sock.");
+        configPath.setToolTipText("Read by the relay for [server] only; never passed to an autostarted daemon.");
         return FormBuilder.createFormBuilder()
                 .addLabeledComponent("Agent executable:", agentPath)
+                .addLabeledComponent("Daemon socket (optional):", socket)
                 .addLabeledComponent("Garrison config (optional):", configPath)
-                .addLabeledComponent("acton-ai config (optional):", actonConfigPath)
                 .addComponentFillVertically(new JPanel(), 0)
                 .getPanel();
     }
@@ -35,23 +38,23 @@ public final class GarrisonConfigurable implements Configurable {
     public boolean isModified() {
         var state = GarrisonSettings.getInstance().getState();
         return !Objects.equals(agentPath.getText(), state.agentPath)
-                || !Objects.equals(configPath.getText(), state.configPath)
-                || !Objects.equals(actonConfigPath.getText(), state.actonConfigPath);
+                || !Objects.equals(socket.getText(), state.socket)
+                || !Objects.equals(configPath.getText(), state.configPath);
     }
 
     @Override
     public void apply() {
         var state = GarrisonSettings.getInstance().getState();
         state.agentPath = agentPath.getText().trim();
+        state.socket = socket.getText().trim();
         state.configPath = configPath.getText().trim();
-        state.actonConfigPath = actonConfigPath.getText().trim();
     }
 
     @Override
     public void reset() {
         var state = GarrisonSettings.getInstance().getState();
         agentPath.setText(state.agentPath);
+        socket.setText(state.socket);
         configPath.setText(state.configPath);
-        actonConfigPath.setText(state.actonConfigPath);
     }
 }

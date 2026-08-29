@@ -31,19 +31,19 @@
 //! identifier is still parseable, sortable by creation time, and prefixed —
 //! and a client that treats it as opaque is never wrong.
 
-use crate::types::ThreadId;
+use crate::types::{ThreadId, TurnId};
 use serde::{Deserialize, Serialize};
 
 pub use agent_client_protocol_schema::v1::{
     AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, Error as ProtocolError,
     ErrorCode, Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
-    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
-    NewSessionResponse, PermissionOption, PermissionOptionId, PermissionOptionKind,
-    PromptCapabilities, PromptRequest, PromptResponse, RequestId, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionCapabilities, SessionId, SessionInfo, SessionListCapabilities, SessionNotification,
-    SessionUpdate, StopReason, ToolCall, ToolCallContent, ToolCallId, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, Meta, NewSessionRequest,
+    NewSessionResponse, PermissionOption, PermissionOptionId, PermissionOptionKind, Plan,
+    PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptCapabilities, PromptRequest,
+    PromptResponse, RequestId, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionCapabilities, SessionId,
+    SessionInfo, SessionListCapabilities, SessionNotification, SessionUpdate, StopReason, ToolCall,
+    ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 pub use agent_client_protocol_schema::ProtocolVersion;
 
@@ -101,6 +101,25 @@ pub mod ext {
     /// Reports what this agent is, and what it is enforcing.
     pub const STATUS: &str = "_garrison/status";
 
+    /// Announces that a turn's history was summarized to fit the window.
+    ///
+    /// A notification, never a request: nothing is being asked of the client.
+    /// It exists because compaction changes what the model is told, and an
+    /// operator watching a session should see that happen rather than infer
+    /// it from an answer that forgot something.
+    pub const SESSION_COMPACTED: &str = "_garrison/session/compacted";
+
+    /// Picks a turn a restart interrupted back up where it stopped.
+    ///
+    /// A request, and the only way a turn that outlived its daemon reaches a
+    /// model again: the resume policy this agent runs under never resumes on
+    /// its own, because a turn resumed in the background would settle pending
+    /// tool calls with no client to ask for permission.
+    pub const SESSION_RESUME: &str = "_garrison/session/resume";
+
+    /// Gives up on a turn a restart interrupted, unblocking the session.
+    pub const SESSION_ABANDON: &str = "_garrison/session/abandon";
+
     /// The key Garrison uses inside any ACP `_meta` object.
     ///
     /// One key, one nested object: a `_meta` is shared with every other
@@ -113,7 +132,11 @@ pub mod ext {
 // =============================================================================
 
 /// The answer to `_garrison/status`.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// `PartialEq` without `Eq`: [`CompactionStatus::threshold`] is a fraction of
+/// the context window, and a fraction is not something to compare for total
+/// equality.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct GarrisonStatus {
@@ -131,6 +154,257 @@ pub struct GarrisonStatus {
     pub audit: AuditStatus,
     /// What isolation the agent's writing tools run under.
     pub sandbox: SandboxStatus,
+    /// What the session supervisor holds across every connection.
+    ///
+    /// Absent when the supervisor could not be asked; the rest of the status
+    /// is still worth having.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threads: Option<ThreadsStatus>,
+    /// How this daemon's one authenticated path to the control plane is
+    /// faring.
+    ///
+    /// Absent on a standalone agent, which has no plane to report on, and on
+    /// a governed one whose plane session could not be asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plane: Option<PlaneStatus>,
+    /// What the daemon does when a conversation outgrows the model's window.
+    ///
+    /// Absent when the router could not be asked, exactly as [`Self::threads`]
+    /// is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextStatus>,
+    /// Whether sessions survive a restart, and what the store holds.
+    ///
+    /// Absent when this daemon persists nothing — `acton-ai.toml` arms no
+    /// `[checkpoint]` section — and when the store could not be asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_store: Option<SessionStoreStatus>,
+    /// Whether a seat entitles this install to run turns at all.
+    ///
+    /// Absent on a standalone agent, which belongs to no organization and
+    /// holds no seat, and on a governed one whose seat monitor could not be
+    /// asked. Present and refusing is the first thing to read when every
+    /// prompt is coming back with code -32014 or -32015.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entitlement: Option<EntitlementStatus>,
+}
+
+/// What the session store holds, and whether it can be reached.
+///
+/// The field an operator reads when a `session/prompt` comes back refused
+/// with `-32018`: a store that cannot answer refuses every turn, on purpose,
+/// rather than running turns whose history would be lost at the next restart.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct SessionStoreStatus {
+    /// Whether the store answered when it was last asked.
+    ///
+    /// `false` is the refusing state: turns are being turned away until it
+    /// answers again.
+    pub healthy: bool,
+    /// Sessions this agent can read back after a restart.
+    pub sessions: usize,
+    /// Of those, how many hold a turn a restart interrupted. Each one is a
+    /// session that will refuse a new prompt until it is resumed or
+    /// abandoned.
+    pub interrupted: usize,
+    /// The most recent turn checkpoint written, by identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_checkpoint: Option<String>,
+    /// Days a session may go untouched before the sweep removes it.
+    pub retain_days: u32,
+    /// When the retention sweep last ran, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_swept: Option<String>,
+    /// What the store last failed at, if it has failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+/// What a client is told about a turn a restart interrupted.
+///
+/// Rides in `_meta.garrison` on the `session/load` response, so an editor
+/// reattaching to a session learns immediately that it cannot prompt until
+/// the operator decides, and has the turn identifier to decide *about*.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct InterruptedTurnMeta {
+    /// The turn left half-done.
+    pub turn_id: String,
+    /// When it started, RFC 3339.
+    pub started_at: String,
+    /// What the operator had asked for.
+    pub prompt: String,
+    /// How many provider rounds it had already spent, from its checkpoint.
+    /// Absent when the turn left no record to read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rounds_completed: Option<usize>,
+    /// Whether the saved progress can still be picked up. `false` means the
+    /// only way forward is to abandon it.
+    pub resumable: bool,
+}
+
+/// The `_meta.garrison` payload on a `session/load` that found an
+/// interrupted turn.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct LoadMeta {
+    /// The turn a restart interrupted, when there is one.
+    pub interrupted_turn: InterruptedTurnMeta,
+}
+
+/// What `_garrison/session/resume` and `_garrison/session/abandon` are given.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InterruptedTurnRequest {
+    /// The session holding the interrupted turn.
+    pub session_id: SessionId,
+}
+
+/// What `_garrison/session/abandon` answers with.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct AbandonResponse {
+    /// The turn that was given up on.
+    pub turn_id: String,
+}
+
+/// What the seat monitor reports about this install's entitlement.
+///
+/// The three states an operator triages on are `entitled`, `unavailable`
+/// (the plane could not confirm and the grace has run out) and a refusal,
+/// which reports as the specific reason rather than a generic "refused":
+/// `seat_revoked`, `seat_expired`, `seat_not_active`, `no_seat`,
+/// `install_not_active`, `install_unbound` or `credential_rejected`. A daemon
+/// that has never had an answer reports `unchecked`, which is deliberately
+/// not the same word as `unavailable`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct EntitlementStatus {
+    /// Where the entitlement stands, in one word.
+    pub state: String,
+    /// The `Seat` row this install is running on, when one entitles it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat: Option<String>,
+    /// That seat's tier: `standard` or `elevated`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+    /// The refusal in prose, when the plane said no. This is the sentence an
+    /// operator acts on, and the same one the error frame carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The organization's impact level, which is where the grace comes from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub impact_level: Option<String>,
+    /// When the plane last confirmed the standing, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<String>,
+    /// How long that confirmation may be spent without the plane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grace_secs: Option<u64>,
+    /// When it stops being spendable, RFC 3339. Absent for a refusal, which
+    /// has no grace, and for a daemon that has never had an answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grace_until: Option<String>,
+    /// When the monitor will look again, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_check_at: Option<String>,
+    /// How often it looks.
+    pub check_interval_secs: u64,
+    /// How many times the plane has answered since this daemon started.
+    ///
+    /// Zero with a cached standing present means this process is running on
+    /// what the last one learned, which is a different statement from having
+    /// confirmed anything itself.
+    #[serde(default)]
+    pub checks: u64,
+    /// What the last check failed with, when it failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+/// What the daemon's credential holder reports about reaching the plane.
+///
+/// This is the field an operator reads first when turns are being refused,
+/// because every governed subsystem spends the same bearer: if the exchange
+/// is failing, the policy pull, the seat check, and the audit shipper are all
+/// failing for one reason, and it is here.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct PlaneStatus {
+    /// Whether the last thing that happened was the plane answering.
+    ///
+    /// False before the first exchange as well as after a failed one: this
+    /// says "a bearer is not known to be obtainable", not "the network is
+    /// down".
+    pub reachable: bool,
+    /// When a bearer was last obtained, RFC 3339, if ever.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_exchange_at: Option<String>,
+    /// When the bearer in hand stops being accepted, RFC 3339.
+    ///
+    /// Absent when there is no bearer, which is the same thing the daemon
+    /// knows and worth saying rather than showing a stale time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    /// What went wrong last time, if the last attempt failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+/// What the daemon does with a history that no longer fits the window.
+///
+/// Reported by the turn router, which is the one actor that sees every
+/// compaction: the policy it was launched under, and how many compactions it
+/// has routed since it started.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ContextStatus {
+    /// The auto-compaction policy in force, or `None` when the oldest
+    /// exchanges are truncated rather than summarized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<CompactionStatus>,
+    /// Compactions this daemon has performed since it started.
+    ///
+    /// Zero with a policy present means the sessions so far have stayed
+    /// inside the window, which is a different statement from compaction
+    /// being off.
+    pub compactions: usize,
+}
+
+/// The auto-compaction policy, as acton-ai resolved it at launch.
+///
+/// Resolved from `[context]` in `acton-ai.toml`: Garrison never calls
+/// `.compaction()` on the builder, so the file is the single source of truth
+/// and this is a readback of it rather than a second copy.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct CompactionStatus {
+    /// The share of the window's available budget at which the oldest
+    /// exchanges are summarized.
+    pub threshold: f64,
+    /// How many trailing exchanges survive verbatim.
+    pub keep_recent_turns: usize,
+}
+
+/// What the session supervisor reports about the sessions it owns.
+///
+/// Distinct from [`GarrisonStatus::sessions`], which counts only the sessions
+/// the asking connection holds: this is the daemon-wide figure.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ThreadsStatus {
+    /// How many sessions are alive in the whole daemon.
+    pub live: usize,
 }
 
 /// The approval gate's configuration, as the client may see it.
@@ -185,20 +459,111 @@ impl SandboxStatus {
 }
 
 /// What the audit trail can say about itself.
+///
+/// The four states of [`state`](Self::state) are what an operator triages on,
+/// and they are deliberately four rather than a boolean: `disabled` (nothing
+/// is being recorded), `configured` (a trail is armed and nothing has been
+/// written to it yet), `healthy` (every append reached the disk), and
+/// `degraded` (at least one did not, so the record is incomplete). A daemon
+/// that cannot ask its own writer reports `degraded` and never `healthy`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct AuditStatus {
     /// Whether the runtime is recording tool invocations at all.
     pub enabled: bool,
+    /// Where the audit stands, in one word.
+    #[serde(default)]
+    pub state: crate::audit::AuditState,
+    /// What an append promises before it is acknowledged: `best_effort` or
+    /// `strict`. Absent when no trail is armed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durability: Option<String>,
     /// The hash at the end of the chain, when the runtime will disclose it.
     ///
-    /// Always `None` today: acton-ai's `AuditLog` actor answers `GetChainHead`
-    /// but `ActonAI` hands out no address for it, so a downstream crate cannot
-    /// ask. Filed upstream; the field exists so filling it in later is not a
-    /// protocol change.
+    /// Read from `ActonAI::audit_head()` at the moment of the request. Absent
+    /// when no trail is configured, or when the audit actor did not answer:
+    /// a status that cannot vouch for the chain says nothing rather than
+    /// guessing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chain_head: Option<String>,
+    /// The sequence number that head carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<u64>,
+    /// The trail's identity, once acton-ai has sealed one into the chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trail_id: Option<String>,
+    /// Entries this process has written and, when strict, synced.
+    #[serde(default)]
+    pub appended: u64,
+    /// Appends this process could not write.
+    #[serde(default)]
+    pub failures: u64,
+    /// The sequence number of the first entry that failed to reach the disk,
+    /// which is where an auditor starts reading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_failed_sequence: Option<u64>,
+    /// What the operating system said about the most recent failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// When the writer first failed, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded_since: Option<String>,
+    /// The externally anchored head, which is what makes a tail truncation
+    /// detectable. Absent when nothing anchors this trail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<AnchorStatus>,
+}
+
+impl AuditStatus {
+    /// What a connection can say before any subsystem has described itself.
+    ///
+    /// `enabled` is known from the runtime; everything else waits for the
+    /// audit keeper's part, and a daemon without a keeper reports the state
+    /// it can actually justify rather than a healthy-looking default.
+    #[must_use]
+    pub fn undescribed(enabled: bool) -> Self {
+        Self {
+            enabled,
+            state: if enabled {
+                crate::audit::AuditState::Configured
+            } else {
+                crate::audit::AuditState::Disabled
+            },
+            durability: None,
+            chain_head: None,
+            sequence: None,
+            trail_id: None,
+            appended: 0,
+            failures: 0,
+            first_failed_sequence: None,
+            last_error: None,
+            degraded_since: None,
+            anchor: None,
+        }
+    }
+}
+
+/// Where the chain head is remembered outside the trail.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct AnchorStatus {
+    /// The anchor file.
+    pub path: String,
+    /// The sequence number it vouches for, absent until one is written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<u64>,
+    /// The hash it vouches for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+    /// When it was last written, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchored_at: Option<String>,
+    /// Why the last attempt to write it failed, when one did. An anchor that
+    /// stops advancing while the trail grows is a finding in its own right.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 /// What Garrison attaches to a `session/prompt` response's `_meta`.
@@ -217,6 +582,122 @@ pub struct TurnMeta {
     pub prompt_tokens: u64,
     /// Tokens received.
     pub completion_tokens: u64,
+    /// The plan as it stood when the turn ended, when the model published one.
+    ///
+    /// The authoritative end state. Plan updates stream as
+    /// [`SessionUpdate::Plan`] notifications from the router while the turn
+    /// runs, and those travel on the same sink as this response but from a
+    /// different actor, so the last of them may land *after* it. A client that
+    /// wants the final plan reads it here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<PlanSummary>,
+    /// What compaction did to this turn's history, oldest first.
+    ///
+    /// Empty, and absent from the wire, unless the history outgrew the window
+    /// and `[context] auto_compact` was on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compactions: Vec<CompactionSummary>,
+}
+
+/// A plan as Garrison states it in `_meta`.
+///
+/// The counts are carried rather than left to be derived: a client that only
+/// wants "three of seven done" should not have to walk the steps to find out.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct PlanSummary {
+    /// The steps, in the order the model listed them.
+    pub steps: Vec<PlanStepSummary>,
+    /// The model's note about the plan as a whole, if it wrote one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// How many steps are finished.
+    pub completed: usize,
+    /// How many steps there are.
+    pub total: usize,
+}
+
+/// One step of a plan, in `_meta`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct PlanStepSummary {
+    /// What the step is.
+    pub title: String,
+    /// Where it stands, spelled as ACP spells it.
+    pub status: PlanEntryStatus,
+}
+
+/// Garrison's correlation for one streamed plan update.
+///
+/// Rides in the notification's `_meta.garrison`. The turn identifier is the
+/// point of it: a client holding several open prompts can tell which answer
+/// this plan belongs to, and match it against the `turnId` the eventual
+/// `session/prompt` response carries.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct PlanMeta {
+    /// Garrison's identifier for the turn that published this plan.
+    pub turn_id: String,
+    /// The `update_plan` call that published it.
+    pub tool_call_id: String,
+    /// The model's note about the plan, if it wrote one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// How many steps are finished.
+    pub completed: usize,
+    /// How many steps there are.
+    pub total: usize,
+}
+
+/// What one compaction did, in `_meta`.
+///
+/// Counts only. The summary text itself is a message in the session's history,
+/// where a `session/load` replays it and session persistence stores it, and
+/// duplicating kilobytes of it in every prompt response would create a second
+/// source of truth for the same words.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct CompactionSummary {
+    /// Estimated tokens before the pass.
+    pub tokens_before: u64,
+    /// Estimated tokens after it.
+    pub tokens_after: u64,
+    /// Messages the summary replaced, as the prompt loop counted them.
+    pub messages_elided: u64,
+    /// Messages in the loop's history before the pass.
+    pub messages_before: u64,
+    /// Messages in it after.
+    pub messages_after: u64,
+    /// How many leading messages of the *session's own* history the summary
+    /// stands for.
+    ///
+    /// acton-ai's statement that a compaction is a strict prefix elision
+    /// (`CompactionRecord::elided_prefix_len`), and therefore the number that
+    /// makes the daemon's copy of the history adoptable rather than guessable.
+    /// It can exceed the messages the session owns, because the loop's list
+    /// also held this turn's rounds.
+    pub elided_prefix_len: u64,
+}
+
+/// The `_garrison/session/compacted` notification's parameters.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct CompactionNotice {
+    /// The session whose history was summarized.
+    pub session_id: SessionId,
+    /// Garrison's identifier for the turn it happened in.
+    pub turn_id: String,
+    /// Estimated tokens before the pass.
+    pub tokens_before: u64,
+    /// Estimated tokens after it.
+    pub tokens_after: u64,
+    /// Messages the summary replaced.
+    pub messages_elided: u64,
 }
 
 // =============================================================================
@@ -361,6 +842,20 @@ pub fn user_chunk(thread_id: &ThreadId, text: &str) -> SessionNotification {
     )
 }
 
+/// The `session/update` carrying context the agent holds but never said.
+///
+/// Used when replaying a loaded session to render the framework's compaction
+/// summary: it is a user-role message in the history because that is the shape
+/// the model needs, but it is not something the operator said, and replaying
+/// it as a user chunk would put words in their mouth.
+#[must_use]
+pub fn thought_chunk(thread_id: &ThreadId, text: &str) -> SessionNotification {
+    SessionNotification::new(
+        session_id(thread_id),
+        SessionUpdate::AgentThoughtChunk(ContentChunk::new(text.into())),
+    )
+}
+
 /// The `session/update` announcing that a tool call has started.
 ///
 /// ACP models a tool call as an object the client creates once and then
@@ -413,6 +908,138 @@ pub fn tool_call_finished(
     )
 }
 
+/// Wraps an extension payload in the one `_meta` key Garrison claims.
+///
+/// A `_meta` object is shared with every other extension in the ecosystem, so
+/// Garrison takes exactly one name in it and nests everything under that. A
+/// payload that will not serialize is logged and dropped rather than failing
+/// the frame it rides on: metadata is never the reason a client loses a turn's
+/// answer.
+#[must_use]
+pub fn garrison_meta<T: Serialize>(payload: &T) -> Meta {
+    let mut meta = Meta::new();
+    match serde_json::to_value(payload) {
+        Ok(value) => {
+            meta.insert(ext::META_KEY.to_string(), value);
+        }
+        Err(error) => tracing::error!(%error, "dropping unserializable garrison metadata"),
+    }
+    meta
+}
+
+/// The `session/update` carrying the model's current plan.
+///
+/// Spec-native: every ACP host already renders `sessionUpdate: "plan"`, so a
+/// plan a governed agent published is visible in Zed, the JetBrains plugin and
+/// Neovim without any of them knowing what Garrison is. Garrison's own
+/// correlation — which turn this plan belongs to, and which `update_plan` call
+/// published it — rides in the notification's `_meta.garrison`, which is the
+/// slot ACP reserves for exactly that.
+///
+/// acton-ai's plans carry no priority, so every entry is
+/// [`PlanEntryPriority::Medium`]: a constant, stated here rather than guessed
+/// per step from wording the model never meant as a priority.
+#[must_use]
+pub fn plan_update(
+    thread_id: &ThreadId,
+    turn_id: &TurnId,
+    tool_call_id: &str,
+    plan: &acton_ai::tools::plan::Plan,
+) -> SessionNotification {
+    let entries: Vec<PlanEntry> = plan
+        .steps()
+        .iter()
+        .map(|step| {
+            PlanEntry::new(
+                step.title().as_str(),
+                PlanEntryPriority::Medium,
+                plan_entry_status(step.status()),
+            )
+        })
+        .collect();
+
+    let meta = garrison_meta(&PlanMeta {
+        turn_id: turn_id.to_string(),
+        tool_call_id: tool_call_id.to_string(),
+        note: plan.note().map(|note| note.as_str().to_string()),
+        completed: plan.completed_count(),
+        total: plan.step_count(),
+    });
+
+    SessionNotification::new(
+        session_id(thread_id),
+        SessionUpdate::Plan(Plan::new(entries)),
+    )
+    .meta(Some(meta))
+}
+
+/// The `_garrison/session/compacted` notification for one compaction pass.
+#[must_use]
+pub fn compaction_notice(
+    thread_id: &ThreadId,
+    turn_id: &TurnId,
+    tokens_before: u64,
+    tokens_after: u64,
+    messages_elided: u64,
+) -> CompactionNotice {
+    CompactionNotice {
+        session_id: session_id(thread_id),
+        turn_id: turn_id.to_string(),
+        tokens_before,
+        tokens_after,
+        messages_elided,
+    }
+}
+
+/// Restates a plan for a `session/prompt` response's `_meta`.
+///
+/// Pure, so the shape a client reads at the end of a turn is testable without
+/// a model.
+#[must_use]
+pub fn plan_summary(plan: &acton_ai::tools::plan::Plan) -> PlanSummary {
+    PlanSummary {
+        steps: plan
+            .steps()
+            .iter()
+            .map(|step| PlanStepSummary {
+                title: step.title().as_str().to_string(),
+                status: plan_entry_status(step.status()),
+            })
+            .collect(),
+        note: plan.note().map(|note| note.as_str().to_string()),
+        completed: plan.completed_count(),
+        total: plan.step_count(),
+    }
+}
+
+/// Restates one compaction for a `session/prompt` response's `_meta`.
+#[must_use]
+pub fn compaction_summary(record: &acton_ai::memory::CompactionRecord) -> CompactionSummary {
+    CompactionSummary {
+        tokens_before: record.outcome.tokens_before as u64,
+        tokens_after: record.outcome.tokens_after as u64,
+        messages_elided: record.outcome.messages_elided as u64,
+        messages_before: record.outcome.messages_before as u64,
+        messages_after: record.outcome.messages_after as u64,
+        elided_prefix_len: record.elided_prefix_len as u64,
+    }
+}
+
+/// Translates acton-ai's plan-step status into ACP's.
+///
+/// Pure, and total in both directions: the two vocabularies are the same three
+/// states, which is why a plan needs no lossy mapping to reach a client.
+#[must_use]
+pub fn plan_entry_status(status: acton_ai::tools::plan::PlanStepStatus) -> PlanEntryStatus {
+    use acton_ai::tools::plan::PlanStepStatus as Step;
+
+    match status {
+        Step::Pending => PlanEntryStatus::Pending,
+        Step::InProgress => PlanEntryStatus::InProgress,
+        Step::Completed => PlanEntryStatus::Completed,
+    }
+}
+
 /// Classifies a tool by name, so a client can render the right icon.
 ///
 /// Pure, exhaustive over Garrison's own builtins, and deliberately generous
@@ -460,8 +1087,144 @@ mod tests {
 
     #[test]
     fn every_garrison_method_is_in_the_reserved_namespace() {
-        assert!(ext::STATUS.starts_with(ext::NAMESPACE));
+        for method in [ext::STATUS, ext::SESSION_COMPACTED] {
+            assert!(method.starts_with(ext::NAMESPACE), "{method}");
+        }
         assert!(ext::NAMESPACE.starts_with('_'));
+    }
+
+    /// A two-step plan whose first step is where the model says it is.
+    fn a_plan(first: acton_ai::tools::plan::PlanStepStatus) -> acton_ai::tools::plan::Plan {
+        use acton_ai::tools::plan::{Plan as ModelPlan, PlanNote, PlanStep, PlanStepStatus};
+
+        ModelPlan::new(
+            vec![
+                PlanStep::parse("read the parser", first).unwrap(),
+                PlanStep::parse("fix the parser", PlanStepStatus::Pending).unwrap(),
+            ],
+            Some(PlanNote::parse("two passes").unwrap()),
+        )
+        .expect("a two-step plan is valid")
+    }
+
+    #[test]
+    fn a_plan_update_is_a_spec_native_plan_with_garrisons_correlation_beside_it() {
+        use acton_ai::tools::plan::PlanStepStatus;
+
+        let notification = plan_update(
+            &ThreadId::new(),
+            &TurnId::new(),
+            "call-1",
+            &a_plan(PlanStepStatus::InProgress),
+        );
+        let frame = serde_json::to_value(&notification).expect("the notification must serialize");
+
+        assert_eq!(frame["update"]["sessionUpdate"], "plan");
+        assert_eq!(frame["update"]["entries"][0]["content"], "read the parser");
+        assert_eq!(frame["update"]["entries"][0]["status"], "in_progress");
+        assert_eq!(frame["update"]["entries"][1]["status"], "pending");
+        assert_eq!(frame["update"]["entries"][0]["priority"], "medium");
+
+        let garrison = &frame["_meta"][ext::META_KEY];
+        assert_eq!(garrison["toolCallId"], "call-1");
+        assert_eq!(garrison["note"], "two passes");
+        assert_eq!(garrison["completed"], 0);
+        assert_eq!(garrison["total"], 2);
+    }
+
+    #[test]
+    fn a_plan_updates_meta_names_the_turn_the_prompt_response_will_name() {
+        use acton_ai::tools::plan::PlanStepStatus;
+
+        let turn_id = TurnId::new();
+        let notification = plan_update(
+            &ThreadId::new(),
+            &turn_id,
+            "call-1",
+            &a_plan(PlanStepStatus::Completed),
+        );
+
+        let frame = serde_json::to_value(&notification).unwrap();
+        assert_eq!(frame["_meta"][ext::META_KEY]["turnId"], turn_id.to_string());
+    }
+
+    #[test]
+    fn a_finished_plan_counts_itself_for_the_response_meta() {
+        use acton_ai::tools::plan::PlanStepStatus;
+
+        let summary = plan_summary(&a_plan(PlanStepStatus::Completed));
+
+        assert_eq!(summary.completed, 1);
+        assert_eq!(summary.total, 2);
+        assert_eq!(summary.steps[0].status, PlanEntryStatus::Completed);
+        assert_eq!(summary.note.as_deref(), Some("two passes"));
+    }
+
+    #[test]
+    fn the_three_plan_statuses_mean_the_same_thing_on_both_sides() {
+        use acton_ai::tools::plan::PlanStepStatus;
+
+        assert_eq!(
+            plan_entry_status(PlanStepStatus::Pending),
+            PlanEntryStatus::Pending
+        );
+        assert_eq!(
+            plan_entry_status(PlanStepStatus::InProgress),
+            PlanEntryStatus::InProgress
+        );
+        assert_eq!(
+            plan_entry_status(PlanStepStatus::Completed),
+            PlanEntryStatus::Completed
+        );
+    }
+
+    #[test]
+    fn a_compaction_notice_names_the_session_the_turn_and_what_it_cost() {
+        let thread_id = ThreadId::new();
+        let turn_id = TurnId::new();
+
+        let notice = compaction_notice(&thread_id, &turn_id, 900, 300, 8);
+        let frame = serde_json::to_value(&notice).expect("the notice must serialize");
+
+        assert_eq!(frame["sessionId"], thread_id.to_string());
+        assert_eq!(frame["turnId"], turn_id.to_string());
+        assert_eq!(frame["tokensBefore"], 900);
+        assert_eq!(frame["tokensAfter"], 300);
+        assert_eq!(frame["messagesElided"], 8);
+    }
+
+    #[test]
+    fn a_compaction_summary_carries_the_counts_and_not_the_text() {
+        use acton_ai::memory::{CompactionOutcome, CompactionRecord};
+
+        let record = CompactionRecord {
+            summary: "words the model wrote".to_string(),
+            outcome: CompactionOutcome {
+                messages_before: 12,
+                messages_after: 5,
+                tokens_before: 900,
+                tokens_after: 300,
+                messages_elided: 8,
+            },
+            elided_prefix_len: 6,
+        };
+
+        let frame = serde_json::to_value(compaction_summary(&record)).unwrap();
+
+        assert_eq!(frame["messagesElided"], 8);
+        assert_eq!(frame["elidedPrefixLen"], 6);
+        assert!(
+            !frame.to_string().contains("words the model wrote"),
+            "the summary text belongs in the history, not in every response"
+        );
+    }
+
+    #[test]
+    fn garrison_metadata_takes_exactly_one_key() {
+        let meta = garrison_meta(&TurnMeta::default());
+
+        assert_eq!(meta.len(), 1);
+        assert!(meta.contains_key(ext::META_KEY));
     }
 
     #[test]

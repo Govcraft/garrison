@@ -1,10 +1,23 @@
 // Garrison control plane — audit aggregation.
 //
-// The agent already keeps a BLAKE3 hash-chained JSONL trail locally. This is
-// where those entries land centrally, chain links intact: `entry_hash` is
-// unique, `prev_hash` names its predecessor, and `chain_seq` orders them, so
-// the control plane can re-verify a session's chain instead of trusting the
-// install that shipped it. A gap or a broken link is visible as data.
+// The agent keeps a BLAKE3 hash-chained JSONL trail locally; acton-ai seals
+// every entry with its sequence, the previous hash, and the trail id it belongs
+// to. Three schemas describe that trail from three vantage points:
+//
+//   AuditTrail:  what the daemon says about its own trail: where the local
+//                 head is and how far it has shipped. Written by the operator
+//                 token, so it is a claim.
+//   AuditEvent:  one shipped entry, the sealed line verbatim in `entry` with
+//                 the chain fields lifted out for indexing. Written by the
+//                 operator token, verified by the hook before it lands.
+//   AuditChain:  what the plane has verified: the head it re-derived and
+//                 whether the walk found the chain intact. Written only by the
+//                 audit service, never by an install.
+//
+// Silence is the difference between the first and the third over time: a trail
+// whose local head keeps moving while its chain does not is an install that
+// stopped shipping, and a trail that stops reporting at all is an install that
+// went dark.
 //
 // Access is deliberately lopsided. Operators (the agents) may append and may
 // not read; auditors may read and may not append.
@@ -18,25 +31,65 @@
 // platform_admin's. An append-only trail with a delete verb is a trail with an
 // eraser in the drawer.
 //
-// Both schemas carry `@export` for SIEM handoff. Export is fail-closed twice
-// over: a schema without `@export` cannot be exported at all, a field without
-// `@exportable` never reaches a file, and the exported set is intersected with
-// what the caller may already read. It is also a distinct Cedar action
-// (`ExportAuditEvent`, not `Read`), so granting the trail to a reader does not
-// grant them a bulk copy of it.
+// AuditEvent and AuditChain carry `@export` for SIEM handoff. Export is
+// fail-closed twice over: a schema without `@export` cannot be exported at all,
+// a field without `@exportable` never reaches a file, and the exported set is
+// intersected with what the caller may already read. It is also a distinct
+// Cedar action (`ExportAuditEvent`, not `Read`), so granting the trail to a
+// reader does not grant them a bulk copy of it.
+
+// The daemon's own account of one trail. One row per trail id, created by the
+// install when the trail opens and patched as it ships. Nothing here is
+// verified; it is the install's claim, and AuditChain is the plane's answer.
+@version(1)
+@tenant(parent: "Organization")
+@display("trail_id")
+@access(
+    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin", "audit_service"],
+    write:  ["operator"],
+    delete: ["org_admin"]
+)
+schema AuditTrail {
+    // acton-ai's trail id, minted when the trail file is opened. Unique per
+    // tenant so two installs cannot claim the same trail.
+    trail_id:         text(max: 64) required unique indexed @list(primary)
+
+    install:          -> AgentInstall required
+    organization:     -> Organization required
+
+    agent_version:    text(max: 32)
+    acton_ai_version: text(max: 32)
+    started_at:       datetime
+
+    // The local head as the daemon last reported it.
+    local_head_seq:   integer(min: 0) default(0) @list(column)
+    local_head_hash:  text(max: 128)
+    // The highest sequence the daemon believes the plane has acknowledged.
+    shipped_through:  integer(min: 0) default(0) @list(column)
+
+    reported_at:      datetime @default("now") @format("relative")
+
+    // Set when the daemon halts shipping on its own account: a broken local
+    // chain, a refused entry, a full backlog. Empty while healthy.
+    halted_reason:    text(max: 1024) @default("''")
+}
 
 @version(1)
 @tenant(parent: "Organization")
 @display("tool_name")
 @access(
-    read:   ["team_lead", "auditor", "security_officer", "org_admin"],
+    read:   ["team_lead", "auditor", "security_officer", "org_admin", "audit_service"],
     write:  ["operator"],
     delete: ["org_admin"]
 )
 @export(formats: [csv, ndjson], bundle_files: false, max_rows: 250000)
+@hook(before_validate) """Verify the shipped entry against the trail's chain state; refuse forks and edits, record gaps"""
 schema AuditEvent {
     organization:  -> Organization required
-    session:       -> AgentSession required
+    trail:         -> AuditTrail required indexed
+    // Attribution by session is optional: a trail belongs to an install, and
+    // an entry may be sealed before any session is known to the plane.
+    session:       -> AgentSession
     operator:      -> Operator required
     install:       -> AgentInstall required
 
@@ -45,6 +98,12 @@ schema AuditEvent {
     chain_seq:     integer(min: 0) required indexed @exportable
     entry_hash:    text(max: 128) required unique indexed @exportable
     prev_hash:     text(max: 128) required @exportable
+
+    // The sealed acton-ai AuditEntry, verbatim: exactly the JSONL object the
+    // daemon wrote. The plane can re-run chain verification over this column
+    // and reproduce `head_hash`; that is the auditor's proof. Every columnar
+    // field below is a projection of it and may be re-derived; this may not.
+    entry:         json required
 
     occurred_at:   datetime required indexed @format("relative") @exportable
     recorded_at:   datetime @default("now") @exportable
@@ -91,7 +150,10 @@ schema AuditEvent {
                    @exportable
 
     sandboxed:     boolean default(true) @exportable
-    elapsed:       duration @exportable
+    // Milliseconds, lifted from the entry's `duration_ms`. An integer rather
+    // than a `duration` because the hook proto generator cannot carry a
+    // duration, and a hooked schema must be expressible on the wire.
+    elapsed_ms:    integer(min: 0) @exportable
 
     // The rule that fired, when one did.
     command_rule:  -> CommandRule
@@ -102,27 +164,38 @@ schema AuditEvent {
     detail:        json
 }
 
-// Per-session chain state, maintained by the control plane as entries arrive.
+// Per-trail chain state as the plane verified it, maintained by the audit
+// service as entries arrive. One chain per trail, not per session. The
+// operator token cannot touch this row: the install reports its own view on
+// AuditTrail, and the two disagreeing is the finding.
+//
 // Verification is a background job, not a read-path cost: `head_hash` and
-// `entry_count` say where the chain is, `verified_through` says how far it has
+// `head_seq` say where the chain is, `verified_through` says how far it has
 // been re-walked, and `integrity` says what the last walk found.
 @version(1)
 @tenant(parent: "Organization")
-@display("session_id")
+@display("trail_id")
 @access(
-    read:   ["team_lead", "auditor", "security_officer", "org_admin"],
-    write:  ["operator"],
+    read:   ["team_lead", "auditor", "security_officer", "org_admin", "audit_service"],
+    write:  ["audit_service"],
     delete: ["org_admin"]
 )
 @export(formats: [csv, ndjson], bundle_files: false, max_rows: 100000)
 schema AuditChain {
-    session_id:       text(max: 64) required unique indexed @exportable
-    session:          -> AgentSession required
+    trail_id:         text(max: 64) required unique indexed @exportable @list(primary)
+    trail:            -> AuditTrail required
     organization:     -> Organization required
     install:          -> AgentInstall required
 
+    // The sealing format of the entries on this chain. "acton-ai/1" is the
+    // only value for 1.0; it is here so a future format is a new value rather
+    // than a silent reinterpretation of old rows. Defaulted rather than bare
+    // required so a row the hook creates never fails on a field it did not
+    // think to send.
+    format:           text(max: 32) default("acton-ai/1") @exportable
+
     head_hash:        text(max: 128) required @exportable
-    entry_count:      integer(min: 0) default(0) @exportable
+    head_seq:         integer(min: 0) default(0) @exportable
     verified_through: integer(min: 0) default(0) @exportable
 
     integrity:        enum("unverified", "intact", "gap", "broken")

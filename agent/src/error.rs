@@ -44,6 +44,24 @@ pub enum GarrisonErrorKind {
         /// The identifier the client sent.
         thread_id: String,
     },
+    /// This install could not join, or could not confirm it had joined, the
+    /// control plane it is configured to answer to.
+    Enrollment {
+        /// What the plane said, or what stopped it being asked.
+        reason: String,
+    },
+    /// The session store could not answer.
+    ///
+    /// Its own kind because a store that cannot be reached is not a
+    /// configuration mistake and not a failed turn: it is the persistence a
+    /// session's survival depends on being unavailable right now, and every
+    /// caller of it has to fail closed rather than carry on unrecorded.
+    Store {
+        /// What was being attempted, e.g. `resolve` or `append`.
+        operation: String,
+        /// Why it could not be done.
+        reason: String,
+    },
     /// A turn could not be run to completion.
     TurnFailed {
         /// Why it failed.
@@ -68,6 +86,22 @@ pub enum GarrisonErrorKind {
     /// A write was refused before any bytes moved.
     PatchRejected {
         /// Why the safety assessment refused it.
+        reason: String,
+    },
+    /// An audit trail did not verify as a hash chain.
+    AuditChainBroken {
+        /// Where the walk stopped, and why.
+        reason: String,
+    },
+    /// An audit trail verifies but no longer ends where its anchor says it
+    /// ended: history was removed or rewritten.
+    ///
+    /// Its own kind, and its own exit code, because it is the one finding a
+    /// chain cannot make about itself — a prefix of a valid chain is a valid
+    /// chain — and a caller scripting `audit verify` needs to tell it apart
+    /// from a chain that simply does not hang together.
+    AuditAnchorMismatch {
+        /// What the comparison found.
         reason: String,
     },
 }
@@ -119,6 +153,23 @@ impl GarrisonError {
         })
     }
 
+    /// This install could not join the control plane.
+    #[must_use]
+    pub fn enrollment(reason: impl Into<String>) -> Self {
+        Self::new(GarrisonErrorKind::Enrollment {
+            reason: reason.into(),
+        })
+    }
+
+    /// The session store could not answer.
+    #[must_use]
+    pub fn store(operation: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::new(GarrisonErrorKind::Store {
+            operation: operation.into(),
+            reason: reason.into(),
+        })
+    }
+
     /// A turn could not be run to completion.
     #[must_use]
     pub fn turn_failed(reason: impl Into<String>) -> Self {
@@ -154,20 +205,64 @@ impl GarrisonError {
         })
     }
 
+    /// An audit trail did not verify as a hash chain.
+    #[must_use]
+    pub fn audit_chain_broken(reason: impl Into<String>) -> Self {
+        Self::new(GarrisonErrorKind::AuditChainBroken {
+            reason: reason.into(),
+        })
+    }
+
+    /// An audit trail no longer ends where its anchor says it ended.
+    #[must_use]
+    pub fn audit_anchor_mismatch(reason: impl Into<String>) -> Self {
+        Self::new(GarrisonErrorKind::AuditAnchorMismatch {
+            reason: reason.into(),
+        })
+    }
+
     /// Whether this is a configuration failure.
     #[must_use]
     pub const fn is_configuration(&self) -> bool {
         matches!(self.kind, GarrisonErrorKind::Configuration { .. })
     }
 
+    /// Whether a trail disagrees with the anchor that vouched for it.
+    #[must_use]
+    pub const fn is_audit_anchor_mismatch(&self) -> bool {
+        matches!(self.kind, GarrisonErrorKind::AuditAnchorMismatch { .. })
+    }
+
+    /// Whether this is an enrollment failure.
+    #[must_use]
+    pub const fn is_enrollment(&self) -> bool {
+        matches!(self.kind, GarrisonErrorKind::Enrollment { .. })
+    }
+
+    /// Whether the daemon refused to start, as opposed to failing while it ran.
+    ///
+    /// A configuration the daemon will not accept, or a control plane that
+    /// turned the install away, are decisions and not malfunctions: nothing
+    /// about restarting the process changes the answer. A supervisor that
+    /// sees this must stop and let an operator look, which is why `serve`
+    /// maps it to its own exit code and the systemd unit refuses to retry it.
+    #[must_use]
+    pub const fn is_refusal_to_start(&self) -> bool {
+        self.is_configuration() || self.is_enrollment()
+    }
+
     /// Whether this is a refusal rather than a malfunction.
     ///
-    /// A rejected patch is a decision the system made on purpose. Callers that
-    /// report failures to an operator should say so differently from the ones
-    /// that mean something broke.
+    /// A rejected patch and a trail that does not verify are both decisions
+    /// the system made on purpose. Callers that report failures to an
+    /// operator should say so differently from the ones that mean something
+    /// broke.
     #[must_use]
     pub const fn is_rejection(&self) -> bool {
-        matches!(self.kind, GarrisonErrorKind::PatchRejected { .. })
+        matches!(
+            self.kind,
+            GarrisonErrorKind::PatchRejected { .. } | GarrisonErrorKind::AuditChainBroken { .. }
+        )
     }
 }
 
@@ -181,8 +276,14 @@ impl fmt::Display for GarrisonError {
                 write!(f, "transport error on {endpoint}: {reason}")
             }
             GarrisonErrorKind::Runtime { reason } => write!(f, "runtime error: {reason}"),
+            GarrisonErrorKind::Enrollment { reason } => {
+                write!(f, "enrollment error: {reason}")
+            }
             GarrisonErrorKind::UnknownThread { thread_id } => {
                 write!(f, "no such thread: {thread_id}")
+            }
+            GarrisonErrorKind::Store { operation, reason } => {
+                write!(f, "the session store could not {operation}: {reason}")
             }
             GarrisonErrorKind::TurnFailed { reason } => write!(f, "turn failed: {reason}"),
             GarrisonErrorKind::PatchParse { line, reason } => {
@@ -193,6 +294,12 @@ impl fmt::Display for GarrisonError {
             }
             GarrisonErrorKind::PatchRejected { reason } => {
                 write!(f, "patch rejected: {reason}")
+            }
+            GarrisonErrorKind::AuditChainBroken { reason } => {
+                write!(f, "the audit trail does not verify: {reason}")
+            }
+            GarrisonErrorKind::AuditAnchorMismatch { reason } => {
+                write!(f, "the audit trail disagrees with its anchor: {reason}")
             }
         }
     }
@@ -210,6 +317,16 @@ mod tests {
         // system broke or whether it refused on purpose.
         assert!(GarrisonError::patch_rejected("outside the project root").is_rejection());
         assert!(!GarrisonError::runtime("provider unreachable").is_rejection());
+    }
+
+    #[test]
+    fn a_refusal_to_start_is_a_decision_not_a_crash() {
+        // Restarting cannot fix either of these; a supervisor must not try.
+        assert!(GarrisonError::configuration("audit.path", "locked").is_refusal_to_start());
+        assert!(GarrisonError::enrollment("token already spent").is_refusal_to_start());
+        assert!(GarrisonError::enrollment("token already spent").is_enrollment());
+        assert!(!GarrisonError::transport("/run/x.sock", "refused").is_refusal_to_start());
+        assert!(!GarrisonError::runtime("provider unreachable").is_refusal_to_start());
     }
 
     #[test]

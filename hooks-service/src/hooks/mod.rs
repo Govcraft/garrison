@@ -6,5 +6,7 @@
 //! markers if you want them to survive every regen.
 
 // SCHEMAFORGE_HOOKS_MODS_BEGIN — DO NOT REMOVE (additive insertion marker)
+pub mod audit_event;
+pub mod policy_bundle;
 pub mod redemption;
 // SCHEMAFORGE_HOOKS_MODS_END

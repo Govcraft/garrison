@@ -22,13 +22,16 @@ use garrison_agent::config::GarrisonConfig;
 use garrison_agent::launch;
 use garrison_agent::protocol::acp;
 use garrison_agent::protocol::jsonrpc::{self, Inbound, RequestId};
-use garrison_agent::protocol::server;
+use garrison_agent::protocol::server::{self, ServerSetup};
 use garrison_agent::thread::{DescribeThread, FindThread, ThreadLookup, ThreadSummary};
 use garrison_agent::types::ThreadId;
 use serde_json::json;
 use support::mock_llm::{MockServer, Round};
 
 use acton_ai::facade::ActonAI;
+use acton_ai::memory::{
+    CompactionConfig, CompactionThreshold, ContextWindow, ContextWindowConfig, KeepRecentTurns,
+};
 use acton_ai::policy::ToolPolicy;
 use acton_reactive::prelude::*;
 use std::path::PathBuf;
@@ -45,10 +48,33 @@ use tokio_util::sync::CancellationToken;
 struct Agent {
     runtime: ActorRuntime,
     supervisor: ActorHandle,
-    _conn: ActorHandle,
+    setup: ServerSetup,
+    _conns: Vec<ActorHandle>,
 }
 
 impl Agent {
+    /// Opens a second connection to the same running agent.
+    ///
+    /// Two clients, one daemon, one router. That is what makes "each session
+    /// heard only its own events" a claim about correlation rather than about
+    /// having quietly run two agents.
+    async fn connect_again(&mut self) -> AgentClient {
+        let (agent_side, client_side) =
+            UnixStream::pair().expect("a socket pair must be creatable");
+        let (read_half, write_half) = tokio::io::split(agent_side);
+        let conn = server::accept_split(
+            &mut self.runtime,
+            read_half,
+            write_half,
+            self.setup.clone(),
+            CancellationToken::new(),
+        )
+        .await;
+        self._conns.push(conn);
+
+        AgentClient::from_stream(client_side)
+    }
+
     /// Asks the supervisor for a session's actor.
     async fn find(&self, thread_id: &ThreadId) -> Option<ActorHandle> {
         self.supervisor
@@ -79,6 +105,17 @@ fn rooted_config(timeout_secs: u64, root: PathBuf) -> GarrisonConfig {
     config.approval.timeout_secs = timeout_secs;
     config.approval.auto_approve.clear();
     config.threads.project_root = Some(root);
+    config
+}
+
+/// A config that auto-approves the named tools and nothing else.
+///
+/// `update_plan` writes nothing and is declared idempotent upstream, so a
+/// planning test that made it a permission round-trip would be testing the
+/// approval gate rather than the plan.
+fn approving_config(tools: &[&str]) -> GarrisonConfig {
+    let mut config = strict_config(300);
+    config.approval.auto_approve = tools.iter().map(|name| (*name).to_string()).collect();
     config
 }
 
@@ -123,14 +160,60 @@ fn project_root() -> PathBuf {
     std::env::current_dir().expect("a test process must have a working directory")
 }
 
+/// What a test asks of the acton-ai runtime itself, as opposed to what it
+/// asks of a session.
+///
+/// Garrison never sets either of these in code: both come from the operator's
+/// `acton-ai.toml`. A test names them here for the same reason the operator
+/// names them there, and the default is the shipped one, which is no
+/// compaction at all.
+#[derive(Default)]
+struct Runtime {
+    compaction: Option<CompactionConfig>,
+    window: Option<ContextWindow>,
+}
+
+impl Runtime {
+    /// A runtime that compacts as soon as the history passes `threshold` of a
+    /// `max_tokens` budget, keeping the last turn verbatim.
+    fn compacting(max_tokens: usize, threshold: f64) -> Self {
+        Self {
+            compaction: Some(
+                CompactionConfig::new()
+                    .with_threshold(CompactionThreshold::new(threshold).expect("a legal threshold"))
+                    .with_keep_recent_turns(KeepRecentTurns::new(1).expect("a legal count")),
+            ),
+            window: Some(ContextWindow::new(
+                ContextWindowConfig::with_max_tokens(max_tokens).with_reserved_for_response(0),
+            )),
+        }
+    }
+}
+
 /// Brings up the whole agent over a socket pair and returns a connected
 /// client.
 async fn connect(base_url: &str, config: &GarrisonConfig) -> (Agent, AgentClient) {
-    let ai = ActonAI::builder()
+    connect_with(base_url, config, Runtime::default()).await
+}
+
+/// The same, with the runtime knobs an operator would have set in TOML.
+async fn connect_with(
+    base_url: &str,
+    config: &GarrisonConfig,
+    runtime_shape: Runtime,
+) -> (Agent, AgentClient) {
+    let mut builder = ActonAI::builder()
         .app_name("garrison-agent-test")
-        .with_builtin_tools(&["calculate"])
+        .with_builtin_tools(&["calculate", "update_plan"])
         .ollama_at(base_url, "test-model")
-        .tool_policy(ToolPolicy::new().on_approval(approval::approval_hook))
+        .tool_policy(ToolPolicy::new().on_approval(approval::approval_hook));
+    if let Some(compaction) = runtime_shape.compaction {
+        builder = builder.compaction(compaction);
+    }
+    if let Some(window) = runtime_shape.window {
+        builder = builder.context_window(window);
+    }
+    let ai = builder
         .launch()
         .await
         .expect("the test runtime must launch");
@@ -140,6 +223,7 @@ async fn connect(base_url: &str, config: &GarrisonConfig) -> (Agent, AgentClient
         .await
         .expect("the test setup must build");
     let supervisor = setup.supervisor.clone();
+    let setup_for_more = setup.clone();
     let mut runtime = ai.runtime().clone();
 
     let (agent_side, client_side) = UnixStream::pair().expect("a socket pair must be creatable");
@@ -157,7 +241,8 @@ async fn connect(base_url: &str, config: &GarrisonConfig) -> (Agent, AgentClient
         Agent {
             runtime,
             supervisor,
-            _conn: conn,
+            setup: setup_for_more,
+            _conns: vec![conn],
         },
         AgentClient::from_stream(client_side),
     )
@@ -189,6 +274,10 @@ struct Scripted {
     text: String,
     asked: Vec<String>,
     tool_calls: Vec<(String, acp::ToolCallStatus)>,
+    /// Every `plan` update, as the session it named and the steps it carried.
+    plans: Vec<(String, Vec<String>)>,
+    /// The parameters of every `_garrison/` notification, by method.
+    extensions: Vec<(String, serde_json::Value)>,
 }
 
 impl Scripted {
@@ -198,7 +287,18 @@ impl Scripted {
             text: String::new(),
             asked: Vec::new(),
             tool_calls: Vec::new(),
+            plans: Vec::new(),
+            extensions: Vec::new(),
         }
+    }
+
+    /// Every `_garrison/session/compacted` this client was sent.
+    fn compactions(&self) -> Vec<&serde_json::Value> {
+        self.extensions
+            .iter()
+            .filter(|(method, _)| method == acp::ext::SESSION_COMPACTED)
+            .map(|(_, params)| params)
+            .collect()
     }
 }
 
@@ -217,8 +317,22 @@ impl Interactions for Scripted {
                         .push((update.tool_call_id.0.to_string(), status));
                 }
             }
+            acp::SessionUpdate::Plan(plan) => self.plans.push((
+                notification.session_id.0.to_string(),
+                plan.entries
+                    .iter()
+                    .map(|entry| entry.content.clone())
+                    .collect(),
+            )),
             _ => {}
         }
+    }
+
+    fn extension(&mut self, method: &str, params: Option<&serde_json::Value>) {
+        self.extensions.push((
+            method.to_string(),
+            params.cloned().unwrap_or(serde_json::Value::Null),
+        ));
     }
 
     fn permission(
@@ -830,6 +944,327 @@ async fn a_patch_reaching_outside_the_root_is_refused_without_asking_anybody() {
         "the refusal must reach the client as a failed tool call: {:?}",
         watcher.tool_calls,
     );
+
+    agent.shutdown().await;
+}
+
+// =============================================================================
+// Plans
+// =============================================================================
+
+/// The `update_plan` call a scripted model makes, with its own step titles.
+fn plan_call(id: &str, first: &str, second: &str, note: &str) -> Round {
+    Round::tool_call(
+        id,
+        "update_plan",
+        json!({
+            "steps": [
+                {"title": first, "status": "in_progress"},
+                {"title": second, "status": "pending"},
+            ],
+            "note": note,
+        }),
+    )
+}
+
+/// The Garrison object inside a response's `_meta`.
+fn garrison_meta(response: &acp::PromptResponse) -> serde_json::Value {
+    response
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get(acp::ext::META_KEY))
+        .cloned()
+        .expect("a completed turn carries Garrison metadata")
+}
+
+#[tokio::test]
+async fn a_plan_reaches_the_client_and_the_response_repeats_it() {
+    let server = MockServer::start(vec![
+        plan_call("call-1", "read the parser", "fix the parser", "two passes"),
+        Round::text("Done.").with_usage(11, 7),
+    ])
+    .await;
+    let (agent, mut client) = connect(server.base_url(), &approving_config(&["update_plan"])).await;
+    let session_id = open_session(&mut client).await;
+
+    let mut watcher = Scripted::answering(acp::OPTION_REJECT);
+    let response = client
+        .prompt(session_id.clone(), "plan the work", &mut watcher)
+        .await
+        .expect("the turn must complete");
+
+    assert_eq!(
+        watcher.plans,
+        vec![(
+            session_id.0.to_string(),
+            vec!["read the parser".to_string(), "fix the parser".to_string()],
+        )],
+        "the plan reaches the client as a spec-native plan naming its session",
+    );
+
+    let garrison = garrison_meta(&response);
+    assert_eq!(garrison["plan"]["total"], 2);
+    assert_eq!(garrison["plan"]["completed"], 0);
+    assert_eq!(garrison["plan"]["steps"][0]["status"], "in_progress");
+    assert_eq!(garrison["plan"]["note"], "two passes");
+    assert!(
+        garrison["compactions"].is_null(),
+        "a turn that compacted nothing says nothing about compaction",
+    );
+    assert!(
+        watcher.extensions.is_empty(),
+        "nothing in the Garrison namespace happened: {:?}",
+        watcher.extensions,
+    );
+
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn two_sessions_at_once_each_hear_only_their_own_plan() {
+    let server = MockServer::start_keyed(vec![
+        (
+            "alpha",
+            vec![
+                plan_call("alpha-1", "survey alpha", "repair alpha", "the first plan"),
+                Round::tool_call("alpha-2", "calculate", json!({"expression": "1 + 1"})),
+                Round::text("Alpha is done."),
+            ],
+        ),
+        (
+            "bravo",
+            vec![
+                plan_call("bravo-1", "survey bravo", "repair bravo", "the second plan"),
+                Round::tool_call("bravo-2", "calculate", json!({"expression": "2 + 2"})),
+                Round::text("Bravo is done."),
+            ],
+        ),
+    ])
+    .await;
+    let config = approving_config(&["update_plan", "calculate"]);
+    let (mut agent, mut first) = connect(server.base_url(), &config).await;
+    let mut second = agent.connect_again().await;
+
+    let alpha = open_session(&mut first).await;
+    let bravo = open_session(&mut second).await;
+
+    let mut alpha_watcher = Scripted::answering(acp::OPTION_REJECT);
+    let mut bravo_watcher = Scripted::answering(acp::OPTION_REJECT);
+    let (alpha_response, bravo_response) = tokio::join!(
+        first.prompt(alpha.clone(), "work on alpha", &mut alpha_watcher),
+        second.prompt(bravo.clone(), "work on bravo", &mut bravo_watcher),
+    );
+
+    let alpha_response = alpha_response.expect("the first turn must complete");
+    let bravo_response = bravo_response.expect("the second turn must complete");
+
+    assert_eq!(
+        alpha_watcher.plans,
+        vec![(
+            alpha.0.to_string(),
+            vec!["survey alpha".to_string(), "repair alpha".to_string()],
+        )],
+        "the first session heard its own plan and only its own",
+    );
+    assert_eq!(
+        bravo_watcher.plans,
+        vec![(
+            bravo.0.to_string(),
+            vec!["survey bravo".to_string(), "repair bravo".to_string()],
+        )],
+        "the second session heard its own plan and only its own",
+    );
+
+    assert_eq!(alpha_watcher.text, "Alpha is done.");
+    assert_eq!(bravo_watcher.text, "Bravo is done.");
+    assert_eq!(
+        garrison_meta(&alpha_response)["plan"]["steps"][0]["title"],
+        "survey alpha"
+    );
+    assert_eq!(
+        garrison_meta(&bravo_response)["plan"]["steps"][0]["title"],
+        "survey bravo"
+    );
+
+    agent.shutdown().await;
+}
+
+// =============================================================================
+// Compaction
+// =============================================================================
+
+/// A message long enough to matter to a small window.
+///
+/// The estimator counts characters, so a history that should cost something
+/// has to actually be long. `needle` is what the test looks for afterwards to
+/// prove the message was elided rather than resent.
+fn long_text(needle: &str) -> String {
+    format!("{needle} {}", "context ".repeat(100))
+}
+
+/// The two prompts a compaction test sends.
+///
+/// The first is long and the second is short, which is what puts the history
+/// over the trigger on the second turn and back under it afterwards: one
+/// compaction, at a moment the test can name.
+fn long_then_short() -> (String, &'static str) {
+    (long_text("zebra"), "and then?")
+}
+
+/// The session actor behind a session id.
+async fn thread_of(agent: &Agent, session_id: &acp::SessionId) -> ActorHandle {
+    let thread_id = acp::thread_id(session_id).expect("a Garrison session id");
+    agent
+        .find(&thread_id)
+        .await
+        .expect("the session must still exist")
+}
+
+/// How many messages a session is holding.
+async fn message_count(agent: &Agent, session_id: &acp::SessionId) -> usize {
+    let summary: ThreadSummary = thread_of(agent, session_id)
+        .await
+        .ask(DescribeThread)
+        .await
+        .expect("the session actor must answer");
+    summary.message_count
+}
+
+#[tokio::test]
+async fn a_compaction_is_announced_and_adopted_into_the_history() {
+    let (first_prompt, second_prompt) = long_then_short();
+    let server = MockServer::start(vec![
+        Round::text(&long_text("crossing")),
+        Round::text("The earlier exchange is recorded."),
+        Round::text("Understood."),
+        Round::text("Still here."),
+    ])
+    .await;
+    let (agent, mut client) = connect_with(
+        server.base_url(),
+        &strict_config(300),
+        Runtime::compacting(400, 0.5),
+    )
+    .await;
+    let session_id = open_session(&mut client).await;
+
+    let mut watcher = Scripted::answering(acp::OPTION_REJECT);
+    client
+        .prompt(session_id.clone(), &first_prompt, &mut watcher)
+        .await
+        .expect("the first turn must complete");
+    assert!(
+        watcher.compactions().is_empty(),
+        "one exchange is not enough history to compact",
+    );
+
+    let mut watcher = Scripted::answering(acp::OPTION_REJECT);
+    let response = client
+        .prompt(session_id.clone(), second_prompt, &mut watcher)
+        .await
+        .expect("the second turn must complete");
+
+    let notices = watcher.compactions();
+    assert_eq!(notices.len(), 1, "exactly one pass: {notices:?}");
+    assert_eq!(notices[0]["sessionId"], session_id.0.to_string());
+    assert_eq!(notices[0]["messagesElided"], 2);
+    assert!(
+        notices[0]["tokensAfter"].as_u64() < notices[0]["tokensBefore"].as_u64(),
+        "a pass that did not shrink anything is not worth announcing: {:?}",
+        notices[0],
+    );
+
+    let garrison = garrison_meta(&response);
+    assert_eq!(garrison["compactions"][0]["messagesElided"], 2);
+    assert_eq!(garrison["compactions"][0]["elidedPrefixLen"], 2);
+    assert!(
+        garrison["compactions"][0]["summary"].is_null(),
+        "the summary text belongs in the history, not in every response",
+    );
+
+    // Two exchanges' worth of messages would be four. The elided prefix was
+    // replaced by one summary, so the session keeps three.
+    assert_eq!(message_count(&agent, &session_id).await, 3);
+
+    // The adopted history is what the next turn is built from: the summary
+    // travels, and what it replaced does not.
+    let mut watcher = Scripted::answering(acp::OPTION_REJECT);
+    client
+        .prompt(session_id.clone(), "still there?", &mut watcher)
+        .await
+        .expect("the third turn must complete");
+
+    let sent = server.requests();
+    let last = sent.last().expect("the model was asked something");
+    let messages = last["messages"].to_string();
+    assert!(
+        messages.contains("[conversation compacted]"),
+        "the summary must reach the model: {messages}",
+    );
+    assert!(
+        !messages.contains("zebra"),
+        "an elided message must not be sent again: {messages}",
+    );
+
+    let status: acp::GarrisonStatus = client
+        .request(acp::ext::STATUS, &json!({}), &mut Quiet)
+        .await
+        .expect("the status must answer");
+    let context = status
+        .context
+        .expect("a compacting daemon reports its policy");
+    assert_eq!(context.compactions, 1);
+    assert_eq!(
+        context.compaction.map(|policy| policy.keep_recent_turns),
+        Some(1),
+    );
+
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn without_a_policy_nothing_is_summarized_and_nothing_is_announced() {
+    let (first_prompt, second_prompt) = long_then_short();
+    let server = MockServer::start(vec![
+        Round::text(&long_text("crossing")),
+        Round::text("Understood."),
+    ])
+    .await;
+    let (agent, mut client) = connect(server.base_url(), &strict_config(300)).await;
+    let session_id = open_session(&mut client).await;
+
+    let mut watcher = Scripted::answering(acp::OPTION_REJECT);
+    client
+        .prompt(session_id.clone(), &first_prompt, &mut watcher)
+        .await
+        .expect("the first turn must complete");
+
+    let mut watcher = Scripted::answering(acp::OPTION_REJECT);
+    let response = client
+        .prompt(session_id.clone(), second_prompt, &mut watcher)
+        .await
+        .expect("the second turn must complete");
+
+    assert!(watcher.compactions().is_empty());
+    assert!(garrison_meta(&response)["compactions"].is_null());
+    assert_eq!(
+        server.request_count(),
+        2,
+        "a runtime with no policy never pays for a summary",
+    );
+    assert_eq!(
+        message_count(&agent, &session_id).await,
+        4,
+        "every message is still there",
+    );
+
+    let status: acp::GarrisonStatus = client
+        .request(acp::ext::STATUS, &json!({}), &mut Quiet)
+        .await
+        .expect("the status must answer");
+    let context = status.context.expect("the context part is always reported");
+    assert!(context.compaction.is_none(), "no policy is in force");
+    assert_eq!(context.compactions, 0);
 
     agent.shutdown().await;
 }

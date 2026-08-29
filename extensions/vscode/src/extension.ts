@@ -102,12 +102,16 @@ class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
   private async ensureConnected(): Promise<void> {
     if (this.client) return;
     const config = vscode.workspace.getConfiguration("garrison");
+    // `garrison-agent acp` is a relay to the per-user daemon, not an engine:
+    // the flags only tell it where the socket is. The daemon's own
+    // configuration governs every session, which is why there is no
+    // acton-ai config setting here.
     const command = config.get<string>("agentPath", "garrison-agent");
     const args: string[] = [];
+    const socket = config.get<string>("socket", "");
     const configPath = config.get<string>("configPath", "");
-    const actonConfigPath = config.get<string>("actonConfigPath", "");
+    if (socket) args.push("--socket", socket);
     if (configPath) args.push("--config", configPath);
-    if (actonConfigPath) args.push("--acton-config", actonConfigPath);
     const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
     const client = new AcpClient(line => this.output.info(line));
     this.client = client;

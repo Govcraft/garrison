@@ -12,13 +12,14 @@
 //! wire conventions every acton-service speaks: the `{error, code, status}`
 //! body shape, the versioned `{base}/{v1}` route layout, bearer auth, the
 //! request-tracking headers, and which statuses are worth retrying. What is
-//! left here is the part that is genuinely SchemaForge's — the `forge/schemas`
-//! route shape, the `{"fields": …}` envelope, and the two row types this
-//! service reads.
+//! left here is the part that is genuinely SchemaForge's: the `forge/schemas`
+//! route shape, the `{"fields": …}` envelope, and the row types this service
+//! reads.
 //!
-//! The credential it holds is scoped by the `enrollment_service` role, which
-//! appears in exactly four `@access` lists: AgentInstall and InstallCredential
-//! writes, EnrollmentToken reads and writes, Operator reads.
+//! Two bearers use this client. The enrollment hook holds one scoped by the
+//! `enrollment_service` role, and the directory sync holds one scoped by
+//! `directory_service`. Each `Plane` value carries exactly one, so the sync
+//! cannot spend the enrollment grant and the hook cannot spend the sync's.
 
 use std::collections::BTreeMap;
 
@@ -26,10 +27,14 @@ use acton_service_client::{ApiVersion, ClientError, ServiceClient};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+/// Rows fetched per page when listing. The plane caps a query at a few
+/// hundred; this stays under it and pages until a short page arrives.
+const PAGE: usize = 200;
+
 /// Everything that can go wrong between here and the plane.
 #[derive(Debug)]
 pub enum PlaneError {
-    /// Transport, status, or decode — the framework client's own taxonomy.
+    /// Transport, status, or decode: the framework client's own taxonomy.
     Client(ClientError),
     /// The plane answered with a shape this client does not understand.
     ///
@@ -81,18 +86,113 @@ pub struct EnrollmentTokenRow {
     pub first_redeemed_at: Option<String>,
 }
 
-/// The subset of an `Operator` row needed to bind an install to a person.
+/// The subset of an `Operator` row the hook and the sync both read.
 ///
-/// The organization is deliberately absent: it comes from the token, which the
+/// `organization` is read for the freshness check at enrollment and nothing
+/// else: the tenant an install joins still comes from the token, which the
 /// plane issued, not from the row, which a UPN lookup reached.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct OperatorRow {
     pub id: String,
+    pub upn: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub entra_object_id: Option<String>,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub organization: Option<String>,
+}
+
+/// The subset of an `Organization` row the sync drives and the hook checks.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct OrganizationRow {
+    pub id: String,
+    pub slug: String,
+    #[serde(default)]
+    pub entra_tenant_id: Option<String>,
+    #[serde(default)]
+    pub entra_group_id: Option<String>,
+    #[serde(default)]
+    pub directory_synced_at: Option<String>,
+    #[serde(default)]
+    pub directory_sync_status: Option<String>,
+    #[serde(default = "yes")]
+    pub active: bool,
+}
+
+/// A console login, in the fields the sync follows.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct UserRow {
+    pub id: String,
+    pub email: String,
+    #[serde(default)]
+    pub roles: Vec<String>,
+    #[serde(default = "yes")]
+    pub active: bool,
+    #[serde(default)]
+    pub entra_object_id: Option<String>,
+    #[serde(default)]
+    pub org_slug: Option<String>,
+}
+
+/// A seat, in the fields needed to revoke it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SeatRow {
+    pub id: String,
+    pub operator: String,
+    #[serde(default)]
+    pub status: String,
+}
+
+/// The standing identity a daemon presents, in the fields the install-token
+/// exchange reads.
+///
+/// `install` and `organization` are relation columns and arrive as the
+/// related row's id, which is exactly what the exchange needs: the identity
+/// it is about to mint a bearer for.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct InstallCredentialRow {
+    pub id: String,
+    pub credential_id: String,
+    pub install: String,
+    pub organization: String,
+    pub credential_kind: String,
+    pub public_key: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub use_count: i64,
+}
+
+/// One daemon in the fleet, in the fields that decide whether it may still
+/// authenticate.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AgentInstallRow {
+    pub id: String,
+    pub install_id: String,
+    pub organization: String,
+    #[serde(default)]
+    pub status: String,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// A bearer-authenticated client for one control plane.
+#[derive(Clone)]
 pub struct Plane {
     http: ServiceClient,
+}
+
+impl std::fmt::Debug for Plane {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Plane").finish_non_exhaustive()
+    }
 }
 
 impl Plane {
@@ -140,15 +240,52 @@ impl Plane {
     /// The bearer's own tenant scope is applied by the plane, so this cannot
     /// reach an operator in another organization even if the UPN collides.
     pub async fn operator_by_upn(&self, upn: &str) -> Result<Option<OperatorRow>, PlaneError> {
-        let value: Value = self
-            .http
-            .post("forge/schemas/Operator/entities/query", &equals("upn", upn))
-            .await?;
-        let mut rows = entities_of(&value)?;
-        if rows.is_empty() {
-            return Ok(None);
-        }
-        one_row(rows.remove(0), "Operator")
+        self.first("Operator", &equals("upn", upn)).await
+    }
+
+    /// Fetch one operator by row id.
+    pub async fn operator_by_id(&self, id: &str) -> Result<Option<OperatorRow>, PlaneError> {
+        self.get("Operator", id).await
+    }
+
+    /// Fetch one organization by row id.
+    pub async fn organization_by_id(
+        &self,
+        id: &str,
+    ) -> Result<Option<OrganizationRow>, PlaneError> {
+        self.get("Organization", id).await
+    }
+
+    /// Every operator of one organization.
+    pub async fn operators_of(&self, organization: &str) -> Result<Vec<OperatorRow>, PlaneError> {
+        self.list_all("Operator", Some(("organization", organization)))
+            .await
+    }
+
+    /// Every console login the bearer can see.
+    pub async fn users(&self) -> Result<Vec<UserRow>, PlaneError> {
+        self.list_all("User", None).await
+    }
+
+    /// Every seat held by one operator.
+    pub async fn seats_of(&self, operator: &str) -> Result<Vec<SeatRow>, PlaneError> {
+        self.list_all("Seat", Some(("operator", operator))).await
+    }
+
+    /// Fetch one install credential by row id.
+    ///
+    /// `None` covers both "no such row" and "this bearer may not see it",
+    /// which for the exchange are the same refusal: an unknown credential.
+    pub async fn install_credential(
+        &self,
+        id: &str,
+    ) -> Result<Option<InstallCredentialRow>, PlaneError> {
+        self.get("InstallCredential", id).await
+    }
+
+    /// Fetch one install by row id.
+    pub async fn agent_install(&self, id: &str) -> Result<Option<AgentInstallRow>, PlaneError> {
+        self.get("AgentInstall", id).await
     }
 
     /// Create an entity and return its new id.
@@ -187,6 +324,76 @@ impl Plane {
             .await?;
         Ok(())
     }
+
+    async fn first<T: serde::de::DeserializeOwned>(
+        &self,
+        schema: &str,
+        query: &Value,
+    ) -> Result<Option<T>, PlaneError> {
+        let value: Value = self
+            .http
+            .post(format!("forge/schemas/{schema}/entities/query"), query)
+            .await?;
+        let mut rows = entities_of(&value)?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        one_row(rows.remove(0), schema)
+    }
+
+    /// A single entity by id; `None` when the plane says it does not exist or
+    /// the bearer may not see it, which from here are the same thing.
+    async fn get<T: serde::de::DeserializeOwned>(
+        &self,
+        schema: &str,
+        id: &str,
+    ) -> Result<Option<T>, PlaneError> {
+        let result: Result<Value, ClientError> = self
+            .http
+            .get(format!("forge/schemas/{schema}/entities/{id}"))
+            .await;
+        match result {
+            Ok(value) => one_row(value, schema),
+            Err(e) if is_not_found(&e) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Every row matching `filter`, paged until a short page.
+    async fn list_all<T: serde::de::DeserializeOwned>(
+        &self,
+        schema: &str,
+        filter: Option<(&str, &str)>,
+    ) -> Result<Vec<T>, PlaneError> {
+        let mut rows = Vec::new();
+        let mut offset = 0;
+        loop {
+            let value: Value = self
+                .http
+                .post(
+                    format!("forge/schemas/{schema}/entities/query"),
+                    &page_query(filter, PAGE, offset),
+                )
+                .await?;
+            let page = entities_of(&value)?;
+            let got = page.len();
+            for row in page {
+                if let Some(parsed) = one_row(row, schema)? {
+                    rows.push(parsed);
+                }
+            }
+            if got < PAGE {
+                return Ok(rows);
+            }
+            offset += got;
+        }
+    }
+}
+
+fn is_not_found(error: &ClientError) -> bool {
+    error
+        .as_api()
+        .is_some_and(|api| api.status().as_u16() == 404)
 }
 
 /// A single-field equality query body.
@@ -198,6 +405,18 @@ fn equals(field: &str, value: &str) -> Value {
         "filter": { "field": field, "op": "eq", "value": value },
         "limit": 2
     })
+}
+
+/// One page of a listing, optionally narrowed by one equality.
+fn page_query(filter: Option<(&str, &str)>, limit: usize, offset: usize) -> Value {
+    match filter {
+        Some((field, value)) => json!({
+            "filter": { "field": field, "op": "eq", "value": value },
+            "limit": limit,
+            "offset": offset
+        }),
+        None => json!({ "limit": limit, "offset": offset }),
+    }
 }
 
 /// Deserialize one row, naming the schema in any failure.
@@ -287,15 +506,42 @@ mod tests {
     }
 
     #[test]
+    fn a_page_query_carries_its_offset_and_optional_filter() {
+        let narrowed = page_query(Some(("operator", "op_1")), 200, 400);
+        assert_eq!(narrowed["offset"], json!(400));
+        assert_eq!(narrowed["filter"]["field"], json!("operator"));
+        let whole = page_query(None, 200, 0);
+        assert!(whole.get("filter").is_none());
+    }
+
+    #[test]
     fn an_envelope_is_folded_flat_with_its_id_alongside_the_fields() {
         let row = json!({
             "id": "operator_01",
             "schema": "Operator",
-            "fields": { "upn": "dev@agency.gov" },
+            "fields": { "upn": "dev@agency.gov", "display_name": "Dev", "status": "active" },
             "permissions": { "update": true }
         });
         let parsed: OperatorRow = one_row(row, "Operator").unwrap().unwrap();
         assert_eq!(parsed.id, "operator_01");
+        assert_eq!(parsed.upn, "dev@agency.gov");
+        assert_eq!(parsed.entra_object_id, None);
+    }
+
+    #[test]
+    fn a_hand_typed_operator_reads_with_its_optional_fields_absent() {
+        let row = json!({ "id": "operator_01", "upn": "dev@agency.gov" });
+        let parsed: OperatorRow = one_row(row, "Operator").unwrap().unwrap();
+        assert_eq!(parsed.status, "");
+        assert_eq!(parsed.organization, None);
+    }
+
+    #[test]
+    fn a_user_row_defaults_to_active_with_no_roles() {
+        let row = json!({ "id": "user_01", "email": "a@x.gov" });
+        let parsed: UserRow = one_row(row, "User").unwrap().unwrap();
+        assert!(parsed.active);
+        assert!(parsed.roles.is_empty());
     }
 
     #[test]

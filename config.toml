@@ -44,30 +44,50 @@ issuer   = "garrison-control-plane"
 # `Forge::Principal` so hand-written policies in policies/custom/ can compare
 # e.g. `principal.entra_object_id` against a resource field. The `source =
 # { user_field = "..." }` form reads the column off the console User row at
-# every login and refresh, which means it requires those columns to exist on
-# the system User schema first. Left commented until the operator extends User
-# — an unresolvable source aborts startup, and that is the correct failure.
+# every login and refresh; the columns come from `schemas/user.schema`, the
+# deployment's override of the system User schema. Startup validates that
+# both sources exist, so `task plane:apply` must run before the plane boots
+# with this section enabled. That is the intended failure.
 #
-# [schema_forge.authz.principal_claims.entra_object_id]
-# type     = "string"
-# required = true
-# source   = { user_field = "entra_object_id" }
-#
-# [schema_forge.authz.principal_claims.org_slug]
-# type     = "string"
-# required = true
-# source   = { user_field = "org_slug" }
-#
+# `required = false` on both, and this is not a softening. `required` is
+# enforced against every bearer the plane accepts, not only console logins:
+# the `enrollee` artifact a daemon redeems and the service bearers minted with
+# `schemaforge token generate` carry no `entra_object_id`, and `required =
+# true` would 401 every enrollment and every hook call. The claim is still
+# projected for every console login that has one, and the policies that care
+# (policies/custom/directory-identity.cedar) test `principal has
+# entra_object_id` and refuse when it is absent. Fail-closed is on the policy,
+# not on the token.
+[schema_forge.authz.principal_claims.entra_object_id]
+type     = "string"
+required = false
+source   = { user_field = "entra_object_id" }
+
+[schema_forge.authz.principal_claims.org_slug]
+type     = "string"
+required = false
+source   = { user_field = "org_slug" }
+
 # Mappings are read at startup only. Changing them needs a daemon restart.
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Lifecycle hooks.
 #
-# One binding, and it is the enrollment decision. Creating a Redemption is the
-# only way a machine joins the fleet, and `before_validate` is where the token
-# is adjudicated and the install and its credential are provisioned. The hook
-# service is `hooks-service/` in this repo; run it with `task hooks:serve`.
+# Three bindings, all `before_validate`, all served by `hooks-service/` in this
+# repo (`task hooks:serve`), all `required = true`:
+#
+#   Redemption    the enrollment decision. Creating a Redemption is the only
+#                 way a machine joins the fleet; the hook adjudicates the token
+#                 and provisions the install and its credential.
+#   AuditEvent    the verifying ingest. The hook re-links the shipped entry
+#                 against the trail's AuditChain and refuses forks and edits.
+#   PolicyBundle  the publish gate. The hook self-tests the rules and stamps
+#                 the checksum when a bundle moves to `published`.
+#
+# The hook names are `{Schema}Hooks.BeforeValidate`, which is what
+# `schemaforge hooks generate` writes into `hooks_descriptor.bin`; the plane
+# validates every binding against that descriptor at startup.
 [schema_forge.hooks]
 enabled              = true
 default_timeout_ms   = 15000
@@ -92,5 +112,27 @@ timeout_ms = 15000
 # the request is the only honest outcome.
 required = true
 
+descriptor_path = "./hooks-service/hooks_descriptor.bin"
+
+# With `false`, an unreachable hook would persist an entry nobody verified and
+# advance nothing; the daemon would take the 201 as an ack and drop it from its
+# backlog. A 503 is what makes the daemon keep the entry and retry.
+[[schema_forge.hooks.bindings]]
+schema          = "AuditEvent"
+event           = "BeforeValidate"
+endpoint        = "http://127.0.0.1:9391"
+timeout_ms      = 15000
+required        = true
+descriptor_path = "./hooks-service/hooks_descriptor.bin"
+
+# With `false`, a bundle could move to `published` with an empty checksum and
+# untested rules, and every install would refuse it on pull for a reason the
+# console never saw. Refusing the publish is the honest outcome.
+[[schema_forge.hooks.bindings]]
+schema          = "PolicyBundle"
+event           = "BeforeValidate"
+endpoint        = "http://127.0.0.1:9391"
+timeout_ms      = 15000
+required        = true
 descriptor_path = "./hooks-service/hooks_descriptor.bin"
 # ---------------------------------------------------------------------------

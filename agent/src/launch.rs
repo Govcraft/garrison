@@ -13,9 +13,11 @@
 
 use crate::approval::approval_hook;
 use crate::config::GarrisonConfig;
+use crate::enrollment::key::InstallKey;
 use crate::error::GarrisonError;
+use crate::plane::session::{Identity, PlaneSession};
 use crate::protocol::acp::{
-    AgentCapabilities, PromptCapabilities, SandboxStatus, SessionCapabilities,
+    AgentCapabilities, CompactionStatus, PromptCapabilities, SandboxStatus, SessionCapabilities,
     SessionListCapabilities,
 };
 use crate::protocol::conn::ThreadDefaults;
@@ -24,6 +26,7 @@ use crate::protocol::transport::{Listener, UnixListener};
 use crate::router::TurnRouter;
 use crate::thread::ThreadSupervisor;
 use acton_ai::facade::ActonAI;
+use acton_ai::memory::CompactionConfig;
 use acton_ai::policy::ToolPolicy;
 use acton_ai::tools::sandbox::{HardeningMode, ProcessSandboxConfig};
 use acton_reactive::prelude::*;
@@ -109,7 +112,9 @@ pub async fn build_ai(acton_config: Option<&Path>) -> Result<ActonAI, GarrisonEr
         .tool_policy(ToolPolicy::new().on_approval(approval_hook))
         .launch()
         .await
-        .map_err(|error| GarrisonError::configuration("acton-ai", error.to_string()))?;
+        .map_err(|error| {
+            GarrisonError::configuration("acton-ai", launch_refusal(&error.to_string()))
+        })?;
 
     if ai.provider_count() == 0 {
         return Err(GarrisonError::configuration(
@@ -119,6 +124,28 @@ pub async fn build_ai(acton_config: Option<&Path>) -> Result<ActonAI, GarrisonEr
     }
 
     Ok(ai)
+}
+
+/// Rewrites acton-ai's launch failure into something an operator can act on.
+///
+/// The one case that matters is the audit trail already being owned by
+/// another process: acton-ai refuses to spawn a second writer of a hash chain
+/// (an exclusive advisory lock on the trail), and the reason is almost always
+/// that a `garrison-agent serve` is already running for this user. The
+/// message says so and names the two ways out. Everything else passes
+/// through unchanged. Pure.
+fn launch_refusal(message: &str) -> String {
+    if message.contains("already owned by another process") {
+        format!(
+            "{message}. There is one daemon per user per machine and it owns the audit trail; \
+             another `garrison-agent serve` is most likely running (check `garrison-agent ping` \
+             or `systemctl --user status garrison-agent`). Stop it, or point this one at a \
+             different trail. This is a refusal to start (exit 2), not a crash: restarting \
+             will not change the answer"
+        )
+    } else {
+        message.to_string()
+    }
 }
 
 /// Refuses to launch when the default provider needs an API key it lacks.
@@ -169,6 +196,14 @@ fn api_key_preflight(config: &acton_ai::config::ActonAIConfig) -> Result<(), Gar
 /// why this function takes the runtime out of the `ActonAI` rather than
 /// accepting one — there is no way to hand it the wrong one.
 ///
+/// # One actor per `spawn_*`
+///
+/// The body is a list of small spawns, each returning the handle it made,
+/// followed by the assembly. A subsystem that joins the daemon adds one
+/// `spawn_*` function, one line here, and pushes its handle onto `gates`
+/// (if it decides turns) or `describers` (if it reports status), or both.
+/// Nothing else in this function changes.
+///
 /// # Errors
 ///
 /// [`GarrisonErrorKind::Runtime`](crate::error::GarrisonErrorKind::Runtime)
@@ -182,51 +217,256 @@ pub async fn build_setup(
     // broker. `runtime_mut()` would instead demand the only `ActonAI` handle
     // in existence — which the `ServerSetup` below makes false the moment it
     // takes its own clone.
-    let mut runtime = ai.runtime().clone();
-    let router = TurnRouter::spawn(&mut runtime).await;
-    let supervisor = ThreadSupervisor::spawn(&mut runtime).await;
+    // What the kernel actually granted, computed once and used twice: the
+    // plane is told it at enrollment, and every client reads it back from
+    // `_garrison/status`. Deriving it in one place is what keeps the two
+    // answers from drifting.
+    let sandbox = sandbox_status(ai.sandbox_config());
 
-    let configured = match &config.threads.project_root {
-        Some(root) => root.clone(),
-        None => std::env::current_dir()
-            .map_err(|error| GarrisonError::runtime(format!("no working directory: {error}")))?,
+    // Before any actor, any listener, and any thread. An install the plane
+    // turned away must not reach the point of having somewhere to run a turn.
+    let enrollment = match config.plane.as_ref() {
+        Some(plane) => crate::enrollment::ensure(plane, &sandbox).await?,
+        None => None,
     };
 
-    // Canonical from here on. Everything downstream — the session boundary,
-    // the patch tool, the language servers, the builtins a turn registers —
-    // compares against this one resolved path, so there is no spelling of a
-    // directory that is inside for one tool and outside for another.
-    let project_root = configured.canonicalize().map_err(|error| {
-        GarrisonError::runtime(format!(
-            "project root '{}' cannot be resolved: {error}",
-            configured.display()
-        ))
-    })?;
+    let mut runtime = ai.runtime().clone();
+    let project_root = resolve_project_root(config.threads.project_root.as_deref())?;
 
-    let mut roots = vec![project_root.clone()];
-    roots.extend(config.threads.workspace_roots.iter().cloned());
-    let approved_roots = Arc::new(crate::boundary::approve(&roots));
+    let router = spawn_router(&mut runtime, ai).await;
+    let supervisor = spawn_supervisor(&mut runtime).await;
+    let lsp = spawn_lsp(&mut runtime, config, &project_root).await;
+    let plane = spawn_plane(&mut runtime, config.plane.as_ref(), enrollment.clone()).await?;
+    let attribution = attribution(enrollment.as_ref());
+    let entitlement = spawn_entitlement(&mut runtime, config, plane.as_ref()).await;
+    let audit = spawn_audit(&mut runtime, ai, config, enrollment).await?;
+    let sessions = spawn_sessions(&mut runtime, ai, config).await?;
 
-    // Eager, so rust-analyzer indexes while the first prompt is still being
-    // written; a server that fails to spawn is a warning inside, not an error.
-    let lsp = crate::lsp::spawn_servers(&mut runtime, &config.lsp_servers, &project_root).await;
+    // Ordered lists, because order is the contract: gates are asked first to
+    // last and the first refusal wins; describers fill the status in sequence.
+    //
+    // Entitlement is asked first. An install that holds no seat is not
+    // entitled to the answer any other gate would give, and "you have no
+    // seat" is the more actionable of two simultaneous refusals.
+    let mut gates: Vec<ActorHandle> = Vec::new();
+    let mut describers: Vec<ActorHandle> = vec![supervisor.clone(), router.clone()];
+    describers.extend(plane.clone());
+    if let Some(monitor) = entitlement {
+        gates.push(monitor.clone());
+        describers.push(monitor);
+    }
+    if let Some(keeper) = audit {
+        gates.push(keeper.clone());
+        describers.push(keeper);
+    }
+    let store = sessions.map(|(keeper, store)| {
+        gates.push(keeper.clone());
+        describers.push(keeper);
+        store
+    });
 
     Ok(ServerSetup {
         supervisor,
         runtime: ai.clone(),
         router,
-        defaults: ThreadDefaults {
-            project_root,
-            approved_roots,
-            system_prompt: config.threads.system_prompt.clone(),
-            approval_timeout: config.approval_timeout(),
-            auto_approve: Arc::new(config.approval.auto_approve.clone()),
-            lsp: Arc::new(lsp),
-        },
+        defaults: thread_defaults(config, project_root, lsp, gates, store, attribution),
         capabilities: capabilities(),
         audited: ai.is_audited(),
-        sandbox: sandbox_status(ai.sandbox_config()),
+        sandbox,
+        describers,
+        plane,
     })
+}
+
+/// The turn router, subscribed to the broker before anything can be missed.
+///
+/// It is handed the resolved compaction policy because it is also the daemon's
+/// describer for what happens to a history that outgrows the window.
+async fn spawn_router(runtime: &mut ActorRuntime, ai: &ActonAI) -> ActorHandle {
+    TurnRouter::spawn(runtime, compaction_status(ai.compaction())).await
+}
+
+/// Describes the auto-compaction policy in force, for `_garrison/status`.
+///
+/// `None` means the oldest exchanges are truncated rather than summarized,
+/// which is acton-ai's default and stays the default here: Garrison never
+/// calls `.compaction()` on the builder, so `[context] auto_compact` in
+/// `acton-ai.toml` is the single source of truth and this only reads it back.
+/// Pure.
+fn compaction_status(config: Option<&CompactionConfig>) -> Option<CompactionStatus> {
+    config.map(|config| CompactionStatus {
+        threshold: config.threshold.get(),
+        keep_recent_turns: config.keep_recent_turns.get(),
+    })
+}
+
+/// The session supervisor.
+async fn spawn_supervisor(runtime: &mut ActorRuntime) -> ActorHandle {
+    ThreadSupervisor::spawn(runtime).await
+}
+
+/// The daemon's credential holder, on a governed install.
+///
+/// `None` on a standalone agent, which has no identity and nothing to
+/// authenticate as. Everything that reaches the plane goes through the handle
+/// this returns; see [`crate::plane`] for why that is a rule and not a habit.
+///
+/// # Why an unreadable key stops the daemon
+///
+/// Enrollment has already succeeded by the time this runs, so the plane holds
+/// the public half of a specific key and every subsystem downstream is about
+/// to assume this process can prove it holds the private half. A daemon that
+/// started anyway would come up looking healthy, refuse every turn the moment
+/// a gate asked the plane, and give an operator a symptom four layers from
+/// the cause. Refusing here says the actual thing, once, at exit 2. The key is
+/// loaded with [`InstallKey::load`] and never `load_or_create`: generating a
+/// replacement would leave a daemon that had quietly stopped being itself.
+///
+/// # Errors
+///
+/// [`GarrisonErrorKind::Enrollment`](crate::error::GarrisonErrorKind::Enrollment)
+/// when an enrolled install's key cannot be read.
+async fn spawn_plane(
+    runtime: &mut ActorRuntime,
+    config: Option<&crate::config::PlaneConfig>,
+    enrollment: Option<crate::enrollment::Record>,
+) -> Result<Option<ActorHandle>, GarrisonError> {
+    let (Some(config), Some(record)) = (config, enrollment) else {
+        return Ok(None);
+    };
+
+    let key = InstallKey::load(&crate::enrollment::key::key_path(
+        &crate::enrollment::config_dir(),
+    ))?;
+
+    let identity = Identity {
+        record,
+        key: Arc::new(key),
+        plane_url: config.url.clone(),
+        hooks_url: config.hooks_url().to_string(),
+    };
+    tracing::info!(
+        plane = %identity.plane_url,
+        exchange = %identity.hooks_url,
+        install = %identity.record.install,
+        "the install will authenticate to the control plane by signed assertion"
+    );
+    Ok(Some(PlaneSession::spawn(runtime, identity).await))
+}
+
+/// The seat monitor, which is also a turn gate.
+///
+/// `None` on a standalone agent: no plane, no organization, no seat to hold.
+/// A governed install always gets one, whatever the plane is doing, because a
+/// daemon that refuses to start when the plane is down is a daemon nobody can
+/// ask *why* it is refusing. It starts, it answers `_garrison/status`, and it
+/// refuses turns until the plane confirms a seat; see [`crate::entitlement`].
+async fn spawn_entitlement(
+    runtime: &mut ActorRuntime,
+    config: &GarrisonConfig,
+    plane: Option<&ActorHandle>,
+) -> Option<ActorHandle> {
+    crate::entitlement::spawn(runtime, config.plane.as_ref(), plane).await
+}
+
+/// The audit anchor keeper, which is also a turn gate.
+///
+/// Refuses to start when a required trail is not armed, or when the trail and
+/// its anchor disagree; see [`crate::audit::spawn`], which owns both rules.
+async fn spawn_audit(
+    runtime: &mut ActorRuntime,
+    ai: &ActonAI,
+    config: &GarrisonConfig,
+    enrolled: Option<crate::enrollment::Record>,
+) -> Result<Option<ActorHandle>, GarrisonError> {
+    let install = enrolled.map(|record| record.install);
+    crate::audit::spawn(runtime, ai, config, install).await
+}
+
+/// Session persistence, or a refusal to start without it.
+///
+/// Returns the keeper — which is both a turn gate and a status describer — and
+/// the store handle every session is written through. `None` on an install
+/// that arms no `[checkpoint]` database and does not require one.
+async fn spawn_sessions(
+    runtime: &mut ActorRuntime,
+    ai: &ActonAI,
+    config: &GarrisonConfig,
+) -> Result<Option<(ActorHandle, crate::session::SessionStore)>, GarrisonError> {
+    crate::session::spawn(runtime, ai, config).await
+}
+
+/// The configured language servers.
+///
+/// Eager, so rust-analyzer indexes while the first prompt is still being
+/// written; a server that fails to spawn is a warning inside, not an error.
+async fn spawn_lsp(
+    runtime: &mut ActorRuntime,
+    config: &GarrisonConfig,
+    project_root: &Path,
+) -> crate::lsp::LspRegistry {
+    crate::lsp::spawn_servers(runtime, &config.lsp_servers, project_root).await
+}
+
+/// Resolves the directory sessions are rooted at by default.
+///
+/// Canonical from here on. Everything downstream — the session boundary, the
+/// patch tool, the language servers, the builtins a turn registers — compares
+/// against this one resolved path, so there is no spelling of a directory that
+/// is inside for one tool and outside for another.
+fn resolve_project_root(configured: Option<&Path>) -> Result<PathBuf, GarrisonError> {
+    let configured = match configured {
+        Some(root) => root.to_path_buf(),
+        None => std::env::current_dir()
+            .map_err(|error| GarrisonError::runtime(format!("no working directory: {error}")))?,
+    };
+
+    configured.canonicalize().map_err(|error| {
+        GarrisonError::runtime(format!(
+            "project root '{}' cannot be resolved: {error}",
+            configured.display()
+        ))
+    })
+}
+
+/// What every new session inherits.
+fn thread_defaults(
+    config: &GarrisonConfig,
+    project_root: PathBuf,
+    lsp: crate::lsp::LspRegistry,
+    gates: Vec<ActorHandle>,
+    store: Option<crate::session::SessionStore>,
+    attribution: crate::session::Attribution,
+) -> ThreadDefaults {
+    let mut roots = vec![project_root.clone()];
+    roots.extend(config.threads.workspace_roots.iter().cloned());
+
+    ThreadDefaults {
+        approved_roots: Arc::new(crate::boundary::approve(&roots)),
+        project_root,
+        system_prompt: config.threads.system_prompt.clone(),
+        approval_timeout: config.approval_timeout(),
+        auto_approve: Arc::new(config.approval.auto_approve.clone()),
+        lsp: Arc::new(lsp),
+        gates,
+        store,
+        attribution,
+    }
+}
+
+/// Who the sessions this daemon opens belong to.
+///
+/// Pure. An unenrolled install has nothing to say here, and its sessions are
+/// stored unattributed on purpose: there is no tenant to attribute them to.
+/// The operator is not yet named because enrollment identifies the machine
+/// rather than the person at it; the field exists so directory identity has
+/// somewhere to land without a second migration.
+fn attribution(enrolled: Option<&crate::enrollment::Record>) -> crate::session::Attribution {
+    crate::session::Attribution {
+        install: enrolled.map(|record| record.install.clone()),
+        organization: enrolled.map(|record| record.organization.clone()),
+        operator_upn: None,
+    }
 }
 
 /// Describes the isolation in force, for `_garrison/status`.
@@ -405,6 +645,47 @@ mod tests {
         api_key_preflight(&config).expect("a keyed provider must pass");
 
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_locked_trail_is_explained_as_a_second_daemon() {
+        let upstream = "configuration error in 'audit.path': the audit trail at /x/audit.jsonl \
+                        is already owned by another process (its exclusive lock is held)";
+        let explained = launch_refusal(upstream);
+
+        assert!(
+            explained.starts_with(upstream),
+            "the upstream text is kept verbatim"
+        );
+        assert!(explained.contains("one daemon per user per machine"));
+        assert!(explained.contains("exit 2"));
+    }
+
+    #[test]
+    fn other_launch_failures_pass_through_unchanged() {
+        assert_eq!(
+            launch_refusal("no provider configured"),
+            "no provider configured"
+        );
+    }
+
+    #[test]
+    fn no_compaction_policy_is_reported_as_no_compaction() {
+        assert_eq!(compaction_status(None), None);
+    }
+
+    #[test]
+    fn a_configured_compaction_policy_reports_the_terms_it_applies() {
+        use acton_ai::memory::{CompactionThreshold, KeepRecentTurns};
+
+        let config = CompactionConfig::new()
+            .with_threshold(CompactionThreshold::new(0.7).expect("0.7 is a fraction"))
+            .with_keep_recent_turns(KeepRecentTurns::new(5).expect("five turns is not zero"));
+
+        let status = compaction_status(Some(&config)).expect("a policy must be reported");
+
+        assert!((status.threshold - 0.7).abs() < f64::EPSILON);
+        assert_eq!(status.keep_recent_turns, 5);
     }
 
     #[test]

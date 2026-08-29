@@ -38,6 +38,8 @@ enum Awaiting {
     NewSession,
     /// The agent's governance settings.
     Status,
+    /// The verdict on an abandoned turn.
+    Abandon,
 }
 
 /// The live connection to the agent.
@@ -119,6 +121,48 @@ impl Session {
         Ok(())
     }
 
+    /// Picks up the turn a restart interrupted.
+    ///
+    /// Tracked as the open turn rather than as an outstanding request, because
+    /// that is what it is: the answer arrives the way a prompt's does, and
+    /// everything the interface does about a running turn — the busy check,
+    /// the streaming, the interrupt — should apply to it unchanged.
+    ///
+    /// # Errors
+    ///
+    /// No session open, or a closed connection.
+    fn resume(&mut self) -> Result<(), GarrisonError> {
+        let method = acp::ext::SESSION_RESUME;
+        let session_id = self
+            .id
+            .clone()
+            .ok_or_else(|| GarrisonError::transport(method, "no session is open"))?;
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| GarrisonError::transport(method, "the connection has closed"))?;
+
+        let request = acp::InterruptedTurnRequest { session_id };
+        self.turn = Some(writer.request(method, &request)?);
+        Ok(())
+    }
+
+    /// Gives up on that turn. Not a turn itself, so it is merely outstanding.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::resume`].
+    fn abandon(&mut self) -> Result<(), GarrisonError> {
+        let method = acp::ext::SESSION_ABANDON;
+        let session_id = self
+            .id
+            .clone()
+            .ok_or_else(|| GarrisonError::transport(method, "no session is open"))?;
+
+        let request = acp::InterruptedTurnRequest { session_id };
+        self.ask(method, &request, Awaiting::Abandon)
+    }
+
     /// Sends a request that is not a turn, and remembers what it was for.
     fn ask<P: serde::Serialize>(
         &mut self,
@@ -187,6 +231,7 @@ pub fn describe_status(status: &acp::GarrisonStatus) -> Vec<Line<'static>> {
             status.sessions, status.policy.approval_timeout_secs
         )),
         notice_line(approvals),
+        notice_line(describe_entitlement(status.entitlement.as_ref())),
         notice_line(if status.audit.enabled {
             status.audit.chain_head.as_ref().map_or_else(
                 || "audit: recording".to_string(),
@@ -196,7 +241,64 @@ pub fn describe_status(status: &acp::GarrisonStatus) -> Vec<Line<'static>> {
             "audit: not recording".to_string()
         }),
         notice_line(describe_sandbox(&status.sandbox)),
+        notice_line(describe_store(status.session_store.as_ref())),
     ]
+}
+
+/// One line on whether this conversation will still be here tomorrow.
+///
+/// Pure. The unhealthy case leads, because a store that will not answer is
+/// refusing every turn on the daemon and that is what the operator is looking
+/// at the status to find out.
+fn describe_store(store: Option<&acp::SessionStoreStatus>) -> String {
+    let Some(store) = store else {
+        return "sessions: not stored, this conversation ends with the daemon".to_string();
+    };
+
+    if !store.healthy {
+        return format!(
+            "sessions: the store is not answering, turns are refused ({})",
+            store.last_error.as_deref().unwrap_or("no reason given")
+        );
+    }
+
+    let kept = format!(
+        "sessions: {} stored, kept {} days",
+        store.sessions, store.retain_days
+    );
+    if store.interrupted == 0 {
+        kept
+    } else {
+        format!(
+            "{kept}, {} interrupted (/resume or /abandon)",
+            store.interrupted
+        )
+    }
+}
+
+/// One line on whether a seat entitles this install to run at all.
+///
+/// Pure. A standalone agent says so rather than being silent about it: an
+/// operator reading `/status` in a governed deployment and seeing nothing
+/// about seats would reasonably conclude the check was passing.
+fn describe_entitlement(status: Option<&acp::EntitlementStatus>) -> String {
+    let Some(status) = status else {
+        return "seat: standalone, this agent answers to no control plane".to_string();
+    };
+
+    match status.reason.as_deref() {
+        Some(reason) => format!("seat: {} - {reason}", status.state),
+        None => {
+            let mut line = format!("seat: {}", status.state);
+            if let Some(tier) = status.tier.as_deref() {
+                line.push_str(&format!(" ({tier})"));
+            }
+            if let Some(checked) = status.checked_at.as_deref() {
+                line.push_str(&format!(", confirmed {checked}"));
+            }
+            line
+        }
+    }
 }
 
 /// One line on what stands between a tool call and the host.
@@ -370,6 +472,22 @@ fn run_command(
                 }
             }
         }
+        Command::Resume => {
+            if actor.model.is_busy() {
+                lines.push(notice_line(
+                    "finish or interrupt the current turn first".to_string(),
+                ));
+            } else if let Err(error) = actor.model.resume() {
+                lines.push(error_line(error.to_string()));
+            } else {
+                return announce(actor, lines, true);
+            }
+        }
+        Command::Abandon => {
+            if let Err(error) = actor.model.abandon() {
+                lines.push(error_line(error.to_string()));
+            }
+        }
         Command::Status => {
             if let Err(error) = actor.model.ask(
                 acp::ext::STATUS,
@@ -520,6 +638,7 @@ fn answer(
     match actor.model.outstanding.remove(id) {
         Some(Awaiting::NewSession) => replaced(actor, outcome),
         Some(Awaiting::Status) => announce(actor, governance(outcome), false),
+        Some(Awaiting::Abandon) => announce(actor, abandoned(outcome), false),
         None => Reply::ready(),
     }
 }
@@ -532,6 +651,21 @@ fn governance(outcome: &Result<serde_json::Value, ErrorObject>) -> Vec<Line<'sta
             |status| describe_status(&status),
         ),
         Err(error) => vec![error_line(error.message.to_string())],
+    }
+}
+
+/// Reads the answer to `_garrison/session/abandon`.
+///
+/// The error case is the interesting one and is not a failure: `-32021` means
+/// there was nothing to abandon, which is what an operator typing `/abandon`
+/// on a healthy session should be told plainly.
+fn abandoned(outcome: &Result<serde_json::Value, ErrorObject>) -> Vec<Line<'static>> {
+    match outcome {
+        Ok(value) => serde_json::from_value::<acp::AbandonResponse>(value.clone()).map_or_else(
+            |error| vec![error_line(format!("unreadable answer: {error}"))],
+            |response| vec![notice_line(format!("abandoned turn {}", response.turn_id))],
+        ),
+        Err(error) => vec![notice_line(error.message.to_string())],
     }
 }
 
@@ -728,16 +862,18 @@ mod tests {
                 approval_timeout_secs: 30,
                 auto_approve: Vec::new(),
             },
-            audit: acp::AuditStatus {
-                enabled: true,
-                chain_head: None,
-            },
+            audit: acp::AuditStatus::undescribed(true),
+            context: None,
             sandbox: acp::SandboxStatus {
                 enabled: true,
                 hardening: Some("enforce".to_string()),
                 timeout_secs: Some(120),
                 memory_limit_bytes: None,
             },
+            threads: None,
+            plane: None,
+            session_store: None,
+            entitlement: None,
         };
 
         let rendered: String = describe_status(&status)

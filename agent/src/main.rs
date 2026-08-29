@@ -1,19 +1,24 @@
 //! The `garrison-agent` command.
 //!
-//! Four subcommands, and the first two are the product:
+//! One engine and three clients of it:
 //!
-//! - `acp` speaks the Agent Client Protocol over stdin and stdout. This is the
-//!   mode ACP hosts expect: the editor spawns the agent as a child process and
-//!   talks to it over its pipes. It is the default for a reason — a JetBrains,
-//!   Zed, or Neovim ACP client needs no configuration beyond a path to this
-//!   binary.
-//! - `serve` runs the same protocol as a daemon on a Unix socket, for clients
-//!   that want one long-lived agent shared across editors, and as the seam a
-//!   Windows named-pipe transport will slot into.
+//! - `serve` is the engine: one daemon per user per machine, owning the
+//!   acton-ai runtime, the socket, the sandbox host and the audit trail. It
+//!   runs under the user's systemd (`packaging/systemd/garrison-agent.service`)
+//!   or is started by the first client that needs it.
+//! - `acp` speaks the Agent Client Protocol over stdin and stdout, which is
+//!   the mode ACP hosts expect: the editor spawns it as a child process and
+//!   talks to it over its pipes. It is a relay to the daemon's socket, not an
+//!   engine of its own, so a spawned child can never become a second writer
+//!   of the hash chain. A JetBrains, Zed, or Neovim ACP client needs no
+//!   configuration beyond a path to this binary.
 //! - `ping` performs the handshake against a running daemon and prints what
-//!   came back, including Garrison's own `_garrison/status`.
+//!   came back, including Garrison's own `_garrison/status`. It never starts
+//!   a daemon: "not running" is one of its answers.
 //! - `chat` drives one session end to end over the socket, rendering updates as
 //!   they arrive and answering permission requests at the terminal.
+//!
+//! See [`garrison_agent::daemon`] for the lifecycle rules and exit codes.
 //!
 //! # The sandbox re-exec
 //!
@@ -22,16 +27,16 @@
 //! dispatches its tool call and exits without ever parsing a command line.
 
 use clap::{Parser, Subcommand};
+use garrison_agent::audit;
 use garrison_agent::client::{update_text, AgentClient, Interactions, Quiet};
-use garrison_agent::config::GarrisonConfig;
+use garrison_agent::config::{GarrisonConfig, ServerConfig};
+use garrison_agent::daemon;
 use garrison_agent::error::GarrisonError;
 use garrison_agent::launch;
 use garrison_agent::protocol::acp;
-use garrison_agent::protocol::server;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use tokio_util::sync::CancellationToken;
 
 /// A governed agentic coding engine.
 #[derive(Debug, Parser)]
@@ -43,16 +48,28 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Speaks ACP over stdin and stdout. The mode editors spawn.
+    /// Relays ACP between stdin/stdout and the daemon. The mode editors spawn.
+    ///
+    /// Connects to the per-user daemon's socket and starts the daemon first
+    /// when none is running and `[server].autostart` allows. The daemon's
+    /// configuration is the one in force; the flags here only tell the relay
+    /// where the socket is.
     Acp {
-        /// Garrison's own config file. Defaults to the usual search path.
+        /// The daemon's socket. Overrides the config file.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// Garrison's own config file, read for `[server]` only.
         #[arg(long)]
         config: Option<PathBuf>,
-        /// acton-ai's config file. Defaults to the usual search path.
+        /// Accepted for compatibility and ignored: the relay runs no engine.
         #[arg(long)]
         acton_config: Option<PathBuf>,
     },
-    /// Runs the agent as a daemon serving ACP on a Unix socket.
+    /// Runs the engine: one daemon per user, serving ACP on a Unix socket.
+    ///
+    /// Exits 2 when it refuses to start (a locked or broken audit trail, a
+    /// configuration it will not accept, a control plane that turned this
+    /// install away), 3 on a rejection, 1 on a malfunction.
     Serve {
         /// The Unix socket to listen on. Overrides the config file.
         #[arg(long)]
@@ -93,6 +110,11 @@ enum Command {
         #[arg(value_enum)]
         provider: ProviderArg,
     },
+    /// Inspects the audit trail this install writes.
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommand,
+    },
     /// Talks to a running daemon.
     Chat {
         /// The socket to connect to.
@@ -108,6 +130,36 @@ enum Command {
         /// Approve every tool call without asking at the terminal.
         #[arg(long)]
         approve_all: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AuditCommand {
+    /// Walks the chain, then measures it against the anchor.
+    ///
+    /// Two questions with two answers. Exit 3 means the chain does not hang
+    /// together: an entry was rewritten or one was inserted. Exit 4 means it
+    /// hangs together perfectly and no longer ends where the anchor says it
+    /// ended, which is what deleting the tail of a trail looks like and is
+    /// the one thing the chain cannot notice about itself. Exit 0 means
+    /// neither. Reads files only: it never talks to the daemon, so it works
+    /// on a trail copied off the machine.
+    Verify {
+        /// The trail to read. Defaults to the one acton-ai.toml arms.
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// The anchor to measure against. Defaults to `[audit] anchor_path`.
+        #[arg(long)]
+        anchor: Option<PathBuf>,
+        /// Garrison's own config file, read for `[audit]`.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// acton-ai's config file, read for the trail's path.
+        #[arg(long)]
+        acton_config: Option<PathBuf>,
+        /// Print the finding as JSON rather than as lines.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -154,7 +206,7 @@ fn destination(cli: &Cli) -> Logs {
         return Logs::Stderr;
     }
 
-    match log_path().and_then(|path| {
+    match daemon::log_path("chat.log").and_then(|path| {
         std::fs::create_dir_all(path.parent()?).ok()?;
         std::fs::OpenOptions::new()
             .create(true)
@@ -165,17 +217,6 @@ fn destination(cli: &Cli) -> Logs {
         Some(file) => Logs::File(std::sync::Arc::new(file)),
         None => Logs::Nowhere,
     }
-}
-
-/// The chat's log file: `$XDG_STATE_HOME/garrison/chat.log`, or under `~`.
-fn log_path() -> Option<PathBuf> {
-    let state = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("state"))
-        })?;
-
-    Some(state.join("garrison").join("chat.log"))
 }
 
 /// The process entry point, which is deliberately not `#[tokio::main]`.
@@ -209,13 +250,10 @@ async fn serve_command_line() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("garrison-agent: {error}");
-            // A deliberate refusal is not a malfunction, and a caller
-            // scripting against this should be able to tell them apart.
-            if error.is_rejection() {
-                ExitCode::from(3)
-            } else {
-                ExitCode::FAILURE
-            }
+            // A refusal to start (2) and a deliberate rejection (3) are not
+            // malfunctions (1): a supervisor must not retry the first two,
+            // and a caller scripting against this can tell them apart.
+            ExitCode::from(daemon::exit_code(&error))
         }
     }
 }
@@ -224,9 +262,10 @@ async fn serve_command_line() -> ExitCode {
 async fn run(cli: Cli) -> Result<(), GarrisonError> {
     match cli.command {
         Command::Acp {
+            socket,
             config,
             acton_config,
-        } => acp_stdio(config, acton_config).await,
+        } => acp_relay(socket, config, acton_config.is_some()).await,
         Command::Serve {
             socket,
             config,
@@ -238,12 +277,63 @@ async fn run(cli: Cli) -> Result<(), GarrisonError> {
             key_stdin,
         } => garrison_agent::auth::login(provider.into(), key_stdin).await,
         Command::Logout { provider } => garrison_agent::auth::logout(provider.into()),
+        Command::Audit {
+            command:
+                AuditCommand::Verify {
+                    file,
+                    anchor,
+                    config,
+                    acton_config,
+                    json,
+                },
+        } => audit_verify(file, anchor, config, acton_config, json),
         Command::Chat {
             socket,
             message,
             approve_all,
         } => chat(socket, message, approve_all).await,
     }
+}
+
+/// `audit verify`: read the trail, read the anchor, report both.
+///
+/// The finding is printed either way — an operator triaging a truncation
+/// needs the numbers, not just an exit status — and only then does the
+/// non-zero outcome become an error, so the report always reaches the screen
+/// before the process ends.
+fn audit_verify(
+    file: Option<PathBuf>,
+    anchor: Option<PathBuf>,
+    config: Option<PathBuf>,
+    acton_config: Option<PathBuf>,
+    json: bool,
+) -> Result<(), GarrisonError> {
+    let garrison = load_config(config)?;
+    let trail = match file {
+        Some(path) => path,
+        None => audit::verify::configured_trail(acton_config.as_deref()).ok_or_else(|| {
+            GarrisonError::configuration(
+                "audit",
+                "no audit trail is armed: acton-ai.toml has no [audit] section, so there is \
+                 nothing to verify. Name one with --file",
+            )
+        })?,
+    };
+    let anchor_path = anchor.unwrap_or_else(|| garrison.audit.anchor_path());
+
+    let report = audit::verify::run(&trail, &anchor_path)?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .map_err(|error| GarrisonError::runtime(error.to_string()))?
+        );
+    } else {
+        println!("{}", audit::verify::render(&report));
+    }
+
+    audit::verify::refusal(&report).map_or(Ok(()), Err)
 }
 
 /// Loads Garrison's config from the named file, or the search path.
@@ -254,41 +344,49 @@ fn load_config(path: Option<PathBuf>) -> Result<GarrisonConfig, GarrisonError> {
     }
 }
 
-/// Resolves the socket to talk to: the argument, else the configured one.
-fn client_socket(socket: Option<PathBuf>) -> Result<PathBuf, GarrisonError> {
-    match socket {
-        Some(path) => Ok(path),
-        None => Ok(GarrisonConfig::load()?.server.socket),
-    }
-}
-
-/// `acp`: one client, on this process's own pipes, until it hangs up.
-async fn acp_stdio(
+/// Resolves where a client talks to: the argument, else the configured
+/// socket, together with the `[server]` rules for a daemon that is not there.
+fn client_target(
+    socket: Option<PathBuf>,
     config: Option<PathBuf>,
-    acton_config: Option<PathBuf>,
-) -> Result<(), GarrisonError> {
-    let config = load_config(config)?;
-    let ai = launch::build_ai(acton_config.as_deref()).await?;
-    let setup = launch::build_setup(&ai, &config).await?;
-    let mut runtime = ai.runtime().clone();
-
-    tracing::info!("garrison agent speaking ACP on stdio");
-    server::serve_connection(
-        &mut runtime,
-        tokio::io::stdin(),
-        tokio::io::stdout(),
-        setup,
-        CancellationToken::new(),
-    )
-    .await;
-
-    runtime
-        .shutdown_all()
-        .await
-        .map_err(|error| GarrisonError::runtime(format!("shutdown failed: {error}")))
+) -> Result<(ServerConfig, PathBuf), GarrisonError> {
+    let server = load_config(config)?.server;
+    let path = socket.unwrap_or_else(|| server.socket.clone());
+    Ok((server, path))
 }
 
-/// `serve`: run until interrupted.
+/// `acp`: a relay between this process's pipes and the daemon's socket.
+///
+/// No `ActonAI` is ever built here. The daemon's configuration governs the
+/// session; `--config` is read only for `[server]`, and `--acton-config` is
+/// accepted so existing hosts keep working, then ignored with a warning.
+async fn acp_relay(
+    socket: Option<PathBuf>,
+    config: Option<PathBuf>,
+    acton_config_given: bool,
+) -> Result<(), GarrisonError> {
+    if acton_config_given {
+        tracing::warn!(
+            "--acton-config is ignored by `acp`: the relay runs no engine, and the daemon's \
+             configuration is in force"
+        );
+    }
+    let (server, path) = client_target(socket, config)?;
+    let stream = daemon::connect_or_start(&server, &path).await?;
+
+    tracing::info!(socket = %path.display(), "relaying ACP between stdio and the daemon");
+    daemon::relay(stream, tokio::io::stdin(), tokio::io::stdout())
+        .await
+        .map_err(|error| {
+            GarrisonError::transport(path.display().to_string(), format!("relay failed: {error}"))
+        })
+}
+
+/// `serve`: run until interrupted or asked to stop.
+///
+/// Tells systemd when it is ready and when it begins stopping, both no-ops
+/// without `$NOTIFY_SOCKET`, so `Type=notify` in the unit means "the socket
+/// is accepting" rather than "the process exists".
 async fn serve(
     socket: Option<PathBuf>,
     config: Option<PathBuf>,
@@ -298,19 +396,41 @@ async fn serve(
     let garrison = launch::launch(&config, socket, acton_config.as_deref()).await?;
 
     println!("garrison-agent listening on {}", garrison.endpoint);
+    acton_ai::introspection::sd_notify::notify_ready();
 
-    tokio::signal::ctrl_c()
-        .await
-        .map_err(|error| GarrisonError::runtime(format!("could not wait for a signal: {error}")))?;
+    wait_for_stop().await?;
 
     println!("shutting down");
+    acton_ai::introspection::sd_notify::notify_stopping();
     garrison.shutdown().await
 }
 
+/// Resolves on `SIGINT` or `SIGTERM`, whichever comes first.
+///
+/// `SIGTERM` is what systemd sends on `stop`; without listening for it the
+/// daemon would be killed after `TimeoutStopSec` instead of shutting its
+/// actors down and unlinking its socket.
+async fn wait_for_stop() -> Result<(), GarrisonError> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|error| {
+        GarrisonError::runtime(format!("could not listen for SIGTERM: {error}"))
+    })?;
+
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result.map_err(|error| {
+            GarrisonError::runtime(format!("could not wait for a signal: {error}"))
+        }),
+        _ = terminate.recv() => Ok(()),
+    }
+}
+
 /// `ping`: handshake, then ask Garrison what it is enforcing.
+///
+/// Never starts a daemon. A probe that brought the thing it was probing into
+/// existence would have nothing truthful to report.
 async fn ping(socket: Option<PathBuf>) -> Result<(), GarrisonError> {
-    let path = client_socket(socket)?;
-    let mut client = AgentClient::connect(&path).await?;
+    let (_server, path) = client_target(socket, None)?;
+    let mut client = AgentClient::from_stream(daemon::connect(&path).await?);
     let handshake = client.initialize("garrison-agent ping").await?;
 
     let agent = handshake.agent_info.as_ref().map_or_else(
@@ -340,7 +460,10 @@ async fn ping(socket: Option<PathBuf>) -> Result<(), GarrisonError> {
         status.policy.approval_timeout_secs,
         status.policy.auto_approve.join(", "),
     );
-    println!("  audit:      {}", status.audit.enabled);
+    if let Some(entitlement) = status.entitlement.as_ref() {
+        println!("  seat:       {}", seat_line(entitlement));
+    }
+    println!("  audit:      {}", audit_line(&status.audit));
     println!(
         "  sandbox:    {}",
         if status.sandbox.enabled {
@@ -355,6 +478,69 @@ async fn ping(socket: Option<PathBuf>) -> Result<(), GarrisonError> {
     );
 
     Ok(())
+}
+
+/// The seat summary `ping` prints, in one line. Pure.
+///
+/// The state comes first because it is the word an operator triages on, and
+/// the reason comes last because it is the sentence they act on. A refusal
+/// prints its whole explanation: `ping` is where somebody looks when every
+/// prompt is failing, and truncating the answer there would send them to the
+/// logs for no reason.
+fn seat_line(status: &acp::EntitlementStatus) -> String {
+    let mut line = status.state.clone();
+
+    if let Some(tier) = status.tier.as_deref() {
+        line.push_str(&format!(" ({tier})"));
+    }
+    if let Some(checked) = status.checked_at.as_deref() {
+        line.push_str(&format!(" checked={checked}"));
+    }
+    if let Some(until) = status.grace_until.as_deref() {
+        line.push_str(&format!(" grace_until={until}"));
+    }
+    line.push_str(&format!(" every={}s", status.check_interval_secs));
+    if let Some(error) = status.last_error.as_deref() {
+        line.push_str(&format!(" last_error={error}"));
+    }
+    if let Some(reason) = status.reason.as_deref() {
+        line.push_str(&format!("\n              {reason}"));
+    }
+
+    line
+}
+
+/// The audit summary `ping` prints, in one line. Pure.
+///
+/// The state comes first because it is the word an operator triages on, and
+/// the anchor's sequence comes last because a head that has run away from its
+/// anchor is the thing worth noticing once the state itself looks fine.
+fn audit_line(status: &acp::AuditStatus) -> String {
+    let mut line = status.state.to_string();
+
+    if let Some(durability) = status.durability.as_deref() {
+        line.push_str(&format!(" ({durability})"));
+    }
+    if let (Some(sequence), Some(hash)) = (status.sequence, status.chain_head.as_deref()) {
+        line.push_str(&format!(" head={sequence}/{}", &hash[..hash.len().min(8)]));
+    }
+    if status.failures > 0 {
+        line.push_str(&format!(" failures={}", status.failures));
+        if let Some(error) = status.last_error.as_deref() {
+            line.push_str(&format!(" last_error={error}"));
+        }
+    }
+    if let Some(anchor) = status.anchor.as_ref() {
+        match anchor.sequence {
+            Some(sequence) => line.push_str(&format!(" anchor={sequence}")),
+            None => line.push_str(" anchor=none"),
+        }
+        if let Some(error) = anchor.last_error.as_deref() {
+            line.push_str(&format!(" anchor_error={error}"));
+        }
+    }
+
+    line
 }
 
 /// The smoke client's reactions: print what arrives, ask before every tool.
@@ -440,14 +626,15 @@ async fn chat(
     message: Option<String>,
     approve_all: bool,
 ) -> Result<(), GarrisonError> {
-    let path = client_socket(socket)?;
+    let (server, path) = client_target(socket, None)?;
+    let stream = daemon::connect_or_start(&server, &path).await?;
     let Some(message) = message else {
         let cwd = std::env::current_dir()
             .map_err(|error| GarrisonError::runtime(format!("no working directory: {error}")))?;
-        return garrison_agent::tui::run(&path, cwd, approve_all).await;
+        return garrison_agent::tui::run(stream, cwd, approve_all).await;
     };
 
-    let mut client = AgentClient::connect(&path).await?;
+    let mut client = AgentClient::from_stream(stream);
     client.initialize("garrison-agent chat").await?;
 
     let cwd = std::env::current_dir()

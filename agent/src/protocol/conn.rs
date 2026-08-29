@@ -53,15 +53,19 @@
 //! and the shortest safe life for one is the session the operator was looking
 //! at when they made it.
 
+use crate::admission::refusal_code;
 use crate::approval::{ApprovalOutcome, RequestApproval, CANCELLED_REASON, REJECTED_REASON};
 use crate::protocol::acp::{self, Permission};
 use crate::protocol::codec::EventSink;
 use crate::protocol::jsonrpc::{encode, error_code, params, ErrorObject, Inbound, RequestId};
+use crate::session;
 use crate::thread::{
-    CreateThread, DescribeThread, FindThread, InterruptTurn, ListThreads, Reattach, StartTurn,
-    ThreadList, ThreadLookup, ThreadSetup, TurnAdmission, TurnFinished, TurnResult,
+    AbandonTurn, CreateThread, DescribeThread, FindThread, InterruptTurn, ListThreads, Reattach,
+    ResumeAdmission, ResumeTurn, StartTurn, ThreadList, ThreadLookup, ThreadSetup, TurnAdmission,
+    TurnFinished, TurnResult,
 };
 use crate::types::{ClientId, ThreadId};
+use acton_ai::checkpoint::CheckpointStatus;
 use acton_ai::facade::ActonAI;
 use acton_reactive::prelude::*;
 use serde_json::Value;
@@ -90,6 +94,22 @@ pub struct ThreadDefaults {
     pub auto_approve: Arc<Vec<String>>,
     /// The language servers every session's tools reach.
     pub lsp: Arc<crate::lsp::LspRegistry>,
+    /// The gates every session's turns must pass, in order.
+    ///
+    /// See [`crate::admission`]. Empty means every turn is admitted.
+    pub gates: Vec<ActorHandle>,
+    /// Where sessions are written so they survive a restart.
+    ///
+    /// `None` on an install that arms no session store, which is the
+    /// standalone developer install: its sessions live in their actors and die
+    /// with the process, exactly as they did before persistence existed.
+    pub store: Option<session::SessionStore>,
+    /// Who every session this daemon opens belongs to.
+    ///
+    /// Settled once at launch and stamped onto each stored session, so a row
+    /// shipped to the fleet view later carries its tenant chain rather than
+    /// landing unattributed and invisible.
+    pub attribution: session::Attribution,
 }
 
 impl Default for ThreadDefaults {
@@ -101,6 +121,9 @@ impl Default for ThreadDefaults {
             approval_timeout: Duration::from_secs(300),
             auto_approve: Arc::new(Vec::new()),
             lsp: Arc::new(crate::lsp::LspRegistry::default()),
+            gates: Vec::new(),
+            store: None,
+            attribution: session::Attribution::default(),
         }
     }
 }
@@ -126,6 +149,56 @@ pub struct ConnSetup {
     pub audited: bool,
     /// What isolation the runtime's writing tools run under, for the same.
     pub sandbox: acp::SandboxStatus,
+    /// Every actor that contributes a part to `_garrison/status`, asked in
+    /// order. See [`Describe`].
+    pub describers: Vec<ActorHandle>,
+    /// The daemon's credential holder, on a governed install.
+    ///
+    /// A subsystem that needs the control plane asks this handle for an
+    /// authenticated client and never builds one; see [`crate::plane`].
+    pub plane: Option<ActorHandle>,
+}
+
+/// Asks a subsystem to describe itself for `_garrison/status`.
+///
+/// One request, answered by every actor that has something to report: the
+/// session supervisor, and later the plane session, the policy agent, the
+/// seat monitor, the audit shipper. Each answers with the [`StatusPart`] it
+/// owns and [`assemble`] places it; a subsystem that joins the status adds one
+/// variant here, one field on [`acp::GarrisonStatus`], and one handler on its
+/// own actor, and never edits [`status`].
+#[acton_message]
+pub struct Describe;
+
+/// One subsystem's contribution to the status.
+///
+/// Non-exhaustive: every subsystem that joins the status adds a variant.
+#[acton_message]
+#[non_exhaustive]
+pub enum StatusPart {
+    /// From the session supervisor.
+    Threads(acp::ThreadsStatus),
+    /// From the plane session, when this daemon is governed.
+    Plane(acp::PlaneStatus),
+    /// From the turn router, which sees every compaction.
+    Context(acp::ContextStatus),
+    /// From the seat monitor: whether a seat entitles this install to run at
+    /// all, and how long the last answer may outlive the plane.
+    Entitlement(acp::EntitlementStatus),
+    /// From the audit anchor keeper: the writer's health, what the trail
+    /// promises, and where the head is anchored.
+    ///
+    /// Boxed because it is by far the widest part, and every `StatusPart` in
+    /// flight — one per describer, on every status request — would otherwise
+    /// be sized for it.
+    Audit(Box<acp::AuditStatus>),
+    /// From the session keeper: whether sessions survive a restart, and how
+    /// many of them are waiting on a decision about an interrupted turn.
+    SessionStore(acp::SessionStoreStatus),
+}
+
+impl Request for Describe {
+    type Response = StatusPart;
 }
 
 /// A frame the reader task pulled off the socket.
@@ -247,7 +320,11 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, ClientConn>) {
                 // race the turn: a turn that finished before its id was stored
                 // would find nothing to answer, and the client would wait
                 // forever on a prompt that had already completed.
-                let parked = if method == acp::method::SESSION_PROMPT {
+                // A resume is parked exactly as a prompt is, because it is
+                // answered exactly as a prompt is: by the turn it starts.
+                let parked = if method == acp::method::SESSION_PROMPT
+                    || method == acp::ext::SESSION_RESUME
+                {
                     match park_prompt(actor, &id, params.as_ref()) {
                         Parked::Busy => {
                             setup.sink.fail(Some(id), busy_error());
@@ -532,18 +609,38 @@ fn permission_request(request: &RequestApproval) -> acp::RequestPermissionReques
 fn answer_prompt(sink: &EventSink, id: RequestId, finished: &TurnFinished) {
     match &finished.result {
         TurnResult::Completed {
-            stop_reason, usage, ..
+            stop_reason,
+            usage,
+            plan,
+            compactions,
+            ..
         } => {
             let mut response = acp::PromptResponse::new(*stop_reason);
             // Token counts ride in `_meta`: they are not part of stable ACP,
             // and inventing a core field for them would make Garrison's frames
-            // unreadable to a conformant client.
-            let meta = turn_meta(&finished.turn_id.to_string(), usage);
+            // unreadable to a conformant client. The final plan rides there
+            // too, and is the authoritative one: the streamed plan updates
+            // come from the router, so the last of them can arrive after this
+            // response.
+            let meta = turn_meta(
+                &finished.turn_id.to_string(),
+                usage,
+                plan.as_ref(),
+                compactions,
+            );
             response.meta = Some(meta);
             sink.respond(id, &response);
         }
         TurnResult::Cancelled => {
             sink.respond(id, &acp::PromptResponse::new(acp::StopReason::Cancelled));
+        }
+        // The code names which gate said no; the data says why in words.
+        TurnResult::Refused(refusal) => {
+            sink.fail(
+                Some(id),
+                ErrorObject::new(refusal_code(refusal), "the turn was not admitted")
+                    .data(Value::String(refusal.to_string())),
+            );
         }
         TurnResult::Failed { reason } => {
             sink.fail(
@@ -555,22 +652,24 @@ fn answer_prompt(sink: &EventSink, id: RequestId, finished: &TurnFinished) {
     }
 }
 
-/// Wraps turn usage in the one `_meta` key Garrison claims.
-fn turn_meta(turn_id: &str, usage: &crate::thread::TurnUsage) -> serde_json::Map<String, Value> {
-    let payload = acp::TurnMeta {
+/// Wraps what a turn ended up costing, planning, and forgetting in the one
+/// `_meta` key Garrison claims.
+///
+/// Pure, so the shape a client reads at the end of a turn is testable without
+/// a socket.
+fn turn_meta(
+    turn_id: &str,
+    usage: &crate::thread::TurnUsage,
+    plan: Option<&acton_ai::tools::plan::Plan>,
+    compactions: &[acton_ai::memory::CompactionRecord],
+) -> acp::Meta {
+    acp::garrison_meta(&acp::TurnMeta {
         turn_id: turn_id.to_string(),
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: usage.completion_tokens,
-    };
-
-    let mut meta = serde_json::Map::new();
-    match serde_json::to_value(payload) {
-        Ok(value) => {
-            meta.insert(acp::ext::META_KEY.to_string(), value);
-        }
-        Err(error) => tracing::error!(%error, "dropping unserializable turn metadata"),
-    }
-    meta
+        plan: plan.map(acp::plan_summary),
+        compactions: compactions.iter().map(acp::compaction_summary).collect(),
+    })
 }
 
 /// Removes a suspended permission request and cancels its timer.
@@ -674,7 +773,9 @@ async fn handle(
         acp::method::SESSION_LOAD => session_load(context, raw).await.map(Answer::Result),
         acp::method::SESSION_LIST => session_list(context, raw).await.map(Answer::Result),
         acp::ext::STATUS => status(context).await.map(Answer::Result),
+        acp::ext::SESSION_ABANDON => session_abandon(context, raw).await.map(Answer::Result),
         acp::method::SESSION_PROMPT => session_prompt(context, raw).await,
+        acp::ext::SESSION_RESUME => session_resume(context, raw).await,
         other => Err(ErrorObject::method_not_found().data(Value::String(other.to_string()))),
     }
 }
@@ -738,19 +839,10 @@ async fn session_new(context: &Dispatch, raw: Option<Value>) -> Result<Value, Er
     let project_root = project_root(context, &request.cwd)?;
     let thread_id = ThreadId::new();
 
-    let setup = ThreadSetup {
-        thread_id,
-        owner: context.setup.client_id.clone(),
-        sink: context.setup.sink.clone(),
-        conn: context.conn.clone(),
-        runtime: context.setup.runtime.clone(),
-        router: context.setup.router.clone(),
-        project_root: Arc::new(project_root),
-        system_prompt: context.setup.defaults.system_prompt.clone(),
-        approval_timeout: context.setup.defaults.approval_timeout,
-        auto_approve: Arc::clone(&context.setup.defaults.auto_approve),
-        lsp: Arc::clone(&context.setup.defaults.lsp),
-    };
+    // Written down before the client is told the id, so the session the client
+    // holds and the session a restart can find are the same session.
+    let meta = record_session(context, &thread_id, &project_root).await?;
+    let setup = thread_setup(context, thread_id, project_root);
 
     let created = context
         .setup
@@ -758,6 +850,8 @@ async fn session_new(context: &Dispatch, raw: Option<Value>) -> Result<Value, Er
         .ask(CreateThread {
             setup,
             history: Vec::new(),
+            meta,
+            appended: 0,
         })
         .await
         .map_err(|error| internal(&format!("could not create a session: {error}")))?;
@@ -826,7 +920,9 @@ async fn session_load(context: &Dispatch, raw: Option<Value>) -> Result<Value, E
         .map_err(|error| internal(&format!("session lookup failed: {error}")))?;
 
     let Some(handle) = handle else {
-        return Err(acp::unknown_session(&request.session_id));
+        // Not live is not the same as unknown. A daemon that has restarted
+        // holds no sessions at all, and the store is what remembers them.
+        return hydrate(context, &request.session_id, &thread_id).await;
     };
 
     // The replay is emitted from inside this `ask`, so the FIFO sink puts every
@@ -891,9 +987,10 @@ async fn session_cancel(context: &Dispatch, raw: Option<Value>) -> Result<(), Er
 
 /// `session/list`: describe every session this client holds.
 async fn session_list(context: &Dispatch, raw: Option<Value>) -> Result<Value, ErrorObject> {
-    // Parsed and discarded: the request's only fields are a cwd filter and a
-    // cursor, and a connection's session set is small enough to answer whole.
-    let _request: acp::ListSessionsRequest = params(raw)?;
+    // The cursor is discarded: a connection's session set is small enough to
+    // answer whole. The cwd is not, because it decides which stored sessions
+    // are worth offering back.
+    let request: acp::ListSessionsRequest = params(raw)?;
 
     let ThreadList { threads } = context
         .setup
@@ -903,10 +1000,12 @@ async fn session_list(context: &Dispatch, raw: Option<Value>) -> Result<Value, E
         .map_err(|error| internal(&format!("could not list sessions: {error}")))?;
 
     let mut sessions = Vec::new();
+    let mut live = Vec::new();
     for (thread_id, handle) in threads {
         if !context.sessions.contains(&thread_id) {
             continue;
         }
+        live.push(thread_id.clone());
         match handle.ask(DescribeThread).await {
             Ok(summary) => sessions.push(acp::SessionInfo::new(
                 acp::session_id(&thread_id),
@@ -918,14 +1017,351 @@ async fn session_list(context: &Dispatch, raw: Option<Value>) -> Result<Value, E
         }
     }
 
+    // Appended rather than merged in place: what is live comes first, in the
+    // order it was created, and what can be reopened follows it.
+    let stored = stored_sessions(context, request.cwd.as_deref(), &live).await;
+    sessions.extend(stored);
+
     encode(&acp::ListSessionsResponse::new(sessions))
 }
 
-/// `_garrison/status`: what this agent is, and what it is enforcing.
-async fn status(context: &Dispatch) -> Result<Value, ErrorObject> {
+// =============================================================================
+// Sessions that outlive the process
+// =============================================================================
+
+/// Everything a session actor needs, built once for both ways in.
+///
+/// `session/new` and a `session/load` that hydrates from the store want the
+/// identical configuration; the only thing that differs between them is which
+/// identity and which root it is built around. Factored out so the two paths
+/// cannot drift, which is how one of them would quietly end up with the wrong
+/// gates or no store.
+fn thread_setup(context: &Dispatch, thread_id: ThreadId, project_root: PathBuf) -> ThreadSetup {
     let defaults = &context.setup.defaults;
 
-    encode(&acp::GarrisonStatus {
+    ThreadSetup {
+        thread_id,
+        owner: context.setup.client_id.clone(),
+        sink: context.setup.sink.clone(),
+        conn: context.conn.clone(),
+        runtime: context.setup.runtime.clone(),
+        router: context.setup.router.clone(),
+        project_root: Arc::new(project_root),
+        system_prompt: defaults.system_prompt.clone(),
+        approval_timeout: defaults.approval_timeout,
+        auto_approve: Arc::clone(&defaults.auto_approve),
+        lsp: Arc::clone(&defaults.lsp),
+        gates: defaults.gates.clone(),
+        store: defaults.store.clone(),
+    }
+}
+
+/// The refusal a client sees when the session store will not answer.
+///
+/// The same code the turn gate refuses with, because it is the same fact: a
+/// daemon that cannot write a session down does not open one, rather than
+/// opening one whose history the next restart will not find.
+fn store_unavailable(error: &crate::error::GarrisonError) -> ErrorObject {
+    ErrorObject::new(
+        error_code::STORE_UNAVAILABLE,
+        format!("the session store is unavailable: {error}"),
+    )
+}
+
+/// Writes a new session down before the client is told it exists.
+///
+/// Ordered that way on purpose. A session the client holds an id for but the
+/// store has never heard of is a session that vanishes at the next restart
+/// with nothing to say about why, so the write is what the id is issued
+/// against. Returns `None` on an install with no store armed, which is the
+/// standalone developer install and behaves exactly as it did before.
+async fn record_session(
+    context: &Dispatch,
+    thread_id: &ThreadId,
+    project_root: &Path,
+) -> Result<Option<session::SessionMeta>, ErrorObject> {
+    let defaults = &context.setup.defaults;
+    let Some(store) = &defaults.store else {
+        return Ok(None);
+    };
+
+    let conversation = store
+        .create(thread_id, defaults.system_prompt.clone())
+        .await
+        .map_err(|error| store_unavailable(&error))?;
+
+    let meta = session::SessionMeta::opening(
+        conversation,
+        project_root.to_path_buf(),
+        session::CLIENT_SOCKET,
+    )
+    .attributed(&defaults.attribution);
+
+    store
+        .write_meta(thread_id, &meta)
+        .await
+        .map_err(|error| store_unavailable(&error))?;
+
+    Ok(Some(meta))
+}
+
+/// Brings a stored session back as a live actor, or says it is unknown.
+///
+/// The boundary is re-checked here rather than trusted from the record. The
+/// approved roots are an administrator's decision and may have narrowed since
+/// the session was written; a session rooted outside them now is refused, and
+/// a stored record is not a way around that.
+async fn hydrate(
+    context: &Dispatch,
+    session_id: &acp::SessionId,
+    thread_id: &ThreadId,
+) -> Result<Value, ErrorObject> {
+    let Some(store) = &context.setup.defaults.store else {
+        return Err(acp::unknown_session(session_id));
+    };
+
+    let stored = store
+        .resolve(thread_id)
+        .await
+        .map_err(|error| store_unavailable(&error))?;
+    let Some(stored) = stored else {
+        return Err(acp::unknown_session(session_id));
+    };
+
+    let project_root = approved_root(context, &stored.meta.project_root)?;
+    let history = store
+        .history(&stored.meta.conversation)
+        .await
+        .map_err(|error| store_unavailable(&error))?;
+    let appended = history.len();
+
+    let setup = thread_setup(context, thread_id.clone(), project_root);
+    let created = context
+        .setup
+        .supervisor
+        .ask(CreateThread {
+            setup,
+            history,
+            meta: Some(stored.meta.clone()),
+            appended,
+        })
+        .await
+        .map_err(|error| internal(&format!("could not restore the session: {error}")))?;
+
+    // Reattaching a session this connection just created looks redundant and
+    // is not: the replay is emitted from inside the `ask`, so the history
+    // reaches the socket before the response ACP says it must precede.
+    created
+        .handle
+        .ask(Reattach {
+            owner: context.setup.client_id.clone(),
+            sink: context.setup.sink.clone(),
+            conn: context.conn.clone(),
+        })
+        .await
+        .map_err(|error| internal(&format!("could not load the session: {error}")))?;
+
+    context
+        .notify_self(OwnSession {
+            thread_id: thread_id.clone(),
+        })
+        .await;
+
+    tracing::info!(
+        %thread_id,
+        messages = appended,
+        interrupted = stored.meta.interrupted().is_some(),
+        "restored a session written before this process started",
+    );
+
+    let response = acp::LoadSessionResponse::new();
+    match interrupted_meta(store, &stored.meta).await {
+        Some(interrupted) => encode(&response.meta(Some(acp::garrison_meta(&acp::LoadMeta {
+            interrupted_turn: interrupted,
+        })))),
+        None => encode(&response),
+    }
+}
+
+/// Re-checks a stored session's root against the roots approved *now*.
+///
+/// Separate from [`project_root`] because the refusal is a different one. A
+/// `session/new` naming a bad directory is a client mistake and reads as
+/// invalid parameters; a stored session whose root has since been de-approved
+/// is an administrator's decision catching up with history, and `-32020`
+/// SESSION_ROOT_UNAPPROVED is the code that says so. The record is left
+/// alone either way: the session is not deleted, it is simply not opened
+/// here, and re-approving the tree brings it back.
+fn approved_root(context: &Dispatch, stored: &Path) -> Result<PathBuf, ErrorObject> {
+    let defaults = &context.setup.defaults;
+
+    crate::boundary::resolve(stored, &defaults.project_root, &defaults.approved_roots).map_err(
+        |rejection| {
+            tracing::warn!(
+                root = %stored.display(),
+                rejection = %rejection,
+                "refused to reopen a stored session",
+            );
+            ErrorObject::new(
+                error_code::SESSION_ROOT_UNAPPROVED,
+                format!(
+                    "this session was opened at '{}', which is no longer inside an approved                      tree: {rejection}. Approve it again under [threads] workspace_roots to                      reopen the session",
+                    stored.display()
+                ),
+            )
+        },
+    )
+}
+
+/// What a client is told about a turn a restart cut short.
+///
+/// The record's open turn is the fact; the checkpoint adds how far it got and
+/// whether there is anything left to pick up. A checkpoint that cannot be read
+/// makes the turn unresumable rather than unreportable: the operator still
+/// needs to know the session is blocked, and abandoning it is still open to
+/// them.
+async fn interrupted_meta(
+    store: &session::SessionStore,
+    meta: &session::SessionMeta,
+) -> Option<acp::InterruptedTurnMeta> {
+    let open = meta.interrupted()?;
+    let record = match session::checkpoint_id_for(&open.turn_id) {
+        Ok(id) => store.checkpoint(&id).await.ok().flatten(),
+        Err(_) => None,
+    };
+
+    Some(acp::InterruptedTurnMeta {
+        turn_id: open.turn_id.to_string(),
+        started_at: open.started_at.clone(),
+        prompt: open.content.clone(),
+        rounds_completed: record.as_ref().map(|record| record.rounds_completed),
+        resumable: record.as_ref().is_some_and(|record| {
+            matches!(
+                record.status,
+                CheckpointStatus::InProgress | CheckpointStatus::Failed
+            )
+        }),
+    })
+}
+
+/// Stored sessions this client is not already holding live, for `session/list`.
+///
+/// Filtered by the requested `cwd` when the client named one, because a client
+/// asking what it can reopen is asking about the project in front of it rather
+/// than about every project this daemon has ever served.
+async fn stored_sessions(
+    context: &Dispatch,
+    cwd: Option<&Path>,
+    live: &[ThreadId],
+) -> Vec<acp::SessionInfo> {
+    let Some(store) = &context.setup.defaults.store else {
+        return Vec::new();
+    };
+
+    let sessions = match store.list().await {
+        Ok(sessions) => sessions,
+        // A store that will not answer costs the client the resumable
+        // sessions, not the live ones it can already see.
+        Err(error) => {
+            tracing::warn!(%error, "could not list stored sessions");
+            return Vec::new();
+        }
+    };
+
+    sessions
+        .into_iter()
+        .filter(|stored| cwd.is_none_or(|cwd| stored.meta.project_root == cwd))
+        .filter_map(|stored| {
+            // A name that is not one of Garrison's identities belongs to some
+            // other writer of this database and is not this daemon's to offer.
+            let thread_id = ThreadId::parse(&stored.name).ok()?;
+            (!live.contains(&thread_id)).then(|| {
+                acp::SessionInfo::new(
+                    acp::session_id(&thread_id),
+                    stored.meta.project_root.clone(),
+                )
+                .updated_at(Some(stored.last_active.clone()))
+            })
+        })
+        .collect()
+}
+
+/// `_garrison/session/resume`: pick an interrupted turn back up.
+///
+/// Answers like `session/prompt` does — deferred, resolved when the turn ends
+/// — because that is what it is: the same turn, under the same identity,
+/// carrying on from the round its checkpoint stopped at. A session with
+/// nothing to resume is `-32021`, never a silently restarted turn.
+async fn session_resume(context: &Dispatch, raw: Option<Value>) -> Result<Answer, ErrorObject> {
+    let request: acp::InterruptedTurnRequest = params(raw)?;
+    let thread_id = acp::thread_id(&request.session_id)?;
+    let session = context.find(&thread_id).await?;
+
+    let admission = session
+        .ask(ResumeTurn)
+        .await
+        .map_err(|error| internal(&format!("could not resume: {error}")))?;
+
+    match admission {
+        ResumeAdmission::Resumed { .. } => Ok(Answer::Deferred),
+        ResumeAdmission::Nothing => Err(ErrorObject::new(
+            error_code::NO_INTERRUPTED_TURN,
+            "this session has no interrupted turn to resume",
+        )),
+        ResumeAdmission::Busy { turn_id } => {
+            Err(busy_error().data(serde_json::json!({ "turnId": turn_id.to_string() })))
+        }
+    }
+}
+
+/// `_garrison/session/abandon`: give up on an interrupted turn.
+///
+/// The escape hatch that keeps fail-closed from meaning stuck: a session whose
+/// interrupted turn cannot or should not be resumed is promptable again the
+/// moment an operator says so, and the record says the turn was abandoned
+/// rather than forgotten.
+async fn session_abandon(context: &Dispatch, raw: Option<Value>) -> Result<Value, ErrorObject> {
+    let request: acp::InterruptedTurnRequest = params(raw)?;
+    let thread_id = acp::thread_id(&request.session_id)?;
+    let session = context.find(&thread_id).await?;
+
+    let abandoned = session
+        .ask(AbandonTurn)
+        .await
+        .map_err(|error| internal(&format!("could not abandon: {error}")))?;
+
+    let Some(turn_id) = abandoned.turn_id else {
+        return Err(ErrorObject::new(
+            error_code::NO_INTERRUPTED_TURN,
+            "this session has no interrupted turn to abandon",
+        ));
+    };
+
+    tracing::info!(%thread_id, %turn_id, "an operator abandoned an interrupted turn");
+
+    encode(&acp::AbandonResponse {
+        turn_id: turn_id.to_string(),
+    })
+}
+
+/// `_garrison/status`: what this agent is, and what it is enforcing.
+///
+/// Three sources, assembled in one place: what the connection knows on its
+/// own, what the audit trail says about its chain, and one [`StatusPart`]
+/// from every describer in [`ConnSetup::describers`].
+async fn status(context: &Dispatch) -> Result<Value, ErrorObject> {
+    let base = own_status(context);
+    let chain_head = chain_head(&context.setup.runtime, context.setup.audited).await;
+    let parts = describe_all(&context.setup.describers).await;
+
+    encode(&assemble(base, chain_head, parts))
+}
+
+/// The part of the status this connection can state without asking anyone.
+fn own_status(context: &Dispatch) -> acp::GarrisonStatus {
+    let defaults = &context.setup.defaults;
+
+    acp::GarrisonStatus {
         agent: env!("CARGO_PKG_NAME").to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         protocol_version: context.version.unwrap_or(acp::PROTOCOL_VERSION).as_u16(),
@@ -934,12 +1370,76 @@ async fn status(context: &Dispatch) -> Result<Value, ErrorObject> {
             approval_timeout_secs: defaults.approval_timeout.as_secs(),
             auto_approve: defaults.auto_approve.as_ref().clone(),
         },
-        audit: acp::AuditStatus {
-            enabled: context.setup.audited,
-            chain_head: None,
-        },
+        audit: acp::AuditStatus::undescribed(context.setup.audited),
         sandbox: context.setup.sandbox.clone(),
-    })
+        threads: None,
+        plane: None,
+        context: None,
+        session_store: None,
+        entitlement: None,
+    }
+}
+
+/// The hash at the end of the audit chain, when there is a chain to ask.
+///
+/// Not asked at all when auditing is off: acton-ai answers that case with a
+/// configuration error, and there is no point paying for one per status call.
+async fn chain_head(runtime: &ActonAI, audited: bool) -> Option<String> {
+    if !audited {
+        return None;
+    }
+    match runtime.audit_head().await {
+        Ok(head) => Some(head.hash),
+        Err(error) => {
+            tracing::debug!(%error, "the audit trail did not disclose its head");
+            None
+        }
+    }
+}
+
+/// Asks every describer for its part, keeping the ones that answered.
+///
+/// A subsystem that does not answer is missing from the status rather than
+/// failing it: an operator asking "why is this daemon refusing turns" needs
+/// the rest of the picture most precisely when one piece is wedged.
+async fn describe_all(describers: &[ActorHandle]) -> Vec<StatusPart> {
+    let mut parts = Vec::with_capacity(describers.len());
+    for describer in describers {
+        match describer.ask(Describe).await {
+            Ok(part) => parts.push(part),
+            Err(error) => {
+                tracing::debug!(describer = %describer.id(), ?error, "a subsystem did not describe itself");
+            }
+        }
+    }
+    parts
+}
+
+/// Places each subsystem's part into the status.
+///
+/// Pure. Every variant of [`StatusPart`] has exactly one home here, which is
+/// what makes adding a subsystem a three-line change.
+fn assemble(
+    mut status: acp::GarrisonStatus,
+    chain_head: Option<String>,
+    parts: Vec<StatusPart>,
+) -> acp::GarrisonStatus {
+    status.audit.chain_head = chain_head;
+    for part in parts {
+        match part {
+            StatusPart::Threads(threads) => status.threads = Some(threads),
+            StatusPart::Plane(plane) => status.plane = Some(plane),
+            StatusPart::Context(context) => status.context = Some(context),
+            StatusPart::Entitlement(entitlement) => status.entitlement = Some(entitlement),
+            // The keeper asked the writer itself, so its answer replaces the
+            // head this connection read on its own — including the head,
+            // which the keeper reports from the same barrier that produced
+            // the health beside it.
+            StatusPart::Audit(audit) => status.audit = *audit,
+            StatusPart::SessionStore(store) => status.session_store = Some(store),
+        }
+    }
+    status
 }
 
 #[cfg(test)]
@@ -1051,6 +1551,8 @@ mod tests {
                     prompt_tokens: 11,
                     completion_tokens: 7,
                 },
+                plan: None,
+                compactions: Vec::new(),
             },
         };
 
@@ -1062,6 +1564,54 @@ mod tests {
         assert_eq!(parsed["result"]["stopReason"], "end_turn");
         assert_eq!(parsed["result"]["_meta"]["garrison"]["promptTokens"], 11);
         assert_eq!(parsed["result"]["_meta"]["garrison"]["completionTokens"], 7);
+        assert!(
+            parsed["result"]["_meta"]["garrison"]["plan"].is_null(),
+            "a turn with no plan says nothing about one"
+        );
+        assert!(
+            parsed["result"]["_meta"]["garrison"]["compactions"].is_null(),
+            "a turn that compacted nothing says nothing about compaction"
+        );
+    }
+
+    #[test]
+    fn a_completed_turn_reports_its_final_plan_and_compactions_in_meta() {
+        use acton_ai::memory::{CompactionOutcome, CompactionRecord};
+        use acton_ai::tools::plan::{Plan, PlanStep, PlanStepStatus};
+
+        let plan = Plan::new(
+            vec![
+                PlanStep::parse("read the parser", PlanStepStatus::Completed).unwrap(),
+                PlanStep::parse("fix the parser", PlanStepStatus::InProgress).unwrap(),
+            ],
+            None,
+        )
+        .expect("a two-step plan is valid");
+        let record = CompactionRecord {
+            summary: "the earlier exchanges".to_string(),
+            outcome: CompactionOutcome {
+                messages_before: 12,
+                messages_after: 5,
+                tokens_before: 900,
+                tokens_after: 300,
+                messages_elided: 8,
+            },
+            elided_prefix_len: 8,
+        };
+
+        let meta = turn_meta(
+            "turn_abc",
+            &TurnUsage::default(),
+            Some(&plan),
+            std::slice::from_ref(&record),
+        );
+        let garrison = &meta[acp::ext::META_KEY];
+
+        assert_eq!(garrison["plan"]["completed"], 1);
+        assert_eq!(garrison["plan"]["total"], 2);
+        assert_eq!(garrison["plan"]["steps"][1]["status"], "in_progress");
+        assert_eq!(garrison["compactions"][0]["messagesElided"], 8);
+        assert_eq!(garrison["compactions"][0]["elidedPrefixLen"], 8);
     }
 
     #[test]
@@ -1095,5 +1645,119 @@ mod tests {
         let parsed: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(parsed["error"]["code"], error_code::TURN_FAILED);
         assert_eq!(parsed["error"]["data"], "the provider hung up");
+    }
+
+    #[test]
+    fn a_refused_turn_answers_the_prompt_with_the_gates_code() {
+        let (sink, mut rx) = sink();
+        let finished = TurnFinished {
+            thread_id: ThreadId::new(),
+            turn_id: TurnId::new(),
+            result: TurnResult::Refused(crate::admission::TurnRefusal::Seat {
+                reason: "seat revoked".to_string(),
+            }),
+        };
+
+        answer_prompt(&sink, RequestId::Number(3), &finished);
+
+        let parsed: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(parsed["error"]["code"], error_code::SEAT_REFUSED);
+        assert_eq!(
+            parsed["error"]["data"],
+            "no seat entitles this turn: seat revoked"
+        );
+    }
+
+    fn bare_status() -> acp::GarrisonStatus {
+        acp::GarrisonStatus {
+            agent: "garrison-agent".to_string(),
+            version: "0.0.0".to_string(),
+            protocol_version: 1,
+            sessions: 1,
+            policy: acp::PolicyStatus {
+                approval_timeout_secs: 1,
+                auto_approve: Vec::new(),
+            },
+            audit: acp::AuditStatus::undescribed(true),
+            sandbox: acp::SandboxStatus::disabled(),
+            threads: None,
+            plane: None,
+            session_store: None,
+            context: None,
+            entitlement: None,
+        }
+    }
+
+    #[test]
+    fn assembling_places_the_compaction_policy() {
+        let assembled = assemble(
+            bare_status(),
+            None,
+            vec![StatusPart::Context(acp::ContextStatus {
+                compaction: Some(acp::CompactionStatus {
+                    threshold: 0.8,
+                    keep_recent_turns: 3,
+                }),
+                compactions: 2,
+            })],
+        );
+
+        let context = assembled.context.expect("the context part must land");
+        assert_eq!(context.compactions, 2);
+        assert_eq!(
+            context.compaction.map(|policy| policy.keep_recent_turns),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn assembling_places_each_part_and_the_chain_head() {
+        let assembled = assemble(
+            bare_status(),
+            Some("abc123".to_string()),
+            vec![StatusPart::Threads(acp::ThreadsStatus { live: 4 })],
+        );
+
+        assert_eq!(assembled.audit.chain_head.as_deref(), Some("abc123"));
+        assert_eq!(assembled.threads, Some(acp::ThreadsStatus { live: 4 }));
+    }
+
+    #[test]
+    fn a_missing_part_leaves_its_field_absent_rather_than_failing() {
+        let assembled = assemble(bare_status(), None, Vec::new());
+
+        assert_eq!(assembled.threads, None);
+        assert_eq!(assembled.audit.chain_head, None);
+        let encoded = serde_json::to_value(&assembled).unwrap();
+        assert!(encoded.get("threads").is_none());
+    }
+
+    #[tokio::test]
+    async fn the_supervisor_describes_how_many_sessions_it_holds() {
+        let mut runtime = ActonApp::launch_async().await;
+        let supervisor = crate::thread::ThreadSupervisor::spawn(&mut runtime).await;
+
+        let parts = describe_all(&[supervisor]).await;
+
+        assert!(
+            matches!(
+                parts.as_slice(),
+                [StatusPart::Threads(acp::ThreadsStatus { live: 0 })]
+            ),
+            "{parts:?}"
+        );
+        runtime.shutdown_all().await.expect("clean shutdown");
+    }
+
+    #[tokio::test]
+    async fn a_describer_that_has_stopped_is_left_out() {
+        let mut runtime = ActonApp::launch_async().await;
+        let supervisor = crate::thread::ThreadSupervisor::spawn(&mut runtime).await;
+        supervisor.stop().await.expect("the supervisor stops");
+
+        let parts = describe_all(&[supervisor]).await;
+
+        assert!(parts.is_empty());
+        runtime.shutdown_all().await.expect("clean shutdown");
     }
 }

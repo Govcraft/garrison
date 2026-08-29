@@ -206,6 +206,22 @@ typed_id!(
     "approval"
 );
 
+typed_id!(
+    /// One installation of this daemon on one machine.
+    ///
+    /// Unlike the four above, this one outlives the process. It is minted once
+    /// at enrollment, written to the install record, and read back on every
+    /// subsequent start, because the control plane keys a machine's whole
+    /// history on it: which grant admitted it, which credentials it has held,
+    /// which sessions it ran. A daemon that minted a fresh one each boot would
+    /// look like a new machine every morning.
+    InstallId,
+    /// Raised when a string is not a valid [`InstallId`].
+    InvalidInstallId,
+    "inst",
+    "install"
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;

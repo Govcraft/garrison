@@ -6,13 +6,18 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-acton-ai = { version = "0.34.0", path = "../../acton-ai" }
+acton-ai = { version = "0.35.0", path = "../../acton-ai" }
 acton-reactive = "9.1.0"
+acton-service-client = "0.1.2"
 agent-client-protocol-schema = "1.6.0"
 base64 = "0.23.1"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde", "std"] }
 clap = { version = "4.6.6", features = ["derive"] }
 crossterm = { version = "0.29", features = ["bracketed-paste", "event-stream"] }
+ed25519-dalek = { version = "3.0.0", features = ["pkcs8", "pem"] }
+garrison-wire = { version = "0.1.0", path = "../wire" }
 getrandom = "0.4.3"
+hostname = "0.4.2"
 lsp-types = "0.97.0"
 mti = "1.1.1"
 ratatui = { version = "0.30.2", features = ["scrolling-regions", "unstable-widget-ref"] }
@@ -22,7 +27,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"
 textwrap = "0.16.2"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process", "signal"] }
 tokio-stream = "0.1.19"
 tokio-util = "0.7.19"
 toml = "1.1.4"
@@ -33,4 +38,5 @@ url = "2.5.8"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+testcontainers = "0.28.0"
 vt100 = "0.16.2"

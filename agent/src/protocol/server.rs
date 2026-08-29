@@ -58,6 +58,13 @@ pub struct ServerSetup {
     pub audited: bool,
     /// What isolation the runtime's writing tools run under.
     pub sandbox: acp::SandboxStatus,
+    /// Every actor that contributes a part to `_garrison/status`.
+    pub describers: Vec<ActorHandle>,
+    /// The daemon's credential holder, on a governed install.
+    ///
+    /// `None` on a standalone agent. See [`crate::plane`]: this handle is the
+    /// only way to an authenticated plane client anywhere in the daemon.
+    pub plane: Option<ActorHandle>,
 }
 
 /// Owns the listener and the accept loop.
@@ -234,6 +241,8 @@ where
             capabilities: setup.capabilities,
             audited: setup.audited,
             sandbox: setup.sandbox,
+            describers: setup.describers,
+            plane: setup.plane,
         },
     )
     .await;

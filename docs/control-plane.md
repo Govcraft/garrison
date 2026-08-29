@@ -20,11 +20,12 @@ the two gates that run without a database:
 task plane:check      # parse the schemas, then strict-mode validate the Cedar bundle
 ```
 
-16 schemas lower into 160 generated Cedar policies; 10 hand-written policies in
-`policies/custom/` bring the bundle to 170, all strict-mode validated. The model
-has also been applied end to end against a throwaway PostgreSQL 17 instance: 26
-migration steps, 15 tables, every `unique` constraint and every CEL rule
-type-checked at apply time. The server was then run against it and the
+18 schemas lower into a Cedar bundle of 231 policies, 12 of them hand-written
+in `policies/custom/`, all strict-mode validated. The model has also been
+applied end to end against a throwaway PostgreSQL 16 instance: 31 migration
+steps, 18 tables, every `unique` constraint and every CEL rule type-checked at
+apply time, and the three hook bindings validated against the generated
+descriptor at startup. The server was then run against it and the
 authorization and write-time rules exercised over HTTP — both delete
 `forbid`s against a control case that succeeds, issuer separation between
 enrollment artifacts and console bearers, and every `@require` on both its
@@ -32,11 +33,26 @@ passing and its failing branch. That database was discarded.
 
 Tooling: `schemaforge` 0.37.2, PostgreSQL flavor.
 
-**Planned:** everything that moves bytes. The agent does not yet pull policy
-from this plane or push audit to it, no database has been provisioned, Entra ID
-is modeled but not integrated, and there is no administration site. The model
-landing first is deliberate — the wire contract between agent and plane is the
-entity model, so it is the thing worth being wrong about early and cheaply.
+The agent enrolls itself on first run (`agent/src/enrollment/`), against the
+same endpoint and the same hook. It then authenticates every later call by
+signing a short-lived assertion with its install key and trading it for a
+15-minute bearer at `POST /api/v1/install/token` on `hooks-service/`; see
+"Authenticating after enrollment" below. That exchange is the single
+authenticated path from a daemon to the plane, and the policy pull, the seat
+check and the audit shipper are all consumers of it rather than of their own
+credentials.
+
+Entra ID is the authority for operators: `hooks-service/` runs a directory
+sync that creates, links, renames, suspends, and offboards `Operator` rows
+from a Microsoft Graph listing (or a JSON file), and the enrollment hook
+refuses anyone the directory has not vouched for. See "Directory" below for
+the rules and for what has and has not been proved against a real tenant.
+
+**Planned:** everything else that moves bytes. The agent does not yet pull
+policy from this plane or push audit to it, no database has been provisioned,
+and there is no administration site. The
+model landing first is deliberate — the wire contract between agent and plane is
+the entity model, so it is the thing worth being wrong about early and cheaply.
 
 ## What SchemaForge owns, and what it does not
 
@@ -56,7 +72,10 @@ the agent needs a console account.
 
 ## The model
 
-Six files, fifteen schemas, one tenancy root.
+Eight files, eighteen schemas, one tenancy root. Seventeen are Garrison's; the
+eighteenth, `schemas/user.schema`, is the deployment's override of
+SchemaForge's system `User` schema, redeclared verbatim plus the two columns
+that carry directory identity into a console token.
 
 ### Tenancy — `schemas/organization.schema`
 
@@ -69,6 +88,25 @@ record-level Cedar decision, not a `WHERE` clause somebody has to remember.
 `Team` groups operators so policy can be assigned to a squad rather than to
 every developer by name.
 
+`Organization.entra_group_id` names the Entra ID group whose members are the
+organization's operators, and the three `directory_*` fields are the
+reconciler's report: when it last ran, whether it succeeded, and what it
+found. The `directory_service` role may write those three fields and no
+others. Every field that says what the organization is (`name`, `slug`,
+`entra_tenant_id`, `entra_group_id`, `impact_level`, `seats_licensed`,
+`active`) carries `@field_access(write: ["org_admin"])`, so the sync can
+report on the boundary but never move it. `directory_sync_status` starts at
+`never`; a stale or `failed` view refuses new enrollments and changes no
+operator.
+
+The system `User` gains `entra_object_id` and `org_slug`. Both are projected
+onto `Forge::Principal` at every console login and refresh through
+`[schema_forge.authz.principal_claims]` in `config.toml`, which is what lets a
+Cedar policy ask whether the person behind a bearer is someone the directory
+knows. `roles`, `role_rank`, and `metadata` are fenced to `platform_admin`, so
+the `directory_service` bearer can deactivate a login when the directory
+disables a person but cannot promote one.
+
 ### Identity and entitlement — `schemas/identity.schema`
 
 | Schema | What it answers |
@@ -80,6 +118,16 @@ every developer by name.
 agent presents and can change. `Seat` carries the offboarding lever, and a
 `@require` rule makes revocation state what it is for — a revoked seat with no
 recorded reason is rejected at write time, in-process, before any hook.
+
+The `directory_service` role reads and writes `Operator`: a rename in the
+directory patches `upn`, `email`, and `display_name` on the same row and
+nothing else changes, because every relation to an operator is by id. A
+disabled account becomes `suspended`, a removed member becomes `offboarded`,
+and `directory_synced_at` on the row is per-person proof the reconciler saw
+them. On `Seat` the same role may write, but `@field_access` fences `operator`,
+`organization`, `tier`, `activated_at`, and `expires_at` to `org_admin`. What
+is left is `status`, `revoked_at`, and `revocation_reason`: the sync can take
+a seat away and say why, and cannot grant, move, or extend one.
 
 ### Machine identity — `schemas/credential.schema`
 
@@ -162,6 +210,13 @@ chain walkable back to enrollment.
 cannot hold an active credential — resolved through the `related.install.status`
 single-hop read, with the caller's tenant scope applied.
 
+The credential triplet is named the same on both sides of enrollment:
+`credential_kind`, `public_key`, `cert_fingerprint` on `Redemption` and on
+`InstallCredential`. The hook copies the fields across without translating,
+and a reader of either wire shape sees one vocabulary. (The field was `kind`
+on `InstallCredential` before 1.0; the rename is a column migration, and the
+one live row is recreated by re-enrolling.)
+
 ### Enrollment — `schemas/enrollment.schema`
 
 | Schema | What it answers |
@@ -191,6 +246,7 @@ in `hooks-service/`:
 |---|---|
 | Adjudicate the token | issuer, status, expiry, use count, tenant — in that order |
 | Resolve the operator | an operator-scoped grant wins over the machine's claim |
+| Admit the operator | `status` must be `active`; with the directory on, the row must carry an `entra_object_id` and the organization's directory view must be fresh (R4 below) |
 | Create the `AgentInstall` | `status = enrolled`, not `active`: joining the fleet is not entitlement |
 | Create the `InstallCredential` | public material only, `status = active` |
 | Spend the token | one patch carrying both the new count and the status it implies |
@@ -221,8 +277,19 @@ rules, and the same audit as a row a human creates. The transport is
 is built on; it already encodes the error-body shape, the versioned routes,
 bearer auth, and the retry classification, so what remains in `plane.rs` is only
 the part that is genuinely SchemaForge's. The bearer it holds is scoped by the
-`enrollment_service` role, which appears in four `@access` lists and nowhere
-else.
+`enrollment_service` role, which appears in the `@access` lists of the
+schemas it provisions, resolves, and (for the policy publish gate) assembles,
+and nowhere else.
+
+One constraint is worth recording because it is easy to design around and
+impossible to configure around. The plane validates every bearer against the
+single `issuer` in its `[token]` section, so an enrollment artifact minted
+under a distinct issuer is a 401 at authentication and never reaches the hook.
+Artifacts are therefore minted under the plane's own issuer, and
+`hooks-service`'s expected issuer must match it. What separates an artifact
+from a console bearer is not `iss` but the `enrollee` role, which is granted
+write on `Redemption` and nothing else anywhere in the bundle. Issuer
+separation would need the plane to accept more than one issuer.
 
 Verified end to end against a live plane:
 
@@ -238,6 +305,357 @@ POST Redemption  tok_OTHER, operator_upn nobody@agency.gov
   201  outcome=refused, "no operator is registered as 'nobody@agency.gov'"
        token still unspent
 ```
+
+### Enrolling, from the agent's side — `agent/src/enrollment/`
+
+The daemon's half is small on purpose. Redemption is an ordinary entity create,
+so there is no bespoke protocol here to get wrong: the agent posts a row and
+reads what came back.
+
+Three files sit on disk, all under the Garrison config directory
+(`$XDG_CONFIG_HOME/garrison`, else `~/.config/garrison`):
+
+| File | Written by | Lives |
+|---|---|---|
+| `enrollment.toml` | whoever provisions the machine | until it is spent |
+| `install-key.pem` | the daemon, at enrollment, mode 0600 | forever |
+| `install.json` | the daemon, on acceptance | forever |
+
+The packet carries two fields rather than one:
+
+```toml
+token_id = "tok_7f3a"
+artifact = "v4.local...."
+```
+
+The `token_id` is there because the artifact is a PASETO **v4.local** token,
+encrypted with the plane's own key. The daemon cannot read a single claim from
+it, which is the right design, but the redemption body must still name the
+`token_id` it is spending so the `@require` above has something to compare. So
+the id travels in the clear beside the artifact. The id is not a secret. The
+artifact is, which is why the packet is deleted the moment it has been spent.
+
+The install key is generated here and never transmitted. What crosses the wire
+is the public half in SPKI form. The alternative, a plane-issued shared secret,
+would put a replayable credential in the plane's database, on the wire at every
+heartbeat, and in a file on every workstation: three copies of something that
+needs to exist in one place.
+
+`install.json` is the whole first-run test. There is no separate flag whose
+only job is to say "done" — a daemon is enrolled if and only if it can read
+that record back, and the record exists only because a redemption succeeded.
+One fact, one place, no way for the two to disagree. A *corrupt* record is an
+error rather than a silent re-enrollment, which would spend a second grant and
+leave two installs in the fleet for one machine.
+
+Enrollment runs in `build_setup`, before any actor spawns, and has four
+outcomes:
+
+| Situation | What happens |
+|---|---|
+| No `[plane]` section | Nothing. A standalone agent starts as it always did. |
+| Already enrolled | The record is logged and the daemon starts. No call is made. |
+| Not enrolled, plane says yes | Identity is recorded, the packet is destroyed, the daemon starts. |
+| Not enrolled, anything else | The daemon refuses to start. |
+
+That last row is the one worth defending. A governed agent that starts anyway
+when the plane turned it away is not governed; it is an agent with a policy
+document next to it. The same holds for an unreachable plane on a machine that
+has never enrolled: with no install record there is no organization, no seat,
+and nothing to attribute a session to, which is exactly the unattributable
+activity this plane exists to prevent.
+
+An *already enrolled* daemon is deliberately not held to that. It does not call
+the plane at all, so an outage cannot ground a fleet that has already been
+admitted. Enrollment is a one-time gate, not a heartbeat.
+
+What the daemon reports is what the process observed, not what a config file
+claims. `sandbox_hardening` in particular is what the kernel actually granted,
+so a machine whose Landlock support degraded says so and the fleet view shows
+it. The agent's own vocabulary is wider than the plane's — it distinguishes "no
+sandbox configured" from "configured, hardening off" — and both collapse to
+`unavailable` on the way out, so the fleet view answers one question instead of
+two.
+
+Reading the answer fails closed. An `outcome` the daemon does not recognize, or
+an acceptance missing any part of the identity it was supposed to carry, is
+treated as a refusal. A daemon that decided it had enrolled on the strength of
+a half-filled response would be a daemon whose local record disagrees with the
+fleet.
+
+Verified end to end, agent against a live plane, on a staged first-boot
+machine with an empty config directory:
+
+```
+boot 1  packet present, no install record
+  enrolling ... install_id=inst_01m17dz1j7 hostname=govcraft
+  spent enrollment packet removed
+  enrolled  install=agentinstall_01m17dz1vp credential=installcredential_01m17dz1xz
+  daemon starts and listens
+  plane:  EnrollmentToken issued -> redeemed, uses 0 -> 1
+          AgentInstall status=enrolled, sandbox_hardening=best_effort,
+                       isolation_active=true, operator resolved from the UPN
+          InstallCredential kind=ed25519 status=active
+          Redemption outcome=accepted
+  disk:   enrollment.toml gone, install-key.pem 0600, install.json written
+          the stored public_key is the public half of install-key.pem
+
+boot 2  same machine, record present
+  already enrolled ... no call to the plane
+  daemon starts and listens
+
+boot 3  a second machine presenting the same spent packet
+  the control plane refused this install: token has already been fully redeemed
+  exit 1, no install record written, packet left in place
+  plane:  a second Redemption row, outcome=refused, reason recorded
+          no second install, no second credential, token still at uses=1
+```
+
+An earlier attempt in this same run refused with `401 ... The claim 'iss'
+failed validation` and is the reason the constraint above is written down. The
+failure also exercised the path that matters most: the packet survived, no
+record was written, and the daemon did not start.
+
+### Authenticating after enrollment: the install-token exchange
+
+Enrollment answers "may this machine join". It does not answer the question
+every later call asks: what does an enrolled daemon present when it wants to
+read its policy bundle, check its seat, or ship an audit entry? It has an
+Ed25519 private key and nothing else. It cannot present a console bearer,
+because there is no human at 03:00, and it must not hold a long-lived one,
+because a standing credential in a file on a workstation is a file an attacker
+copies.
+
+So there is exactly one authenticated path from a daemon to the plane:
+
+```
+daemon                         garrison-hooks                 plane
+  |  sign a 120s assertion          |                            |
+  |  with the install key           |                            |
+  |-- POST /api/v1/install/token -->|                            |
+  |                                 |-- GET InstallCredential -->|
+  |                                 |-- GET AgentInstall ------->|
+  |                                 |  verify signature, window, |
+  |                                 |  nonce, both statuses      |
+  |<-- 200 { token, expires_at } ---|  mint a 15-minute PASETO   |
+  |                                                              |
+  |------------- GET/POST/PATCH with that bearer --------------->|
+```
+
+The exchange is the only route `garrison-hooks` serves over HTTP; everything
+else it does is a gRPC hook. It is registered through `VersionedApiBuilder`
+with `.with_base_path("/api")` and exempted from the framework's bearer
+middleware by `[token] public_paths = ["/api/v1/install/token"]`, because a
+daemon arriving there has no bearer by definition. That exemption is a
+**prefix** match, so no other route may begin with that string, and the
+service refuses to boot without it rather than answering every exchange with a
+401 raised by middleware the route never reaches.
+
+What is on the wire is one type, defined once, in the workspace crate
+`wire/` (`garrison-wire`) that both the daemon and the service depend on,
+with a pinned test vector both sides compile against:
+
+```json
+{ "credential_id": "...",
+  "assertion":  "base64url(JSON)",
+  "signature":  "base64url(Ed25519 over the raw assertion bytes)" }
+```
+
+The assertion's JSON keys are `credential_id`, `install_id`, `iat`, `exp`,
+`nonce`, in that order, and the signature covers the octets that arrived
+rather than a re-serialization of the parsed value, so no canonicalization
+step can disagree between the two ends.
+
+The decision is a pure function, `adjudicate_assertion(now, body, credential,
+install)` in `hooks-service/src/install_token.rs`. It takes a clock reading and
+two rows and performs no I/O, so every branch below is a unit test that needs
+neither a database nor a socket:
+
+| Refused because | Status | `error` |
+|---|---|---|
+| no such credential row, or none this service may see | 401 | `unknown_credential` |
+| the signature does not verify against the stored SPKI | 401 | `assertion_rejected` |
+| the assertion names an install its credential does not belong to | 401 | `assertion_rejected` |
+| `exp - iat > 120`, or `now` outside `[iat-30, exp+30]` | 401 | `assertion_window` / `assertion_expired` / `assertion_future` |
+| the nonce is shorter than 22 characters | 401 | `assertion_nonce` |
+| the nonce has been seen before | 401 | `assertion_replayed` |
+| `credential_kind != "ed25519"` | 403 | `unsupported_credential_kind` |
+| `credential.status != "active"` | 403 | `credential_rejected` |
+| `install.status` is `quarantined` or `retired` | 403 | `install_not_active` |
+
+The 401/403 split is the daemon's whole branch. A 401 is worth one retry with
+a fresh assertion; a 403 is a decision somebody made, and a daemon that
+retried it would turn a deliberate quarantine into a denial of service against
+its own control plane. A refusal is never reported as "the plane is
+unreachable", and an unreachable plane is never reported as a refusal.
+
+Replay is the one check that is not in the pure function, because "have I seen
+this before" is by construction a fact about state. It lives in a supervised
+`NonceLedger` actor, so no lock is held in a request path, and entries are
+dropped as they expire on the way through, so the ledger never holds more than
+one assertion window's worth of traffic and needs no timer. A restart empties
+it, which is bounded rather than a hole: an assertion outside its 120-second
+window is refused whether or not its nonce is remembered.
+
+The bearer is minted with the plane's own `[token]` key through
+`PasetoGenerator` + `ClaimsBuilder`, so it is indistinguishable from one
+`schemaforge token generate` produced and needs no second trust root:
+`sub = "install:{install_id}"`, `roles = ["operator"]`, a `tenant_chain` of
+the install's organization, and custom `install` and `credential_id` claims.
+Lifetime is `[garrison] lifetime`, 900 seconds. The tenant chain is not
+optional decoration: a bearer without it sees no tenant-scoped row at all.
+The exchange then best-effort PATCHes `InstallCredential` with `last_used_at`,
+`last_used_from` (the forwarded client address, when a proxy supplied one) and
+`use_count + 1`; a failure there costs an audit detail rather than the
+daemon's turn.
+
+On the daemon's side the whole thing lives in `agent/src/plane/`, and the
+invariant is worth stating plainly: **nothing outside that module builds an
+authenticated client**. Every subsystem asks the `PlaneSession` actor for an
+`Authenticate` and receives an `Api` that is already authenticated and already
+scoped. The actor hands back the bearer it holds while more than 60 seconds
+remain on it, and otherwise performs exactly one exchange with every other
+asker parked on the result. Serialization is a property of the mailbox, not
+of a lock somebody remembered to take. `_garrison/status` gains a `plane`
+block reporting reachability, the last exchange, the current expiry, and the
+last error, because when turns are being refused this is the first field an
+operator should read: every governed subsystem spends the same bearer.
+
+A daemon that has enrolled and then cannot read its install key does not
+start (exit 2). The key is loaded, never created: generating a replacement
+would leave a process that had quietly stopped being itself.
+
+Verified end to end against the live development plane, with throwaway rows
+and our own `garrison-hooks` on a free port:
+
+```
+POST /api/v1/install/token   valid assertion         200
+  GET AgentInstall with the minted bearer            200  (hostname read back)
+POST /api/v1/install/token   replayed nonce          401  assertion_replayed
+POST /api/v1/install/token   forged signature        401  assertion_rejected
+POST /api/v1/install/token   retired install         403  install_not_active
+POST /api/v1/install/token   revoked credential      403  credential_rejected
+POST /api/v1/install/token   unknown credential      401  unknown_credential
+```
+
+The same sequence runs in CI against a containerized plane
+(`hooks-service/tests/install_token.rs`): one PostgreSQL 16, one
+`schemaforge apply` and `serve`, one `garrison-hooks`, a keypair generated in
+the test whose SPKI goes onto a real `InstallCredential` row.
+
+### Seat entitlement, from the agent's side — `agent/src/entitlement/`
+
+**Implemented.** A seat is not a line in a licence file. It is a row on this
+plane, and the daemon runs only while that row says it may. Every turn passes
+a gate that spends the seat, and a turn that starts on a live seat is ended
+when the seat stops being live under it.
+
+**What is read.** One check is three calls through the shared plane component,
+in the order the rule needs them:
+
+1. `AgentInstall`, this machine's own row, which names its operator.
+2. `Seat`, filtered to that operator.
+3. `Organization`, for `impact_level`, which sets how long a stale answer may
+   be spent.
+
+Nothing here holds a credential of its own. The reader asks `PlaneSession`
+for an `Authenticate` and spends the `Api` it gets back, exactly like the
+policy pull and the audit shipper. A 401 costs one `RevokeBearer` and one
+retry, because the one benign cause of a 401 is a bearer that expired between
+being handed out and being spent. A second 401 is the plane meaning it.
+
+**The rule.** `entitlement::verdict::adjudicate` is a pure function over those
+three rows, and it decides in this order:
+
+| Condition | Answer |
+|---|---|
+| install `status` is not `enrolled` or `active` | refused, `install_not_active` |
+| install has no operator | refused, `install_unbound` |
+| an `active` seat for that operator, not past `expires_at` | entitled, at that seat's tier |
+| a seat exists but every one is revoked | refused, `seat_revoked`, with the recorded reason |
+| a seat exists but its `expires_at` has passed | refused, `seat_expired` |
+| a seat exists in some other state | refused, `seat_not_active`, naming the state |
+| no seat at all | refused, `no_seat` |
+
+When several seats are live the longest-lasting one is spent, and a seat with
+no expiry outlasts every dated one. An `expires_at` that does not parse counts
+as expired: the daemon cannot tell whether an unreadable date is in the
+future, and a seat it cannot date is not a seat it may spend.
+
+**Where the answer comes from at turn time.** The gate answers from the
+standing already in the actor's model, in one message pass, with no network
+call on the turn path. That is not an optimization. A gate has five seconds to
+answer, and a seat check is three plane calls behind a token exchange; a gate
+that went to the network there would, on a slow plane, blow the deadline and
+come back as the generic "a gate could not be asked", collapsing "your seat
+was revoked" and "the plane is unreachable" into one indistinguishable
+failure. Freshness is the timer's job instead: `[plane] seat_check_secs`
+(default 60, clamped to 15..900) drives a repeating `send_every` refresh, and
+the daemon performs one check at startup before it accepts a connection.
+
+**Offline grace.** A plane that cannot be reached is not the same as a plane
+that said no, and only the first gets a window. How long the last confirmed
+entitlement may be spent without reconfirmation comes from the organization's
+`impact_level` and the seat's tier:
+
+| `impact_level` | standard | elevated |
+|---|---|---|
+| `commercial` | 72h | 24h |
+| `fedramp_moderate`, `il2` | 24h | 4h |
+| `fedramp_high`, `il4` | 4h | 0 |
+| `il5`, or an unrecognized value | 0 | 0 |
+
+`[plane] offline_grace_secs` may shorten any of these and can never lengthen
+one: a deployment can be stricter than its impact level requires, never more
+generous. A tier the daemon does not recognize is read as `elevated`, the
+stricter row.
+
+A refusal carries no window at all. A revoked seat refuses the next turn and
+every turn after it, however long the plane is then unreachable for, because a
+refusal is an answer rather than an outage. That is the property that stops a
+revoked install from running out the rest of what would have been its grace.
+
+**Two refusals, not one.** When the seat is revoked, absent, or expired, the
+turn is refused with `SEAT_REFUSED` (-32014). When the seat cannot be
+confirmed and the last confirmation has aged past its window, it is refused
+with `PLANE_UNREACHABLE` (-32015). Both carry prose naming the plane and, for
+a revocation, the reason the console recorded. An operator reading a refused
+prompt can tell which of the two happened without reading a log.
+
+**A turn in flight is not grandfathered.** When a refresh turns an admitting
+standing into a refusing one, the monitor broadcasts `EntitlementLost` on the
+runtime's broker. Sessions subscribe and end the turn they are running with
+that refusal, so a revocation reaches a turn that has already started rather
+than only the next one. The broadcast fires on the transition, so a
+persistently revoked seat does not re-cancel anything.
+
+**The cache.** `entitlement.json` beside the install key, mode 0600, holds the
+last standing so a daemon that restarts while the plane is down still knows
+what it last confirmed and how much of its window is left. It is deliberately
+unsigned: the install key sits in the same directory under the same uid, so
+anyone who can rewrite the cache can already sign it. What bounds the damage
+is the grace table, not a signature, and at `fedramp_high` elevated, `il4`
+elevated, `il5`, or an unrecognized impact level the window is zero and the
+file buys an attacker nothing. Every read failure is a missing cache, which is
+a refusal.
+
+**Status.** `_garrison/status` gains an `entitlement` block: the state, the
+seat and tier when entitled, the refusal reason when not, the impact level,
+when the plane was last confirmed, the grace window and when it runs out, when
+the next check is due, and the last error. `garrison-agent ping` prints a
+`seat:` line from it.
+
+**Proved end to end** against a containerized plane
+(`agent/tests/seat_entitlement.rs`): one PostgreSQL 16, one `schemaforge
+apply` and `serve` on this repository's own schemas and policies, and the
+daemon's own reader spending an `operator` bearer. An `assigned` seat does not
+entitle; activated, it does, at the tier the console set; a PATCH revoking a
+seat with no reason is refused by the `@require`, so the explanation is a fact
+the schema enforces rather than a convention; revoked with a reason, the very
+next check refuses and carries that reason; that refusal is still a refusal
+thirty days later; and a retired install is refused whatever its operator's
+seats say.
+
 
 ### Fleet — `schemas/fleet.schema`
 
@@ -257,6 +675,13 @@ as an observation, and it is the field a reviewer will ask about.
 `AgentSession` is where seat utilization and cost accounting roll up.
 `total_tokens` is `@compute("input_tokens + output_tokens")` — server-derived
 at write time, overwriting whatever a client sends.
+
+A session whose history was compacted reports more tokens, not fewer: each
+pass is a summarization request to the session's own provider, and its usage
+is part of the turn's. The compaction itself is not an audit entry, because no
+tool ran and nobody authorized anything; the chain an install reports is the
+same length either way. See "Compaction, persisted sessions, and audit
+evidence" in [garrison-agent-design.md](garrison-agent-design.md).
 
 ### Policy — `schemas/policy.schema`
 
@@ -279,6 +704,18 @@ examples refuses to load.
 published. An install reports the checksum it loaded; a mismatch is drift, and
 drift is visible rather than deniable.
 
+Publishing is gated by a `before_validate` hook on `PolicyBundle`, bound in
+`config.toml` with `required = true`. When a bundle moves to `published`, the
+hook assembles its rules and endpoints, runs every rule's own match examples,
+and refuses the publish if any fail; otherwise it computes the checksum over
+the canonical bundle and stamps `checksum`, `published_at`, and `published_by`
+onto the row before it persists. The hook reads those rows with the hook
+service's own bearer, which is why `enrollment_service` appears in the read
+lists of `PolicyBundle`, `CommandRule`, `ToolRule`, and `ModelEndpoint`. It
+holds no write grant on any of them: the checksum lands through the hook
+response, not a PATCH. Until the gate is implemented, the hook refuses every
+publish and passes drafting and retiring through untouched.
+
 `ModelEndpoint` records authorization state (`pilot`, `interim_ato`, `ato`,
 `denied`) alongside hosting, and an ATO endpoint must name who authorized it.
 
@@ -286,18 +723,57 @@ drift is visible rather than deniable.
 
 | Schema | What it answers |
 |---|---|
-| `AuditEvent` | One entry from an install's BLAKE3 chain |
-| `AuditChain` | Where a session's chain is, and whether it still verifies |
+| `AuditTrail` | What the install says about its own trail: local head, shipped through |
+| `AuditEvent` | One entry from an install's BLAKE3 chain, the sealed line verbatim |
+| `AuditChain` | Where the plane has verified a trail's chain to, and whether it holds |
 
-The agent already keeps a hash-chained JSONL trail locally. `AuditEvent` is
-where those entries land centrally with the links intact: `entry_hash` is
-unique, `prev_hash` names its predecessor, `chain_seq` orders them. The plane
-re-verifies rather than trusting the install that shipped the entries, and
-`AuditChain.integrity` records what the last walk found — with a `@require`
-rule forcing a gap or a break to say what it was.
+The agent keeps a hash-chained JSONL trail locally; acton-ai seals every entry
+with its sequence, the previous hash, and the trail id it belongs to. The
+three schemas are three vantage points on that one trail, and the split is
+along who is allowed to say what.
+
+`AuditTrail` is the daemon's claim. The `operator` token creates one row per
+trail id and patches it as it ships: `local_head_seq` and `local_head_hash`
+are where the local file is, `shipped_through` is the highest sequence the
+daemon believes the plane acknowledged, `reported_at` is when it last said so,
+and `halted_reason` is set when the daemon stops shipping on its own account.
+Nothing here is verified.
+
+`AuditEvent` is one shipped entry. `entry` holds the acton-ai `AuditEntry`
+JSONL object verbatim, and `chain_seq`, `entry_hash`, and `prev_hash` are
+lifted out of it for indexing: `entry_hash` is unique so a replay collides
+instead of duplicating, `prev_hash` names the predecessor, `chain_seq` orders
+them. The promise is that the plane can re-run chain verification over the
+`entry` column of a trail and reproduce `head_hash`; that is the auditor's
+proof. Every other column (`kind`, `decision`, `decider`, `outcome`,
+`elapsed_ms`, and the rest) is a projection of `entry` that may be re-derived
+and may change; the verbatim entry may not. `session` is optional: a trail
+belongs to an install, and an entry can be sealed before any session is known
+to the plane. `trail` is required.
+
+`AuditChain` is the plane's answer, one per trail rather than one per session.
+Only the `audit_service` role writes it. The `before_validate` hook on
+`AuditEvent`, bound in `config.toml` with `required = true`, loads the chain
+for the entry's trail, re-links the entry against `head_hash` and `head_seq`,
+and either advances the chain, records a gap in `integrity` and `finding`, or
+refuses the write outright as a fork or an edit. `verified_through` says how
+far a background walk has re-derived the chain, and the `@require` on
+`finding` forces a gap or a break to say what it was. `format` names the
+sealing format of the entries, `acton-ai/1` for 1.0, defaulted so a row the
+hook creates never fails on a field it did not send. Until the verifying
+ingest is implemented, the hook refuses every `AuditEvent` write; a stub that
+accepted would persist entries nobody verified while the daemon took the
+success as an acknowledgement.
+
+Silence is the difference between the first and the third over time. A trail
+whose `local_head_seq` keeps moving while its chain's `head_seq` does not is
+an install that stopped shipping; a trail whose `reported_at` stops moving is
+an install that went dark. The two rows disagreeing is the finding, which is
+why the install cannot write the chain and the plane does not write the trail.
 
 Access here is deliberately lopsided. Operators — that is, agents — append and
-cannot read. Auditors read and cannot append.
+cannot read. Auditors read and cannot append. `audit_service` reads all three
+and writes only the chain.
 
 Deletion needs more care than the DSL can express, and the obvious spelling is
 a trap. `delete: []` does **not** mean "nobody": an empty list reads as
@@ -316,7 +792,8 @@ generated policies rather than trusting the annotation.
 
 So the generated permit is narrowed to `org_admin`, and the real rule lives in
 `policies/custom/audit-append-only.cedar` as a Cedar `forbid` over
-`UpdateAuditEvent` and `DeleteAuditEvent`. A `forbid` beats every `permit`,
+`UpdateAuditEvent`, `DeleteAuditEvent`, `DeleteAuditChain`, and
+`DeleteAuditTrail`. A `forbid` beats every `permit`,
 platform_admin's bypass included, which is what makes "nobody deletes" true
 rather than aspirational. Narrowing the generated permit as well means a lost
 custom policy file degrades to "only the highest role", not "everyone".
@@ -329,8 +806,329 @@ Bulk export is a separate consent again. `@export` on both audit schemas
 enables the endpoint; it grants nobody. The distinct `ExportAuditEvent` /
 `ExportAuditChain` actions are permitted in the same custom file to the three
 roles that already read the trail, and the exported column set is
-`@exportable ∩ readable`. `AuditEvent.detail` is deliberately left out: a bulk
-file is the wrong place for whatever a tool happened to attach.
+`@exportable ∩ readable`. `AuditEvent.detail` and `AuditEvent.entry` are
+deliberately left out: a bulk file is the wrong place for whatever a tool
+happened to attach, and the verbatim entry is the verification input, not a
+report column.
+
+One more `forbid` sits on top of those permits, in
+`policies/custom/directory-identity.cedar`: `ExportAuditEvent` is refused to
+any principal that does not carry `entra_object_id`. A console login whose
+`User` row has one gets it projected onto the token; a service bearer minted
+with `schemaforge token generate` never does. Taking a copy of the trail is
+the one action that must be attributable to a person the directory knows.
+
+## Audit durability, degraded state, and anchoring
+
+The three schemas above are the plane's view of a trail. This section is the
+agent's, and it is deliberately independent of the plane: **the plane is not
+on the durability path.** Durability is enforced on the machine that writes
+the trail, the local anchor is written unconditionally, and no turn is ever
+refused because a control plane was unreachable. Pushing the anchored head to
+`AuditChain` is issue #8's job and is best effort; its staleness is reported
+in `_garrison/status` and never blocks a turn. A deployment that wants "no
+plane, no turns" is asking for a seat gate, not for this.
+
+### What an append promises
+
+`acton-ai.toml`'s `[audit] durability` says what an entry must have done
+before the loop moves on:
+
+| Value | What an append does | What a failed append does |
+|---|---|---|
+| `best_effort` | Appends and flushes | Logs, marks the writer degraded, and the turn continues |
+| `strict` (Garrison's shipped default) | Appends, `fsync`s, and is acknowledged before the next tool call | Refuses every tool not declared idempotent for the rest of the process, and refuses the next turn outright |
+
+Strict mode refuses at two layers, and they are different refusals for
+different moments. Inside a turn, acton-ai's own guard refuses each
+non-idempotent tool call. The tool that already ran cannot be un-run, so
+failing the whole turn would lose the model's account of what happened, and a
+read-only investigation stays possible. Between turns, Garrison's anchor
+keeper answers `AdmitTurn` and refuses the next turn before a single tool
+runs, with JSON-RPC code `-32017`. A writer that does not answer the health
+question within its deadline is refused exactly as a degraded one is: "I
+cannot find out whether this will be recorded" and "this will not be
+recorded" have the same consequence for the record.
+
+### The four states an operator triages on
+
+`_garrison/status` reports `audit.state`, and `garrison-agent ping` prints it
+first:
+
+| State | Meaning | What to do |
+|---|---|---|
+| `disabled` | No trail is armed | Nothing is being recorded. Add `[audit]` to `acton-ai.toml`, or accept it on a standalone install |
+| `configured` | A trail is armed and intact; nothing written yet in this process | Nothing. The daemon has not yet proved it can write, which is why this is not `healthy` |
+| `healthy` | Every append in this process reached the disk | Nothing |
+| `degraded` | At least one append did not | Stop the daemon, fix the disk, verify, restart (see below) |
+
+A daemon that cannot ask its own writer reports `degraded`, never `healthy`.
+
+Recovering from `degraded` is an operator procedure, not a self-healing one:
+
+1. Stop the daemon. In strict mode it is already refusing turns; in
+   best effort it is running and recording nothing.
+2. Fix the cause the status names in `audit.lastError`: a full filesystem, a
+   permission change, a trail replaced by something that is not a file.
+3. Run `garrison-agent audit verify`. **Keep the trail.** A trail with a gap
+   in it is evidence: the gap plus `audit.firstFailedSequence` plus
+   `audit.degradedSince` are what an auditor needs to bound what was lost.
+4. Restart. The in-memory head keeps advancing past a failed append on
+   purpose, so a restart is what returns the writer to healthy; healing the
+   gap silently would make the trail lie about the entry it lost.
+
+### The anchor, and what a hash chain cannot notice
+
+A hash chain detects a rewrite and detects an insertion. It does not detect a
+**truncation**, because a prefix of a valid chain is itself a valid chain:
+delete the last ten entries of a trail and `verify_chain` still reports it
+intact, at a lower head, with nothing to say about what used to be above it.
+
+So the daemon keeps the head somewhere the trail is not. `[audit] anchor_path`
+in `garrison.toml` (default `$XDG_STATE_HOME/garrison/audit-anchor.json`, mode
+0600) holds the last head this install vouched for, rewritten after **every
+finished turn** rather than only at shutdown, so the window in which entries
+could be deleted unnoticed is one turn rather than one session. The anchor
+keeper learns a turn finished by subscribing to acton-ai's turn lifecycle;
+nothing on the turn path knows it exists.
+
+The anchor is not a security boundary. It sits on the same host, under the
+same user, as the trail. It turns silent tail deletion into a refusal to start
+and a non-zero exit from `garrison-agent audit verify`, which is precisely the
+failure that would otherwise leave no trace. The independently protected copy
+is the plane's `AuditChain` row, and `Anchor` carries exactly the fields that
+row wants so #8 adds a sink rather than a mechanism.
+
+Comparing a trail against its anchor has five verdicts, and only three of them
+stop a daemon:
+
+| Verdict | Meaning | At startup |
+|---|---|---|
+| `matches` | The trail ends where the anchor says | Starts |
+| `advanced` | The trail grew past the anchor | Starts, with a warning. A daemon that died between its last append and its next anchor produces this routinely |
+| `truncated` | The trail ends *before* the anchor: entries were removed from the tail | Refuses (exit 2) |
+| `diverged` | Same sequence, different hash: history at or below the anchor was rewritten | Refuses (exit 2) |
+| `trail_changed` | The file carries a different trail identity | Refuses (exit 2) |
+
+`[audit] on_anchor_mismatch = "warn"` relaxes the three refusals into a log
+line for a deployment that would rather run than stop. An anchor written for a
+different trail path is treated as evidence about another file: the daemon
+warns and re-anchors rather than refusing something it cannot reason about.
+
+### `garrison-agent audit verify`
+
+Two questions, two exit codes, and files only. It never talks to the daemon,
+so it works on a trail copied off the machine:
+
+```sh
+garrison-agent audit verify                 # the armed trail and the configured anchor
+garrison-agent audit verify --file t.jsonl --anchor a.json --json
+```
+
+| Exit | Finding |
+|---|---|
+| 0 | The chain verifies and agrees with its anchor |
+| 2 | The trail or the anchor could not be read; no verdict was reached |
+| 3 | The chain does not verify: an entry was rewritten or inserted |
+| 4 | The chain verifies and no longer ends where the anchor says it ended |
+
+4 is the only code this binary uses for that finding, and nothing else uses 4.
+The comparison is run over the whole chain rather than the head alone, so a
+trail rewritten *below* the anchor and then extended past it is caught rather
+than read as ordinary growth.
+
+### When a trail is required
+
+**A `[plane]` section present while acton-ai arms no trail is a refusal to
+start** (exit 2). An install that answers to an agency was configured to be
+accountable to it, and an accountable agent that records nothing is the exact
+failure an audit exists to prevent. A standalone developer install with no
+`[plane]` starts unrecorded, with a warning, so first-run in an editor works.
+`garrison.toml`'s `[audit] required = true|false` overrides the inference in
+either direction. This rule lives in exactly one function,
+`GarrisonConfig::audit_required`, because more than one subsystem asks it and
+they must get the same answer.
+
+## Sessions that outlive the process
+
+A daemon restarts: it is upgraded, a supervisor bounces it, the machine
+reboots. Without persistence every conversation an operator was having ends at
+that moment, and the trail above acquires a gap exactly where a reader most
+wants continuity. This section, like the audit one, is the agent's, and **the
+plane is not on this path either**: persistence is local, and no turn is ever
+refused because a control plane was unreachable.
+
+### What is stored, and who owns it
+
+acton-ai's `MemoryStore` owns a libSQL database, armed by `[checkpoint]` in
+`acton-ai.toml`. Garrison writes four things into it and reimplements none of
+them.
+
+| Row | What it holds | Written |
+|---|---|---|
+| session | Keyed by the ACP session id itself, so a client's `sessionId` *is* the lookup key | on `session/new` |
+| conversation | The message history the next turn sends | after every turn; rewritten in place when compaction elides a prefix, so the record follows the pointer |
+| metadata | The canonical root, the client kind, the install/tenant/operator the session is attributed to, turn and token counts, and the turn that was open when it was last written | on create, when a turn opens, and when a turn settles |
+| turn checkpoint | acton-ai's own record of a turn in progress, one per provider round | by the prompt loop |
+
+The session row is written **before `session/new` answers**. A client holding
+an id the store has never heard of is a session that vanishes at the next
+restart with nothing to say about why, so the write is what the id is issued
+against; a store that will not take it is `-32018` and no session at all.
+
+Attribution is filled from the enrollment record when there is one, so a
+governed install's sessions already carry the install and tenant an
+`AgentSession` row wants. Shipping them to the fleet view is an addition
+rather than a redesign.
+
+### Two fail-closed rules
+
+Both live in one pure function, `session::keeper::gate_decision`, and reach
+the turn path through the same admission seam the seat, policy and audit gates
+use.
+
+| Condition | Code | Consequence |
+|---|---|---|
+| The store cannot be reached, or answered with an error | `-32018` `STORE_UNAVAILABLE` | Every turn is refused. "I cannot find out whether this will be saved" and "this will not be saved" have the same consequence for the record |
+| The session's own record names a turn that is still open | `-32019` `TURN_INTERRUPTED` | That session refuses *new* prompts until an operator resumes or abandons the old one |
+
+The second is deliberately automatic in neither direction. Silently restarting
+the turn would re-run tools that have already run and be paid for twice;
+silently dropping it would throw away work the operator asked for. This is
+also why `[checkpoint] policy` must be `resume_on_request`: **`resume_auto` is
+refused at startup** (exit 2), because a turn resumed in the background would
+settle its pending tool calls with no client connected to approve them, which
+is the one thing a governed agent may never do.
+
+A session created before the store came up has no stored record at all. That
+is not an interrupted turn, and it is admitted: it runs in memory alone, as
+every session did before this existed.
+
+### Reopening a session
+
+`session/load` is the one call that reaches a session this connection never
+opened — which, after a restart, is every session there is. When the
+supervisor holds no live actor for the id, the daemon reads the record back,
+**re-checks the stored root against the approved roots** (an administrator may
+have narrowed them since, and a stored record is not a way around the
+boundary), rebuilds the session, and replays its history as `session/update`
+events before the response, which is the ordering ACP asks for.
+
+A stored session whose root is no longer approved is `-32020`
+`SESSION_ROOT_UNAPPROVED` rather than a generic bad-parameters refusal, and
+the record is left alone: the session is not deleted, it is simply not opened,
+and re-approving the tree brings it back.
+
+If that session was holding an interrupted turn, the response says so:
+
+```json
+{
+  "_meta": {
+    "garrison": {
+      "interruptedTurn": {
+        "turnId": "turn_01m17…",
+        "startedAt": "2026-08-29T14:02:11Z",
+        "prompt": "refactor the parser",
+        "roundsCompleted": 3,
+        "resumable": true
+      }
+    }
+  }
+}
+```
+
+`roundsCompleted` and `resumable` come from the checkpoint. A checkpoint that
+cannot be read makes the turn *unresumable* rather than unreportable: the
+operator still needs to know the session is blocked, and abandoning it is
+still open to them.
+
+Two extension methods settle it. Both take `{"sessionId": …}`, and both answer
+`-32021` `NO_INTERRUPTED_TURN` when there is nothing to settle — never a
+silently restarted turn, and never a pretended one.
+
+| Method | Answers | Shape |
+|---|---|---|
+| `_garrison/session/resume` | deferred, resolved when the turn ends | Exactly like `session/prompt`, because it *is* the same turn: same identifier, carrying on from the round its checkpoint stopped at. The prompt replayed comes from the record, so a client that never saw the original still sees what was asked |
+| `_garrison/session/abandon` | `{"turnId": "turn_…"}` | Immediate. The record is cleared and the checkpoint marked abandoned, and the session is promptable again |
+
+Abandon is what keeps fail-closed from meaning stuck. Both of its halves are
+best effort and neither is retried: the operator has said the work is not
+wanted, and the metadata write is the one the gate reads.
+
+`session/list` merges the live sessions this connection holds with the stored
+ones it does not, filtered by the requested `cwd`, so an editor reopening a
+project is offered the conversations belonging to it. A stored name that is
+not one of Garrison's identities belongs to some other writer of that database
+and is never offered.
+
+### Retention
+
+Persistence without retention is a growing disk and a growing disclosure:
+every prompt an operator ever typed, kept forever, on a machine an agency has
+to be able to say something definite about. `garrison.toml`'s `[sessions]`
+owns the window. The sweep runs at startup — a daemon that has been down for a
+month should not carry that month's expired sessions until tomorrow — and
+every `sweep_interval_hours` after, and its plan is a pure function,
+`session::plan_retention`.
+
+```toml
+[sessions]
+required = true            # inferred: required exactly when [plane] is present
+retain_days = 30
+sweep_interval_hours = 24  # zero is read as one, in both keys
+```
+
+Three of the sweep's four rules are refusals to delete:
+
+- a session touched inside the window stays;
+- a session whose last-active date this daemon cannot parse stays, because a
+  date it cannot read is not evidence that the session is stale;
+- **a session holding an interrupted turn stays at any age**, because the
+  operator has not said whether to resume it and sweeping it would make that
+  decision for them.
+
+The fourth deletes a checkpoint in a terminal state whatever its age: a
+completed turn is already committed to the session's history, and an abandoned
+one was abandoned on purpose. In-progress and failed records are precisely
+what a resume needs, so they leave only when their session does.
+
+### When a store is required
+
+The same rule as the trail, for the same reason. **A `[plane]` section present
+while `acton-ai.toml` arms no `[checkpoint]` is a refusal to start** (exit 2):
+an operator whose work vanishes on every upgrade has not been given a governed
+agent, only an unreliable one. A standalone install with no `[plane]` starts
+without a store, with a warning, so first-run in an editor works. `[sessions]
+required = true|false` overrides the inference in either direction, and the
+rule lives in exactly one function, `GarrisonConfig::sessions_required`.
+
+`db_path` must be an **absolute per-user path**. It is resolved against the
+daemon's working directory and is not tilde-expanded, and that directory is
+`$HOME` under systemd and under relay autostart. Omitting the key is worse
+than getting it wrong: acton-ai then defaults to `acton-ai-checkpoints.db`
+beside wherever the daemon happened to start, so an operator would get a
+different set of sessions per directory. Same rule, and same reason, as the
+trail's `path`.
+
+### What `_garrison/status` reports
+
+```json
+"sessionStore": {
+  "healthy": true,
+  "sessions": 12,
+  "interrupted": 1,
+  "lastCheckpoint": "ckpt_01m17…",
+  "retainDays": 30,
+  "lastSwept": "2026-08-29T03:00:00Z"
+}
+```
+
+`healthy: false` is the refusing state: turns are being turned away until the
+store answers again, and `lastError` says what it last failed at. `interrupted`
+counts the sessions that will refuse a prompt until somebody decides about
+them. The whole field is absent on an install that persists nothing, which is
+the standalone case saying so plainly rather than reporting a healthy store
+that does not exist.
 
 ## Write-time rules: `@default` is what binds a value for `@require`
 
@@ -369,6 +1167,124 @@ The rule when adding a `@require`: list every field the expression names, and
 confirm each is `required` or carries `@default`. Then test the create that
 omits the optional fields, not just the one that violates the rule.
 
+## Directory
+
+The directory sync lives in `hooks-service/` as a supervised actor
+(`src/sync.rs`) beside the enrollment hook, because the enrollment decision
+now depends on the sync's freshness and one service is one config to audit.
+It is configured by the `[directory]` table in `hooks-service/config.toml`
+and holds its own plane bearer for the `directory_service` role, distinct from
+the hook's `enrollment_service` bearer. Every write it makes goes through the
+plane's REST API, so it is bounded by the same `@access` lists and
+`@field_access` fences as a console user, and lands in the same audit table.
+One hooks service reconciles one organization, named by
+`[directory] organization`: the bearer is scoped to that tenant, and the
+plane does not return the tenant-root `Organization` row itself from a
+tenant-scoped listing, so the sync fetches the row it was told about by id
+and nothing wider. Every row the sync writes carries that tenant; rows
+written by a bearer with no tenant chain (the bootstrap `admin` login, for
+one) land with no tenant and are invisible to the sync and to the enrollment
+hook alike, so operators must be created inside the tenant.
+
+Everything it decides is decided by one pure function,
+`reconcile::reconcile`, whose tests are the specification. The rules, in the
+words the code uses:
+
+- **R1. Join key.** `Operator.entra_object_id` is the identity. A directory
+  member with no row is created (`active`, or `suspended` if the account is
+  disabled). A row whose member is absent from the listing is `offboarded`.
+- **R2. One-time link, then rename in place.** A hand-typed row with no
+  object id is linked exactly once, by case-insensitive UPN match, and stamped
+  with the member's object id. After that `upn`, `display_name`, and `email`
+  are directory-owned: a rename patches the same row and every install,
+  session, and audit entry keeps pointing at the same person. A hand-typed
+  row that matches nobody is reported in the sync detail and never offboarded;
+  the directory never knew it.
+- **R3. Deprovision.** A disabled account becomes `suspended`; a removed
+  member becomes `offboarded`. Either way the operator's `assigned` and
+  `active` seats are set `revoked` with `revoked_at` and a reason the
+  `@require` rule demands: `directory: account disabled` or `directory:
+  account removed`. `reconcile` also plans the console `User` with the same
+  object id (or, before it is stamped, the same email) to `active = false`,
+  never a `platform_admin`; but the plane's user store has no tenant column,
+  so a tenant-scoped bearer cannot list it (the plane answers `502`, `column
+  "_tenant" does not exist`). The sync therefore reconciles operators and
+  seats, records `console users not reconciled` in `directory_sync_detail`,
+  and leaves the console login to be closed by hand. That is a known gap,
+  listed below, not a silent one. A member who reappears enabled is set
+  `active` again, but no seat is re-assigned: that is an `org_admin`
+  decision. On a running install a revocation reaches the daemon within
+  `seat_check_secs` (`garrison.toml`, `[plane]`), which is the runtime lever;
+  the directory sync is the provisioning lever.
+- **R4. Enrollment admissibility.** The hook refuses, with a persisted
+  `outcome = refused`, an operator whose `status` is not `active`, and, when
+  `[directory] mode` is not `off`, one with no `entra_object_id` ("operator is
+  not linked to the directory") or one whose organization has not synced
+  successfully within `staleness` seconds ("directory view is stale;
+  enrollment refused until the next successful sync"). An unreachable plane
+  during the hook is still an abort, not a refusal.
+- **R5. Bounded damage.** An empty listing is a failure, never "everyone
+  left". A plan that would suspend or offboard more than `fraction` (default
+  0.5) of the currently active operators is refused whole, so a wrong group
+  id cannot empty a fleet. Both are recorded on the Organization as
+  `directory_sync_status = failed` with the reason in `directory_sync_detail`,
+  and no operator changes.
+- **R6. Unreachable directory or plane.** The tick fails, the failure is
+  recorded where it can be, and the next tick retries. While the view is
+  stale, existing installs keep running and no new enrollment is admitted.
+- **R7. Enrollment carries no directory identity.** The machine reports a
+  UPN once, at first enrollment; the plane resolves it to a row and the row's
+  object id is the identity from then on. A rename after enrollment changes
+  nothing about the install.
+
+Each successful tick stamps `Organization.directory_synced_at` and
+`directory_sync_status = ok`, and `Operator.directory_synced_at` on every row
+the listing confirmed, so "when did the directory last see this person" is a
+column, not a log search.
+
+### What has been proved, and against what
+
+`cargo nextest run -p garrison-hooks` runs three layers:
+
+- Unit tests on `reconcile` for every rule above, with no network.
+- Fixture tests on the Graph parsers (`tests/fixtures/graph/`): a paged
+  listing with `@odata.nextLink`, a guest UPN with `#EXT#` and `mail: null`,
+  `accountEnabled: false`, a member missing `accountEnabled` (a failed page,
+  not a guess), a throttled `429` body, and a token-endpoint error body.
+- An integration test (`tests/directory_sync.rs`) that starts PostgreSQL in a
+  container, applies this repository's schemas and policies, serves the plane,
+  and runs `garrison-hooks` with `[directory] mode = "file"`. It proves that a
+  member is provisioned into an operator a `Redemption` can bind to, that a
+  hand-typed operator is linked by UPN, and that disabling the account
+  suspends the operator, revokes the seat with the written reason, records
+  the unreconciled console half in the sync detail, and refuses the next
+  enrollment. It skips,
+  saying why, without `schemaforge` on `PATH` or a container socket
+  (`DOCKER_HOST=unix:///run/user/1000/podman/podman.sock` for rootless
+  podman).
+
+Running that test against the real plane changed two schemas, and the
+reasons are worth keeping:
+
+- `Organization.owner_id` lost its `@owner` annotation. The annotation
+  generates a Cedar `forbid` on Read, List, Update, and Delete for every
+  principal other than the owner, which hid the row from every role in its
+  own `@access(read: ...)` list, `org_admin` included. The row is fenced by
+  the tenant guard and the per-field `@field_access` writes instead.
+- `Seat` now lists `directory_service` under `read`. It could already write
+  a revocation; it could not find the seats to revoke.
+
+The Graph transport (`src/directory/graph.rs`) has **not** been run against
+a real tenant. Before trusting `mode = "graph"` in a deployment, confirm on
+the actual tenant: that the app registration's `User.Read.All` and
+`GroupMember.Read.All` application permissions are admin-consented; that
+`accountEnabled` is populated for every member, including users synced from
+on-premises AD (a missing value fails the tick rather than guessing); that
+guest members are meant to be operators at all (they are listed, with their
+`#EXT#` UPN); that a group of the expected size pages through `$top=999`
+correctly; and that throttling under the tenant's real rate limits resolves
+within `staleness`, because a run of failed ticks grounds new enrollments.
+
 ## Roles
 
 `policies/role_ranks.toml` orders the hierarchy. Ranks drive the
@@ -382,10 +1298,20 @@ no-upward-visibility rule (`principal.role_rank >= resource.role_rank`), so a
 | `auditor` | 600 | Reads the trail, writes nothing |
 | `team_lead` | 400 | Their team's operators, installs, sessions |
 | `operator` | 100 | Pulls policy, appends audit, nothing more |
+| `directory_service` | 30 | The Entra reconciler: operators, seats, console logins, three organization fields |
+| `enrollment_service` | 20 | The hook service provisioning an accepted enrollment |
+| `audit_service` | 20 | The hook service verifying shipped audit entries; the only writer of `AuditChain` |
+| `enrollee` | 10 | An enrollment artifact: create one `Redemption`, nothing else |
 
 `platform_admin` is SchemaForge's reserved operator role, hardcoded at
 `i64::MAX`. It is not a Garrison role and must not appear in that file or in
 any `@access` list.
+
+The four machine roles are ranked below every human role on purpose. Rank
+gates visibility of *user* records, and none of them has any business seeing
+one; their actual authority is the `@access` lists that name them and the
+`@field_access` fences that bound what a write may touch. One hook-service
+bearer carries both `enrollment_service` and `audit_service`.
 
 The `operator` row is the one to read twice: it is the role a *daemon* holds,
 and it is scoped to exactly the two things a daemon needs — read the policy it
@@ -419,22 +1345,88 @@ the plan from `plane:plan` before forcing anything.
 touches `schemas/` or `policies/` — strict-mode failures caught at review time
 are failures the runtime would otherwise refuse to hot-swap after merge.
 
+## Process topology on the agent side
+
+One daemon per user per machine. `garrison-agent serve` is the only process
+that ever builds an acton-ai runtime, so it is the only owner of the policy,
+the sandbox host, the socket and the audit trail. Everything else is a
+client of its socket (`$XDG_RUNTIME_DIR/garrison-agent.sock`):
+
+- `garrison-agent acp`, the mode editors spawn, is a relay between its pipes
+  and that socket. It never builds an engine, so a spawned child cannot be a
+  second writer of the hash chain. Two VS Code windows, a JetBrains project
+  and a terminal `chat` are four clients of one daemon, one policy, one
+  trail.
+- The daemon's configuration is the one in force. `--config` on the relay is
+  read for `[server]` only; `--acton-config` is accepted and ignored with a
+  warning.
+- A daemon that is not running is started by the first `acp` or `chat` that
+  needs it when `[server] autostart` is on: through `systemctl --user start
+  garrison-agent` when that unit is loaded, otherwise as a detached child
+  rooted at `$HOME`. An autostarted daemon reads only the XDG configuration
+  files (`~/.config/garrison/garrison.toml`, `~/.config/acton-ai/config.toml`);
+  the relay's flags are never handed to it. With `autostart = false` the
+  client reports the missing daemon and starts nothing. `ping` never starts
+  anything.
+- Two guards, both kernel-owned and gone with the process, no pidfile: the
+  socket is probed before it is bound, and a second daemon on a live socket
+  refuses to start; acton-ai holds an exclusive advisory lock on the trail,
+  and a second daemon over the same trail refuses to start rather than fork
+  the chain.
+- Exit codes from `serve`: 2 is "refused to start" (locked or broken trail,
+  unusable configuration, a control plane that turned the install away), 3 is
+  a rejection, 1 is a malfunction. The packaged unit
+  (`packaging/systemd/garrison-agent.service`, `task daemon:install`) retries
+  only 1; 2 and 3 wait for an operator.
+- The boundary: with `[threads] project_root` unset the default root is the
+  daemon's working directory, `$HOME` under systemd or autostart, so any
+  workspace under home can host a session and each session is confined to
+  its own `cwd`. Workspaces elsewhere need `workspace_roots`. Language
+  servers are off in the shipped `garrison.toml` until they are spawned per
+  session root; see the comment there.
+
+Enrollment happens in that one daemon, before it listens, so a machine has
+exactly one install identity: a fleet of editor windows is one
+`AgentInstall`, one credential and one seat, not one per window.
+
 ## Known gaps
 
-- **No daemon-side client.** The agent has never spoken to the plane. There is
-  no enrollment, no heartbeat, no bundle pull, no audit shipping, and no
-  `[control_plane]` section in `GarrisonConfig` — its only outbound network
-  auth is to model providers. `schemas/credential.schema` describes the
-  identity a daemon would present; nothing generates or presents one yet.
+- **The daemon does not heartbeat, and does not pull policy.** It enrolls
+  (`agent/src/enrollment/`), it exchanges its install key for a bearer
+  (`agent/src/plane/`), and it checks its seat on a timer
+  (`agent/src/entitlement/`). `AgentInstall.last_heartbeat` is never written,
+  and no bundle is pulled, so a console cannot yet tell a daemon that is
+  quietly wedged from one that was shut down cleanly.
 - **Schemas are unsigned.** Every command prints `schema signature
   verification is disabled (signing.mode = off)`. SchemaForge can require
   ed25519, SSH allowed-signers, or cosign-keyless signatures over `schemas/`
   before parsing, which is worth adopting here well before anything federal
   ships. The rollout is off → warn → enforce.
-- **Entra claims are modeled, not wired.** `[schema_forge.authz.principal_claims]`
-  in `config.toml` is commented out because projecting `entra_object_id` onto
-  `Forge::Principal` requires those columns on the system `User` schema first.
-  Until then, custom Cedar policies cannot scope by Entra identity.
+- **Graph is untested against a real tenant.** The directory sync's Microsoft
+  Graph client is exercised against recorded responses only; the
+  end-to-end proof uses `[directory] mode = "file"`. The "Directory" section
+  lists what a real tenant must confirm. Until a console login has been
+  stamped by a sync it carries no `entra_object_id`, and the export `forbid`
+  in `directory-identity.cedar` refuses it; that is the fail-closed direction,
+  stated here so nobody reads a 403 on export as a bug. `required` on the
+  projected claims cannot be `true`: it is enforced against every bearer the
+  plane accepts, including enrollment artifacts and service tokens, which
+  carry no such claim by construction.
+- **Console logins are not deactivated by the sync.** The plane's user store
+  has no tenant column, so a tenant-scoped `directory_service` bearer cannot
+  list `User`; the tick says so in `directory_sync_detail` and closes the
+  operator and the seats. Closing the console login is a manual step until
+  the plane can scope its user store, or the sync is given a second,
+  unscoped bearer for that one read.
+- **The directory bearer is tenant-scoped.** A `directory_service` token is
+  minted with one organization's tenant chain, so one `garrison-hooks` syncs
+  the organizations that bearer can see. A deployment with several
+  organizations on one plane runs one hooks service per organization, or
+  waits for a chain-less service bearer.
+- **Two hooks are declared and refuse.** The `AuditEvent` and `PolicyBundle`
+  `before_validate` hooks are bound and served, and both are stubs that fail
+  closed: every audit ingest is refused, and every bundle publish is refused,
+  until the verifying ingest and the publish gate are implemented.
 - **No provisioned database.** The apply path has been exercised against a
   throwaway container, not against an environment anyone can point a client at.
   There is no migration history, no seeded organization, and no bootstrapped

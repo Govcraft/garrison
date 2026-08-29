@@ -5,15 +5,27 @@
 // pulls and puts in force. Bundles are drafted, published, and retired; an
 // install never edits one, it only reports the checksum it is running, which
 // is what makes drift detectable rather than deniable.
+//
+// `enrollment_service` appears in the read lists here and on the three rule
+// schemas because the hook that stamps a bundle's checksum has to assemble
+// the bundle first, and it does so with the hook service's own bearer. It
+// writes nothing: the checksum lands through the hook response, not a PATCH.
 
+// Publishing is the one transition that needs more than the row. The
+// `before_validate` hook fetches the bundle's rules and endpoints, runs every
+// rule's own match examples, and refuses the publish if any fail; then it
+// computes the BLAKE3 checksum over the canonical bundle and stamps it, with
+// `published_at` and `published_by`. A bundle nobody can verify is a bundle
+// nobody should distribute.
 @version(1)
 @tenant(parent: "Organization")
 @display("name")
 @access(
-    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin"],
+    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin", "enrollment_service"],
     write:  ["security_officer", "org_admin"],
     delete: ["org_admin"]
 )
+@hook(before_validate) """Stamp the checksum and self-test the rules when a bundle is published"""
 schema PolicyBundle {
     name:                  text(max: 255) required indexed
     version:               integer(min: 1) required @list(column)
@@ -68,7 +80,7 @@ schema PolicyBundle {
 @tenant(parent: "Organization")
 @display("name")
 @access(
-    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin"],
+    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin", "enrollment_service"],
     write:  ["security_officer", "org_admin"],
     delete: ["security_officer", "org_admin"]
 )
@@ -105,7 +117,7 @@ schema CommandRule {
 @tenant(parent: "Organization")
 @display("tool_name")
 @access(
-    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin"],
+    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin", "enrollment_service"],
     write:  ["security_officer", "org_admin"],
     delete: ["security_officer", "org_admin"]
 )
@@ -132,7 +144,7 @@ schema ToolRule {
 @tenant(parent: "Organization")
 @display("name")
 @access(
-    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin"],
+    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin", "enrollment_service"],
     write:  ["security_officer", "org_admin"],
     delete: ["org_admin"]
 )

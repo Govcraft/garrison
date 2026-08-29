@@ -18,10 +18,13 @@
 //!
 //! # Roots
 //!
-//! Servers are rooted at the daemon's project root. A session that names a
-//! different `cwd` still reaches them, and a server asked about a file
-//! outside its root will answer with whatever it can see — usually nothing.
-//! Per-session server pools can come later if that limitation bites.
+//! Servers are rooted at the daemon's project root, once, at launch. With one
+//! daemon per user rooted at `$HOME`, that root is not any workspace, and a
+//! server asked about a file under some other session's `cwd` answers with
+//! whatever it can see, which is usually nothing. The shipped `garrison.toml`
+//! therefore leaves `[lsp_servers]` empty and says why; an operator running
+//! the daemon with `threads.project_root` set to one tree may enable them.
+//! Spawning servers per session root is the fix and is a tracked follow-up.
 
 pub mod actor;
 pub mod connection;
