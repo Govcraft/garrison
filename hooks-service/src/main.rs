@@ -27,6 +27,7 @@ mod adjudicate;
 mod config;
 mod directory;
 mod hooks;
+mod install_token;
 mod plane;
 mod reconcile;
 mod sync;
@@ -55,6 +56,7 @@ use acton_service::prelude::*;
 use crate::config::{DirectoryMode, HooksConfig};
 use crate::directory::Directory;
 use crate::hooks::redemption::DirectoryGate;
+use crate::install_token::{Exchange, NonceLedger};
 use crate::plane::Plane;
 use crate::reconcile::Policy;
 use crate::sync::{DirectorySync, SyncSettings};
@@ -98,6 +100,20 @@ async fn main() -> Result<()> {
     // bearer, which is authorized for a handful of operations and nothing else.
     let plane = Plane::new(&garrison.url, &garrison.token)
         .map_err(|e| Error::ValidationError(e.to_string()))?;
+
+    // The install-token exchange: the one authenticated path from a daemon to
+    // the plane. It mints with the same `[token]` key this service verifies
+    // inbound hook calls against, so the bearer it hands out is
+    // indistinguishable from one the forge's own CLI produced. A missing or
+    // unusable key is a refusal to boot, not a 500 on the first enrollment.
+    let key_path = install_token_key(&config)?;
+    let exchange = Arc::new(Exchange::new(
+        Plane::new(&garrison.url, &garrison.token)
+            .map_err(|e| Error::ValidationError(e.to_string()))?,
+        key_path,
+        garrison.issuer.clone(),
+        garrison.lifetime,
+    )?);
 
     // The directory sync, when enabled, holds its own bearer for the
     // `directory_service` role. Settings are parked where the supervised
@@ -166,12 +182,60 @@ async fn main() -> Result<()> {
         // SCHEMAFORGE_HOOKS_SERVICES_END
         .build(Some(state));
 
+    // One HTTP route beside the gRPC hooks, on the same listener and the same
+    // port. `.with_base_path("/api")` is not decoration: without it the
+    // versioned router mounts at `/v1/...`, the path `[token] public_paths`
+    // exempts never matches, and every exchange 401s.
+    let routes = VersionedApiBuilder::new()
+        .with_base_path("/api")
+        .add_version(ApiVersion::V1, |router| {
+            router.merge(install_token::routes(exchange))
+        })
+        .build_routes();
+
     let mut builder = ServiceBuilder::new()
         .with_config(config)
+        .with_actor::<NonceLedger>()
+        .with_routes(routes)
         .with_grpc_services(grpc_services);
     if directory.enabled() {
         builder = builder.with_actor::<DirectorySync>();
     }
     builder.try_build()?.serve().await?;
     Ok(())
+}
+
+/// The PASETO key this service both verifies and mints with, once the
+/// exchange's own route is known to be reachable.
+///
+/// The key is read from the framework's own `[token]` section rather than a
+/// second setting, because two paths that must name the same file are two
+/// paths that will one day differ.
+///
+/// The `public_paths` check is not pedantry. A daemon arriving at the
+/// exchange has no bearer by definition, so without that exemption every
+/// exchange answers 401 from middleware the route never sees, and the symptom
+/// points at the daemon's credentials rather than at this file. Refusing to
+/// boot names the missing line instead.
+fn install_token_key(config: &Config) -> Result<std::path::PathBuf> {
+    let Some(acton_service::config::TokenConfig::Paseto(paseto)) = config.token.as_ref() else {
+        return Err(Error::ValidationError(
+            "the install-token exchange mints with the plane's PASETO key; \
+             add a [token] section with format = \"paseto\" and key_path"
+                .to_string(),
+        ));
+    };
+    if !paseto
+        .public_paths
+        .iter()
+        .any(|prefix| install_token::PUBLIC_PATH.starts_with(prefix.as_str()))
+    {
+        return Err(Error::ValidationError(format!(
+            "[token] public_paths does not exempt {}; a daemon exchanging an \
+             assertion carries no bearer and would be refused before the route \
+             is reached",
+            install_token::PUBLIC_PATH
+        )));
+    }
+    Ok(paseto.key_path.clone())
 }
