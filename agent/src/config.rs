@@ -8,6 +8,7 @@
 //! Garrison's settings do not have to be accepted upstream to exist.
 
 use crate::error::GarrisonError;
+use acton_ai::audit::AuditDurability;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -33,8 +34,110 @@ pub struct GarrisonConfig {
     /// agency having stood a plane up. Adding the section is what turns this
     /// daemon into a member of a fleet.
     pub plane: Option<PlaneConfig>,
+    /// What this install requires of its audit trail.
+    ///
+    /// Absent — no `[audit]` section — follows acton-ai: the trail is armed
+    /// if `acton-ai.toml` arms one, it promises whatever that file says, and
+    /// the anchor lives in the default place. The section exists for the
+    /// deployment that wants to say more than acton-ai's file can.
+    pub audit: AuditConfig,
     /// Language servers to run, keyed by a name of the operator's choosing.
     pub lsp_servers: std::collections::HashMap<String, LspServerConfig>,
+}
+
+/// What Garrison requires of the audit trail acton-ai writes.
+///
+/// acton-ai owns the trail: where it is, what an append promises, who holds
+/// it. This section owns the three questions acton-ai has no opinion about —
+/// whether a trail is required at all, where the chain head is anchored
+/// outside the trail, and what to do when the two disagree at startup.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuditConfig {
+    /// What an append must promise before a turn may run.
+    ///
+    /// `None` — the key omitted — follows the trail: whatever
+    /// `acton-ai.toml`'s `[audit] durability` resolved to. Naming it here is
+    /// how a deployment states the requirement in its own file, and it is
+    /// what [`Self::durability_for`] answers with.
+    ///
+    /// `strict` is what arms the turn gate: with a strict trail, a writer
+    /// that has failed an append refuses further turns rather than running
+    /// them unrecorded. `best_effort` records what it can and never refuses.
+    pub durability: Option<AuditDurability>,
+
+    /// Where the last verified chain head is written, outside the trail.
+    ///
+    /// The anchor is what makes a tail truncation detectable: the trail alone
+    /// still verifies after its last entries are deleted, because a prefix of
+    /// a valid chain is a valid chain. `None` resolves to
+    /// `$XDG_STATE_HOME/garrison/audit-anchor.json`, falling back to
+    /// `$HOME/.local/state/garrison/audit-anchor.json`.
+    pub anchor_path: Option<PathBuf>,
+
+    /// What startup does when the trail and the anchor disagree.
+    pub on_anchor_mismatch: AnchorMismatchAction,
+
+    /// Whether the daemon may start without an armed trail.
+    ///
+    /// `None` means "required when a `[plane]` section is present": a member
+    /// of a fleet has an agency expecting its record, a standalone developer
+    /// install does not. See [`GarrisonConfig::audit_required`], which is the
+    /// only place this rule is decided.
+    pub required: Option<bool>,
+}
+
+/// What to do when the trail's head is not the head the anchor remembers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnchorMismatchAction {
+    /// Refuse to start (exit 2). The default: a trail that lost entries is
+    /// evidence, and starting over it appends to a record already known to be
+    /// incomplete.
+    #[default]
+    Refuse,
+    /// Log the disagreement and start anyway, for a deployment that would
+    /// rather have a running agent than a stopped one.
+    Warn,
+}
+
+impl AuditConfig {
+    /// The durability the turn gate enforces: what this file declares, else
+    /// what the trail itself promises.
+    ///
+    /// Pure, so the precedence is testable without a runtime.
+    #[must_use]
+    pub fn durability_for(&self, trail: Option<AuditDurability>) -> AuditDurability {
+        self.durability
+            .or(trail)
+            .unwrap_or(AuditDurability::BestEffort)
+    }
+
+    /// Where the anchor file lives.
+    ///
+    /// State rather than config: it is written by the daemon, changes on
+    /// every turn, and must not be checked into whatever backs the config
+    /// directory up.
+    #[must_use]
+    pub fn anchor_path(&self) -> PathBuf {
+        self.anchor_path.clone().unwrap_or_else(default_anchor_path)
+    }
+}
+
+/// The default anchor location: `$XDG_STATE_HOME/garrison/audit-anchor.json`.
+///
+/// `$HOME/.local/state` is the XDG fallback, and the temp directory is the
+/// last resort so a process with no home still writes an anchor somewhere
+/// rather than silently anchoring nothing.
+fn default_anchor_path() -> PathBuf {
+    let state_home = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("state"))
+        })
+        .unwrap_or_else(std::env::temp_dir);
+
+    state_home.join("garrison").join("audit-anchor.json")
 }
 
 /// Where the control plane is, and how this machine first proves itself to it.
@@ -291,6 +394,23 @@ impl GarrisonConfig {
     pub const fn approval_timeout(&self) -> Duration {
         Duration::from_secs(self.approval.timeout_secs)
     }
+
+    /// Whether this daemon may start without an armed audit trail.
+    ///
+    /// The single home of one rule: **a `[plane]` section present while
+    /// acton-ai arms no trail is a refusal to start.** An install that
+    /// answers to an agency was configured to be accountable to it, and an
+    /// accountable agent that records nothing is the exact failure an audit
+    /// exists to prevent — so it fails closed, loudly, at launch, rather than
+    /// running unrecorded turns nobody notices until someone asks for the
+    /// trail. `[audit] required` overrides the inference in either direction.
+    ///
+    /// Pure, and deliberately the only place this is decided: #8's shipping
+    /// path asks the same question and must get the same answer.
+    #[must_use]
+    pub fn audit_required(&self) -> bool {
+        self.audit.required.unwrap_or(self.plane.is_some())
+    }
 }
 
 #[cfg(test)]
@@ -438,6 +558,96 @@ auto_start = false
         .unwrap_err();
 
         assert!(error.to_string().contains("timeout_seconds"));
+    }
+
+    #[test]
+    fn no_audit_section_follows_acton_ai() {
+        let config = GarrisonConfig::from_toml("").unwrap();
+
+        assert!(config.audit.durability.is_none());
+        assert_eq!(
+            config.audit.on_anchor_mismatch,
+            AnchorMismatchAction::Refuse
+        );
+        assert!(config.audit.required.is_none());
+    }
+
+    #[test]
+    fn the_declared_durability_wins_over_the_trails() {
+        let config = GarrisonConfig::from_toml("[audit]\ndurability = \"strict\"\n").unwrap();
+
+        assert_eq!(
+            config
+                .audit
+                .durability_for(Some(AuditDurability::BestEffort)),
+            AuditDurability::Strict
+        );
+    }
+
+    #[test]
+    fn an_undeclared_durability_follows_the_trail() {
+        let audit = GarrisonConfig::default().audit;
+
+        assert_eq!(
+            audit.durability_for(Some(AuditDurability::Strict)),
+            AuditDurability::Strict
+        );
+        assert_eq!(audit.durability_for(None), AuditDurability::BestEffort);
+    }
+
+    #[test]
+    fn a_plane_makes_the_audit_trail_required() {
+        let with_plane =
+            GarrisonConfig::from_toml("[plane]\nurl = \"https://plane.agency.gov\"\n").unwrap();
+        let standalone = GarrisonConfig::from_toml("").unwrap();
+
+        assert!(
+            with_plane.audit_required(),
+            "an install answering to an agency must record what it does"
+        );
+        assert!(
+            !standalone.audit_required(),
+            "a developer install must start with no plane and no trail"
+        );
+    }
+
+    #[test]
+    fn the_required_key_overrides_the_inference_in_both_directions() {
+        let plane_without_audit = GarrisonConfig::from_toml(
+            "[plane]\nurl = \"https://plane.agency.gov\"\n\n[audit]\nrequired = false\n",
+        )
+        .unwrap();
+        let standalone_with_audit =
+            GarrisonConfig::from_toml("[audit]\nrequired = true\n").unwrap();
+
+        assert!(!plane_without_audit.audit_required());
+        assert!(standalone_with_audit.audit_required());
+    }
+
+    #[test]
+    fn the_anchor_path_can_be_named_outright() {
+        let config =
+            GarrisonConfig::from_toml("[audit]\nanchor_path = \"/var/lib/g/anchor.json\"\n")
+                .unwrap();
+
+        assert_eq!(
+            config.audit.anchor_path(),
+            PathBuf::from("/var/lib/g/anchor.json")
+        );
+    }
+
+    #[test]
+    fn the_mismatch_action_can_be_relaxed_to_a_warning() {
+        let config = GarrisonConfig::from_toml("[audit]\non_anchor_mismatch = \"warn\"\n").unwrap();
+
+        assert_eq!(config.audit.on_anchor_mismatch, AnchorMismatchAction::Warn);
+    }
+
+    #[test]
+    fn a_misspelled_audit_key_is_refused_rather_than_ignored() {
+        let error = GarrisonConfig::from_toml("[audit]\ndurabilty = \"strict\"\n").unwrap_err();
+
+        assert!(error.to_string().contains("durabilty"));
     }
 
     #[test]

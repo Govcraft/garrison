@@ -58,6 +58,38 @@ auto_approve = ["read_file", "glob", "grep", "list_directory", "calculate", "get
 # command = "rust-analyzer"
 # extensions = ["rs"]
 
+[audit]
+# What Garrison requires of the trail acton-ai writes. acton-ai owns the trail
+# itself: where it is, what an append promises, who holds its lock. This
+# section owns the three questions it has no opinion about.
+
+# What an append must promise before a turn may run. Omitted, this follows
+# acton-ai.toml's own `[audit] durability`; naming it here is how a deployment
+# states the requirement in its own file. `strict` is what arms the turn gate.
+# durability = "strict"
+
+# Where the last verified chain head is written, outside the trail. This is
+# what makes a tail truncation detectable: the trail alone still verifies
+# after its last entries are deleted, because a prefix of a valid chain is a
+# valid chain. Only a record of where the chain used to end can notice.
+# Defaults to $XDG_STATE_HOME/garrison/audit-anchor.json (mode 0600), rewritten
+# after every finished turn.
+# anchor_path = "/home/dev/.local/state/garrison/audit-anchor.json"
+
+# What startup does when the trail and the anchor disagree. "refuse" (the
+# default) stops the daemon with exit 2 on a truncated, rewritten, or replaced
+# trail: starting over it would append to a record already known to be
+# incomplete. "warn" logs the same finding and starts anyway. A trail that
+# merely grew past its anchor is never a mismatch; that is what a daemon that
+# died before re-anchoring looks like.
+# on_anchor_mismatch = "refuse"
+
+# Whether the daemon may start without an armed trail. Omitted, a trail is
+# required exactly when a [plane] section is present: an install answering to
+# an agency records what it does, a standalone developer install need not.
+# Set it explicitly to override the inference in either direction.
+# required = true
+
 # [plane]
 # Enrolling with a control plane. Omit this section entirely and the agent runs
 # standalone, exactly as it did before enrollment existed.

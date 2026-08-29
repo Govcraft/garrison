@@ -111,6 +111,20 @@ read_write = ["~/.cache/uv"]
 # Keep the trail on a local filesystem: the lock is an advisory flock and is
 # not reliable on NFS.
 [audit]
+# What an append must have done before the loop moves on to the next tool
+# call. `best_effort` (acton-ai's default, for other embedders) appends and
+# flushes; a failed append is logged and the turn continues. `strict`, which
+# is what Garrison ships, fsyncs and waits for the acknowledgement, and once
+# an append has failed it refuses every tool not declared idempotent for the
+# rest of the process. Garrison then refuses the next turn outright, with
+# JSON-RPC code -32017, rather than running it unrecorded.
+#
+# The refusal is not self-healing by design. The record is incomplete until an
+# operator repairs the trail and restarts the daemon over it; the gap is the
+# evidence of what was lost. See "Audit durability, degraded state, and
+# anchoring" in docs/control-plane.md for the recovery steps, and
+# `garrison-agent audit verify` for the finding.
+durability = "strict"
 
 # Interrupted-turn checkpoints (session persistence). The same rule applies
 # when this section is enabled: `db_path` is resolved against the daemon's
