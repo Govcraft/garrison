@@ -53,6 +53,7 @@
 //! and the shortest safe life for one is the session the operator was looking
 //! at when they made it.
 
+use crate::admission::refusal_code;
 use crate::approval::{ApprovalOutcome, RequestApproval, CANCELLED_REASON, REJECTED_REASON};
 use crate::protocol::acp::{self, Permission};
 use crate::protocol::codec::EventSink;
@@ -90,6 +91,10 @@ pub struct ThreadDefaults {
     pub auto_approve: Arc<Vec<String>>,
     /// The language servers every session's tools reach.
     pub lsp: Arc<crate::lsp::LspRegistry>,
+    /// The gates every session's turns must pass, in order.
+    ///
+    /// See [`crate::admission`]. Empty means every turn is admitted.
+    pub gates: Vec<ActorHandle>,
 }
 
 impl Default for ThreadDefaults {
@@ -101,6 +106,7 @@ impl Default for ThreadDefaults {
             approval_timeout: Duration::from_secs(300),
             auto_approve: Arc::new(Vec::new()),
             lsp: Arc::new(crate::lsp::LspRegistry::default()),
+            gates: Vec::new(),
         }
     }
 }
@@ -126,6 +132,34 @@ pub struct ConnSetup {
     pub audited: bool,
     /// What isolation the runtime's writing tools run under, for the same.
     pub sandbox: acp::SandboxStatus,
+    /// Every actor that contributes a part to `_garrison/status`, asked in
+    /// order. See [`Describe`].
+    pub describers: Vec<ActorHandle>,
+}
+
+/// Asks a subsystem to describe itself for `_garrison/status`.
+///
+/// One request, answered by every actor that has something to report: the
+/// session supervisor, and later the plane session, the policy agent, the
+/// seat monitor, the audit shipper. Each answers with the [`StatusPart`] it
+/// owns and [`assemble`] places it; a subsystem that joins the status adds one
+/// variant here, one field on [`acp::GarrisonStatus`], and one handler on its
+/// own actor, and never edits [`status`].
+#[acton_message]
+pub struct Describe;
+
+/// One subsystem's contribution to the status.
+///
+/// Non-exhaustive: every subsystem that joins the status adds a variant.
+#[acton_message]
+#[non_exhaustive]
+pub enum StatusPart {
+    /// From the session supervisor.
+    Threads(acp::ThreadsStatus),
+}
+
+impl Request for Describe {
+    type Response = StatusPart;
 }
 
 /// A frame the reader task pulled off the socket.
@@ -545,6 +579,14 @@ fn answer_prompt(sink: &EventSink, id: RequestId, finished: &TurnFinished) {
         TurnResult::Cancelled => {
             sink.respond(id, &acp::PromptResponse::new(acp::StopReason::Cancelled));
         }
+        // The code names which gate said no; the data says why in words.
+        TurnResult::Refused(refusal) => {
+            sink.fail(
+                Some(id),
+                ErrorObject::new(refusal_code(refusal), "the turn was not admitted")
+                    .data(Value::String(refusal.to_string())),
+            );
+        }
         TurnResult::Failed { reason } => {
             sink.fail(
                 Some(id),
@@ -750,6 +792,7 @@ async fn session_new(context: &Dispatch, raw: Option<Value>) -> Result<Value, Er
         approval_timeout: context.setup.defaults.approval_timeout,
         auto_approve: Arc::clone(&context.setup.defaults.auto_approve),
         lsp: Arc::clone(&context.setup.defaults.lsp),
+        gates: context.setup.defaults.gates.clone(),
     };
 
     let created = context
@@ -922,10 +965,23 @@ async fn session_list(context: &Dispatch, raw: Option<Value>) -> Result<Value, E
 }
 
 /// `_garrison/status`: what this agent is, and what it is enforcing.
+///
+/// Three sources, assembled in one place: what the connection knows on its
+/// own, what the audit trail says about its chain, and one [`StatusPart`]
+/// from every describer in [`ConnSetup::describers`].
 async fn status(context: &Dispatch) -> Result<Value, ErrorObject> {
+    let base = own_status(context);
+    let chain_head = chain_head(&context.setup.runtime, context.setup.audited).await;
+    let parts = describe_all(&context.setup.describers).await;
+
+    encode(&assemble(base, chain_head, parts))
+}
+
+/// The part of the status this connection can state without asking anyone.
+fn own_status(context: &Dispatch) -> acp::GarrisonStatus {
     let defaults = &context.setup.defaults;
 
-    encode(&acp::GarrisonStatus {
+    acp::GarrisonStatus {
         agent: env!("CARGO_PKG_NAME").to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         protocol_version: context.version.unwrap_or(acp::PROTOCOL_VERSION).as_u16(),
@@ -939,7 +995,61 @@ async fn status(context: &Dispatch) -> Result<Value, ErrorObject> {
             chain_head: None,
         },
         sandbox: context.setup.sandbox.clone(),
-    })
+        threads: None,
+    }
+}
+
+/// The hash at the end of the audit chain, when there is a chain to ask.
+///
+/// Not asked at all when auditing is off: acton-ai answers that case with a
+/// configuration error, and there is no point paying for one per status call.
+async fn chain_head(runtime: &ActonAI, audited: bool) -> Option<String> {
+    if !audited {
+        return None;
+    }
+    match runtime.audit_head().await {
+        Ok(head) => Some(head.hash),
+        Err(error) => {
+            tracing::debug!(%error, "the audit trail did not disclose its head");
+            None
+        }
+    }
+}
+
+/// Asks every describer for its part, keeping the ones that answered.
+///
+/// A subsystem that does not answer is missing from the status rather than
+/// failing it: an operator asking "why is this daemon refusing turns" needs
+/// the rest of the picture most precisely when one piece is wedged.
+async fn describe_all(describers: &[ActorHandle]) -> Vec<StatusPart> {
+    let mut parts = Vec::with_capacity(describers.len());
+    for describer in describers {
+        match describer.ask(Describe).await {
+            Ok(part) => parts.push(part),
+            Err(error) => {
+                tracing::debug!(describer = %describer.id(), ?error, "a subsystem did not describe itself");
+            }
+        }
+    }
+    parts
+}
+
+/// Places each subsystem's part into the status.
+///
+/// Pure. Every variant of [`StatusPart`] has exactly one home here, which is
+/// what makes adding a subsystem a three-line change.
+fn assemble(
+    mut status: acp::GarrisonStatus,
+    chain_head: Option<String>,
+    parts: Vec<StatusPart>,
+) -> acp::GarrisonStatus {
+    status.audit.chain_head = chain_head;
+    for part in parts {
+        match part {
+            StatusPart::Threads(threads) => status.threads = Some(threads),
+        }
+    }
+    status
 }
 
 #[cfg(test)]
@@ -1095,5 +1205,96 @@ mod tests {
         let parsed: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(parsed["error"]["code"], error_code::TURN_FAILED);
         assert_eq!(parsed["error"]["data"], "the provider hung up");
+    }
+
+    #[test]
+    fn a_refused_turn_answers_the_prompt_with_the_gates_code() {
+        let (sink, mut rx) = sink();
+        let finished = TurnFinished {
+            thread_id: ThreadId::new(),
+            turn_id: TurnId::new(),
+            result: TurnResult::Refused(crate::admission::TurnRefusal::Seat {
+                reason: "seat revoked".to_string(),
+            }),
+        };
+
+        answer_prompt(&sink, RequestId::Number(3), &finished);
+
+        let parsed: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(parsed["error"]["code"], error_code::SEAT_REFUSED);
+        assert_eq!(
+            parsed["error"]["data"],
+            "no seat entitles this turn: seat revoked"
+        );
+    }
+
+    fn bare_status() -> acp::GarrisonStatus {
+        acp::GarrisonStatus {
+            agent: "garrison-agent".to_string(),
+            version: "0.0.0".to_string(),
+            protocol_version: 1,
+            sessions: 1,
+            policy: acp::PolicyStatus {
+                approval_timeout_secs: 1,
+                auto_approve: Vec::new(),
+            },
+            audit: acp::AuditStatus {
+                enabled: true,
+                chain_head: None,
+            },
+            sandbox: acp::SandboxStatus::disabled(),
+            threads: None,
+        }
+    }
+
+    #[test]
+    fn assembling_places_each_part_and_the_chain_head() {
+        let assembled = assemble(
+            bare_status(),
+            Some("abc123".to_string()),
+            vec![StatusPart::Threads(acp::ThreadsStatus { live: 4 })],
+        );
+
+        assert_eq!(assembled.audit.chain_head.as_deref(), Some("abc123"));
+        assert_eq!(assembled.threads, Some(acp::ThreadsStatus { live: 4 }));
+    }
+
+    #[test]
+    fn a_missing_part_leaves_its_field_absent_rather_than_failing() {
+        let assembled = assemble(bare_status(), None, Vec::new());
+
+        assert_eq!(assembled.threads, None);
+        assert_eq!(assembled.audit.chain_head, None);
+        let encoded = serde_json::to_value(&assembled).unwrap();
+        assert!(encoded.get("threads").is_none());
+    }
+
+    #[tokio::test]
+    async fn the_supervisor_describes_how_many_sessions_it_holds() {
+        let mut runtime = ActonApp::launch_async().await;
+        let supervisor = crate::thread::ThreadSupervisor::spawn(&mut runtime).await;
+
+        let parts = describe_all(&[supervisor]).await;
+
+        assert!(
+            matches!(
+                parts.as_slice(),
+                [StatusPart::Threads(acp::ThreadsStatus { live: 0 })]
+            ),
+            "{parts:?}"
+        );
+        runtime.shutdown_all().await.expect("clean shutdown");
+    }
+
+    #[tokio::test]
+    async fn a_describer_that_has_stopped_is_left_out() {
+        let mut runtime = ActonApp::launch_async().await;
+        let supervisor = crate::thread::ThreadSupervisor::spawn(&mut runtime).await;
+        supervisor.stop().await.expect("the supervisor stops");
+
+        let parts = describe_all(&[supervisor]).await;
+
+        assert!(parts.is_empty());
+        runtime.shutdown_all().await.expect("clean shutdown");
     }
 }

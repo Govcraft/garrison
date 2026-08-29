@@ -1,5 +1,6 @@
 //! garrison-agent: a governed agentic coding engine built on acton-ai.
 
+pub mod admission;
 pub mod approval;
 pub mod auth;
 pub mod boundary;

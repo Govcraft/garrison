@@ -169,6 +169,14 @@ fn api_key_preflight(config: &acton_ai::config::ActonAIConfig) -> Result<(), Gar
 /// why this function takes the runtime out of the `ActonAI` rather than
 /// accepting one — there is no way to hand it the wrong one.
 ///
+/// # One actor per `spawn_*`
+///
+/// The body is a list of small spawns, each returning the handle it made,
+/// followed by the assembly. A subsystem that joins the daemon adds one
+/// `spawn_*` function, one line here, and pushes its handle onto `gates`
+/// (if it decides turns) or `describers` (if it reports status), or both.
+/// Nothing else in this function changes.
+///
 /// # Errors
 ///
 /// [`GarrisonErrorKind::Runtime`](crate::error::GarrisonErrorKind::Runtime)
@@ -195,50 +203,91 @@ pub async fn build_setup(
     }
 
     let mut runtime = ai.runtime().clone();
-    let router = TurnRouter::spawn(&mut runtime).await;
-    let supervisor = ThreadSupervisor::spawn(&mut runtime).await;
+    let project_root = resolve_project_root(config.threads.project_root.as_deref())?;
 
-    let configured = match &config.threads.project_root {
-        Some(root) => root.clone(),
-        None => std::env::current_dir()
-            .map_err(|error| GarrisonError::runtime(format!("no working directory: {error}")))?,
-    };
+    let router = spawn_router(&mut runtime).await;
+    let supervisor = spawn_supervisor(&mut runtime).await;
+    let lsp = spawn_lsp(&mut runtime, config, &project_root).await;
 
-    // Canonical from here on. Everything downstream — the session boundary,
-    // the patch tool, the language servers, the builtins a turn registers —
-    // compares against this one resolved path, so there is no spelling of a
-    // directory that is inside for one tool and outside for another.
-    let project_root = configured.canonicalize().map_err(|error| {
-        GarrisonError::runtime(format!(
-            "project root '{}' cannot be resolved: {error}",
-            configured.display()
-        ))
-    })?;
-
-    let mut roots = vec![project_root.clone()];
-    roots.extend(config.threads.workspace_roots.iter().cloned());
-    let approved_roots = Arc::new(crate::boundary::approve(&roots));
-
-    // Eager, so rust-analyzer indexes while the first prompt is still being
-    // written; a server that fails to spawn is a warning inside, not an error.
-    let lsp = crate::lsp::spawn_servers(&mut runtime, &config.lsp_servers, &project_root).await;
+    // Ordered lists, because order is the contract: gates are asked first to
+    // last and the first refusal wins; describers fill the status in sequence.
+    let gates: Vec<ActorHandle> = Vec::new();
+    let describers: Vec<ActorHandle> = vec![supervisor.clone()];
 
     Ok(ServerSetup {
         supervisor,
         runtime: ai.clone(),
         router,
-        defaults: ThreadDefaults {
-            project_root,
-            approved_roots,
-            system_prompt: config.threads.system_prompt.clone(),
-            approval_timeout: config.approval_timeout(),
-            auto_approve: Arc::new(config.approval.auto_approve.clone()),
-            lsp: Arc::new(lsp),
-        },
+        defaults: thread_defaults(config, project_root, lsp, gates),
         capabilities: capabilities(),
         audited: ai.is_audited(),
         sandbox,
+        describers,
     })
+}
+
+/// The turn router, subscribed to the broker before anything can be missed.
+async fn spawn_router(runtime: &mut ActorRuntime) -> ActorHandle {
+    TurnRouter::spawn(runtime).await
+}
+
+/// The session supervisor.
+async fn spawn_supervisor(runtime: &mut ActorRuntime) -> ActorHandle {
+    ThreadSupervisor::spawn(runtime).await
+}
+
+/// The configured language servers.
+///
+/// Eager, so rust-analyzer indexes while the first prompt is still being
+/// written; a server that fails to spawn is a warning inside, not an error.
+async fn spawn_lsp(
+    runtime: &mut ActorRuntime,
+    config: &GarrisonConfig,
+    project_root: &Path,
+) -> crate::lsp::LspRegistry {
+    crate::lsp::spawn_servers(runtime, &config.lsp_servers, project_root).await
+}
+
+/// Resolves the directory sessions are rooted at by default.
+///
+/// Canonical from here on. Everything downstream — the session boundary, the
+/// patch tool, the language servers, the builtins a turn registers — compares
+/// against this one resolved path, so there is no spelling of a directory that
+/// is inside for one tool and outside for another.
+fn resolve_project_root(configured: Option<&Path>) -> Result<PathBuf, GarrisonError> {
+    let configured = match configured {
+        Some(root) => root.to_path_buf(),
+        None => std::env::current_dir()
+            .map_err(|error| GarrisonError::runtime(format!("no working directory: {error}")))?,
+    };
+
+    configured.canonicalize().map_err(|error| {
+        GarrisonError::runtime(format!(
+            "project root '{}' cannot be resolved: {error}",
+            configured.display()
+        ))
+    })
+}
+
+/// What every new session inherits.
+fn thread_defaults(
+    config: &GarrisonConfig,
+    project_root: PathBuf,
+    lsp: crate::lsp::LspRegistry,
+    gates: Vec<ActorHandle>,
+) -> ThreadDefaults {
+    let mut roots = vec![project_root.clone()];
+    roots.extend(config.threads.workspace_roots.iter().cloned());
+
+    ThreadDefaults {
+        approved_roots: Arc::new(crate::boundary::approve(&roots)),
+        project_root,
+        system_prompt: config.threads.system_prompt.clone(),
+        approval_timeout: config.approval_timeout(),
+        auto_approve: Arc::new(config.approval.auto_approve.clone()),
+        lsp: Arc::new(lsp),
+        gates,
+    }
 }
 
 /// Describes the isolation in force, for `_garrison/status`.

@@ -79,6 +79,28 @@ pub mod error_code {
     pub const TURN_FAILED: i32 = -32012;
     /// The session already has a turn in flight.
     pub const SESSION_BUSY: i32 = -32013;
+
+    // The turn-admission codes below are allocated once, here, for every gate
+    // a later subsystem adds. `crate::admission::refusal_code` is the one
+    // mapping from a refusal onto them; nothing else picks a number.
+
+    /// No seat entitles this install's operator to run a turn.
+    pub const SEAT_REFUSED: i32 = -32014;
+    /// The control plane is unreachable and the offline grace has run out.
+    pub const PLANE_UNREACHABLE: i32 = -32015;
+    /// The policy in force forbids the turn.
+    pub const POLICY_REFUSED: i32 = -32016;
+    /// The audit trail cannot be shipped and its backlog is past its bound.
+    pub const AUDIT_SHIPPING_REFUSED: i32 = -32017;
+    /// The session store is unavailable.
+    pub const STORE_UNAVAILABLE: i32 = -32018;
+    /// The session has an interrupted turn that must be resumed or abandoned
+    /// before another starts.
+    pub const TURN_INTERRUPTED: i32 = -32019;
+    /// The session root the client named lies outside every approved root.
+    pub const SESSION_ROOT_UNAPPROVED: i32 = -32020;
+    /// A resume or abandon named a session with no interrupted turn.
+    pub const NO_INTERRUPTED_TURN: i32 = -32021;
 }
 
 /// One frame arriving over the socket, classified.
@@ -570,6 +592,14 @@ mod tests {
             error_code::UNSUPPORTED_VERSION,
             error_code::TURN_FAILED,
             error_code::SESSION_BUSY,
+            error_code::SEAT_REFUSED,
+            error_code::PLANE_UNREACHABLE,
+            error_code::POLICY_REFUSED,
+            error_code::AUDIT_SHIPPING_REFUSED,
+            error_code::STORE_UNAVAILABLE,
+            error_code::TURN_INTERRUPTED,
+            error_code::SESSION_ROOT_UNAPPROVED,
+            error_code::NO_INTERRUPTED_TURN,
         ] {
             assert!((-32099..=-32000).contains(&code), "{code} is out of range");
             assert!(
@@ -577,5 +607,40 @@ mod tests {
                 "{code} collides with an ACP code",
             );
         }
+    }
+
+    #[test]
+    fn the_admission_codes_are_the_frozen_table() {
+        // The numbers are a promise to clients, not an implementation detail:
+        // every gate's refusal lands on one of these and nowhere else.
+        assert_eq!(error_code::SEAT_REFUSED, -32014);
+        assert_eq!(error_code::PLANE_UNREACHABLE, -32015);
+        assert_eq!(error_code::POLICY_REFUSED, -32016);
+        assert_eq!(error_code::AUDIT_SHIPPING_REFUSED, -32017);
+        assert_eq!(error_code::STORE_UNAVAILABLE, -32018);
+        assert_eq!(error_code::TURN_INTERRUPTED, -32019);
+        assert_eq!(error_code::SESSION_ROOT_UNAPPROVED, -32020);
+        assert_eq!(error_code::NO_INTERRUPTED_TURN, -32021);
+    }
+
+    #[test]
+    fn no_two_garrison_codes_share_a_number() {
+        let codes = [
+            error_code::NOT_INITIALIZED,
+            error_code::UNSUPPORTED_VERSION,
+            error_code::TURN_FAILED,
+            error_code::SESSION_BUSY,
+            error_code::SEAT_REFUSED,
+            error_code::PLANE_UNREACHABLE,
+            error_code::POLICY_REFUSED,
+            error_code::AUDIT_SHIPPING_REFUSED,
+            error_code::STORE_UNAVAILABLE,
+            error_code::TURN_INTERRUPTED,
+            error_code::SESSION_ROOT_UNAPPROVED,
+            error_code::NO_INTERRUPTED_TURN,
+        ];
+        let distinct: std::collections::BTreeSet<i32> = codes.iter().copied().collect();
+
+        assert_eq!(distinct.len(), codes.len());
     }
 }

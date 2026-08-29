@@ -1,0 +1,402 @@
+//! Turn admission: one question every gate answers the same way.
+//!
+//! Before a session runs a turn it asks each of its gates [`AdmitTurn`], in
+//! order, and stops at the first refusal. A gate is any actor that implements
+//! a handler for [`AdmitTurn`]: a seat monitor, a policy agent, an audit
+//! shipper, a session store. None of them touch `thread.rs`; they are handed
+//! to a session as a list, and the fold here is the only code that walks it.
+//!
+//! # Fail closed
+//!
+//! A gate that cannot be asked — its actor has stopped, its reply never comes,
+//! the deadline passes — has not said yes. [`admit`] treats every
+//! [`AskError`] as a refusal, because a gate that exists in the list is a gate
+//! somebody decided a turn must pass, and a turn that runs because the gate was
+//! unreachable is a turn nobody admitted.
+//!
+//! # One refusal vocabulary
+//!
+//! [`TurnRefusal`] is the closed set of reasons a turn may be refused, and
+//! [`refusal_code`] is the one place a refusal becomes a JSON-RPC error code.
+//! Every gate speaks it, so a client sees the same error shape whichever gate
+//! said no.
+
+use crate::protocol::jsonrpc::error_code;
+use crate::types::{ThreadId, TurnId};
+use acton_reactive::prelude::*;
+use std::fmt;
+use std::time::Duration;
+
+/// How long a gate has to answer before its silence counts as a refusal.
+///
+/// Well inside acton-reactive's default `ask` deadline, so a wedged gate turns
+/// into a prompt error rather than a `session/prompt` that hangs for the
+/// runtime-wide thirty seconds.
+pub const GATE_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Asks a gate whether a turn may start.
+#[acton_message]
+pub struct AdmitTurn {
+    /// The session about to run a turn.
+    pub thread_id: ThreadId,
+    /// Garrison's identifier for the turn.
+    pub turn_id: TurnId,
+}
+
+/// A gate's answer.
+#[acton_message]
+#[derive(PartialEq, Eq)]
+pub enum Admission {
+    /// The turn may start, as far as this gate is concerned.
+    Admit,
+    /// It may not, and this is why.
+    Refuse(TurnRefusal),
+}
+
+impl Request for AdmitTurn {
+    type Response = Admission;
+}
+
+/// Why a turn was not admitted.
+///
+/// Non-exhaustive: a later gate may need a reason not listed here, and adding
+/// one must not break the clients that already match on these.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TurnRefusal {
+    /// The operator holds no seat that entitles this install to run.
+    Seat {
+        /// What the seat check found.
+        reason: String,
+    },
+    /// The control plane could not be reached and the grace for running
+    /// without it has run out.
+    PlaneUnavailable {
+        /// What failed, in transport terms.
+        reason: String,
+    },
+    /// The policy in force forbids the turn.
+    Policy {
+        /// Which rule, or why there is no usable policy.
+        reason: String,
+    },
+    /// The audit trail cannot be shipped and the unshipped backlog is past its
+    /// bound.
+    AuditShipping {
+        /// What the shipper is stuck on.
+        reason: String,
+    },
+    /// The session store the turn would be recorded in is unavailable.
+    StoreUnavailable,
+    /// The session has an interrupted turn that must be resumed or abandoned
+    /// before a new one starts.
+    TurnInterrupted {
+        /// The turn left half-done.
+        turn_id: TurnId,
+    },
+    /// A gate could not be asked at all, so it has not said yes.
+    GateUnreachable {
+        /// Which gate, by actor identity.
+        gate: String,
+        /// What went wrong asking it.
+        reason: String,
+    },
+}
+
+impl fmt::Display for TurnRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Seat { reason } => write!(f, "no seat entitles this turn: {reason}"),
+            Self::PlaneUnavailable { reason } => {
+                write!(f, "the control plane is unreachable: {reason}")
+            }
+            Self::Policy { reason } => write!(f, "policy refuses this turn: {reason}"),
+            Self::AuditShipping { reason } => {
+                write!(f, "the audit trail cannot be shipped: {reason}")
+            }
+            Self::StoreUnavailable => write!(f, "the session store is unavailable"),
+            Self::TurnInterrupted { turn_id } => write!(
+                f,
+                "turn {turn_id} was interrupted and must be resumed or abandoned first"
+            ),
+            Self::GateUnreachable { gate, reason } => {
+                write!(f, "gate {gate} could not be asked: {reason}")
+            }
+        }
+    }
+}
+
+/// The JSON-RPC error code a refusal is reported under.
+///
+/// Pure, and the only mapping from a refusal to a code; the table it encodes
+/// is the one frozen in [`error_code`]. An unreachable gate is not a verdict
+/// any subsystem reached, so it reports as the turn failing rather than as any
+/// of the governance refusals.
+#[must_use]
+pub const fn refusal_code(refusal: &TurnRefusal) -> i32 {
+    match refusal {
+        TurnRefusal::Seat { .. } => error_code::SEAT_REFUSED,
+        TurnRefusal::PlaneUnavailable { .. } => error_code::PLANE_UNREACHABLE,
+        TurnRefusal::Policy { .. } => error_code::POLICY_REFUSED,
+        TurnRefusal::AuditShipping { .. } => error_code::AUDIT_SHIPPING_REFUSED,
+        TurnRefusal::StoreUnavailable => error_code::STORE_UNAVAILABLE,
+        TurnRefusal::TurnInterrupted { .. } => error_code::TURN_INTERRUPTED,
+        TurnRefusal::GateUnreachable { .. } => error_code::TURN_FAILED,
+    }
+}
+
+/// Folds a sequence of answers into one: the first refusal wins.
+///
+/// Pure. The iterator is consumed lazily, so a caller that produces answers by
+/// asking gates one at a time stops asking once one has refused.
+pub fn fold(admissions: impl IntoIterator<Item = Admission>) -> Admission {
+    admissions
+        .into_iter()
+        .find(|admission| matches!(admission, Admission::Refuse(_)))
+        .unwrap_or(Admission::Admit)
+}
+
+/// Asks every gate in order, stopping at the first refusal.
+///
+/// Empty gates admit. A gate that cannot be asked refuses; see the module docs.
+pub async fn admit(gates: &[ActorHandle], request: &AdmitTurn) -> Admission {
+    for gate in gates {
+        let answer = match gate.ask_with_timeout(request.clone(), GATE_DEADLINE).await {
+            Ok(answer) => answer,
+            Err(error) => Admission::Refuse(TurnRefusal::GateUnreachable {
+                gate: gate.id().to_string(),
+                reason: describe_ask_error(&error),
+            }),
+        };
+        if let Admission::Refuse(refusal) = answer {
+            tracing::info!(
+                gate = %gate.id(),
+                thread_id = %request.thread_id,
+                turn_id = %request.turn_id,
+                %refusal,
+                "a gate refused a turn",
+            );
+            return Admission::Refuse(refusal);
+        }
+    }
+    Admission::Admit
+}
+
+/// Words for an `AskError`, since the type does not print itself.
+fn describe_ask_error(error: &AskError) -> String {
+    match error {
+        AskError::Undeliverable => "the gate has stopped".to_string(),
+        AskError::Cancelled => "the ask was cancelled by shutdown".to_string(),
+        AskError::NoReply => "the gate did not answer".to_string(),
+        AskError::TimedOut { after } => {
+            format!("the gate did not answer within {}s", after.as_secs())
+        }
+        other => format!("{other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn refuse(reason: &str) -> Admission {
+        Admission::Refuse(TurnRefusal::Policy {
+            reason: reason.to_string(),
+        })
+    }
+
+    #[test]
+    fn no_answers_admit() {
+        assert!(matches!(fold(Vec::new()), Admission::Admit));
+    }
+
+    #[test]
+    fn all_admits_admit() {
+        assert!(matches!(
+            fold([Admission::Admit, Admission::Admit]),
+            Admission::Admit
+        ));
+    }
+
+    #[test]
+    fn the_first_refusal_wins_over_later_ones() {
+        let folded = fold([Admission::Admit, refuse("first"), refuse("second")]);
+
+        assert_eq!(
+            folded,
+            Admission::Refuse(TurnRefusal::Policy {
+                reason: "first".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn folding_stops_at_the_first_refusal() {
+        // A panicking third element proves it was never reached.
+        let answers =
+            [refuse("stop here"), Admission::Admit]
+                .into_iter()
+                .chain(std::iter::from_fn(|| -> Option<Admission> {
+                    panic!("asked past the refusal")
+                }));
+
+        assert!(matches!(fold(answers), Admission::Refuse(_)));
+    }
+
+    #[test]
+    fn every_refusal_maps_onto_the_frozen_code_table() {
+        let cases = [
+            (
+                TurnRefusal::Seat {
+                    reason: String::new(),
+                },
+                error_code::SEAT_REFUSED,
+            ),
+            (
+                TurnRefusal::PlaneUnavailable {
+                    reason: String::new(),
+                },
+                error_code::PLANE_UNREACHABLE,
+            ),
+            (
+                TurnRefusal::Policy {
+                    reason: String::new(),
+                },
+                error_code::POLICY_REFUSED,
+            ),
+            (
+                TurnRefusal::AuditShipping {
+                    reason: String::new(),
+                },
+                error_code::AUDIT_SHIPPING_REFUSED,
+            ),
+            (TurnRefusal::StoreUnavailable, error_code::STORE_UNAVAILABLE),
+            (
+                TurnRefusal::TurnInterrupted {
+                    turn_id: TurnId::new(),
+                },
+                error_code::TURN_INTERRUPTED,
+            ),
+            (
+                TurnRefusal::GateUnreachable {
+                    gate: String::new(),
+                    reason: String::new(),
+                },
+                error_code::TURN_FAILED,
+            ),
+        ];
+
+        for (refusal, expected) in cases {
+            assert_eq!(refusal_code(&refusal), expected, "{refusal}");
+        }
+    }
+
+    #[test]
+    fn a_refusal_reads_as_a_sentence_with_its_reason() {
+        let refusal = TurnRefusal::Seat {
+            reason: "seat revoked".to_string(),
+        };
+
+        assert_eq!(
+            refusal.to_string(),
+            "no seat entitles this turn: seat revoked"
+        );
+    }
+
+    /// A gate that always says no.
+    #[acton_actor]
+    struct Refuser;
+
+    /// A gate that always says yes.
+    #[acton_actor]
+    struct Admitter;
+
+    /// A gate that never answers.
+    #[acton_actor]
+    struct Mute;
+
+    fn request() -> AdmitTurn {
+        AdmitTurn {
+            thread_id: ThreadId::new(),
+            turn_id: TurnId::new(),
+        }
+    }
+
+    async fn spawn_gates(runtime: &mut ActorRuntime) -> (ActorHandle, ActorHandle, ActorHandle) {
+        let mut admitter = runtime.new_actor::<Admitter>();
+        admitter.act_on::<AdmitTurn>(|_, envelope| {
+            let reply = envelope.reply_envelope();
+            Reply::pending(async move { reply.send(Admission::Admit).await })
+        });
+
+        let mut refuser = runtime.new_actor::<Refuser>();
+        refuser.act_on::<AdmitTurn>(|_, envelope| {
+            let reply = envelope.reply_envelope();
+            Reply::pending(async move {
+                reply
+                    .send(Admission::Refuse(TurnRefusal::StoreUnavailable))
+                    .await;
+            })
+        });
+
+        let mut mute = runtime.new_actor::<Mute>();
+        mute.act_on::<AdmitTurn>(|_, _| Reply::ready());
+
+        (
+            admitter.start().await,
+            refuser.start().await,
+            mute.start().await,
+        )
+    }
+
+    #[tokio::test]
+    async fn no_gates_admit() {
+        assert!(matches!(admit(&[], &request()).await, Admission::Admit));
+    }
+
+    #[tokio::test]
+    async fn a_refusing_gate_refuses_the_turn_even_after_an_admitting_one() {
+        let mut runtime = ActonApp::launch_async().await;
+        let (admitter, refuser, _) = spawn_gates(&mut runtime).await;
+
+        let answer = admit(&[admitter, refuser], &request()).await;
+
+        assert_eq!(answer, Admission::Refuse(TurnRefusal::StoreUnavailable));
+        runtime.shutdown_all().await.expect("clean shutdown");
+    }
+
+    #[tokio::test]
+    async fn a_gate_that_does_not_answer_is_a_refusal() {
+        let mut runtime = ActonApp::launch_async().await;
+        let (admitter, _, mute) = spawn_gates(&mut runtime).await;
+
+        let answer = admit(&[mute, admitter], &request()).await;
+
+        assert!(
+            matches!(
+                answer,
+                Admission::Refuse(TurnRefusal::GateUnreachable { .. })
+            ),
+            "{answer:?}"
+        );
+        runtime.shutdown_all().await.expect("clean shutdown");
+    }
+
+    #[tokio::test]
+    async fn a_stopped_gate_is_a_refusal() {
+        let mut runtime = ActonApp::launch_async().await;
+        let (admitter, _, _) = spawn_gates(&mut runtime).await;
+        admitter.stop().await.expect("the gate stops");
+
+        let answer = admit(&[admitter], &request()).await;
+
+        assert!(
+            matches!(
+                answer,
+                Admission::Refuse(TurnRefusal::GateUnreachable { .. })
+            ),
+            "{answer:?}"
+        );
+        runtime.shutdown_all().await.expect("clean shutdown");
+    }
+}
