@@ -25,9 +25,10 @@ task plane:check      # parse the schemas, then strict-mode validate the Cedar b
 has also been applied end to end against a throwaway PostgreSQL 17 instance: 26
 migration steps, 15 tables, every `unique` constraint and every CEL rule
 type-checked at apply time. The server was then run against it and the
-authorization and write-time rules exercised over HTTP — hidden-field
-rejection, both delete `forbid`s, and every `@require` on both its passing and
-its failing branch. That database was discarded.
+authorization and write-time rules exercised over HTTP — both delete
+`forbid`s against a control case that succeeds, issuer separation between
+enrollment artifacts and console bearers, and every `@require` on both its
+passing and its failing branch. That database was discarded.
 
 Tooling: `schemaforge` 0.37.2, PostgreSQL flavor.
 
@@ -100,23 +101,54 @@ rejected: it would put a replayable credential in the database, on the wire at
 every heartbeat, and in a file on every workstation, which is three copies of
 something that only needs to exist in one place.
 
-`EnrollmentToken` is the one unavoidable secret, and it is spent once.
-`secret_hash` is `@hidden`, which means more than "not serialized": SchemaForge
-rejects any request body that so much as names a hidden field. Combined with
-`required`, that makes an enrollment token **impossible to mint through the
-generic CRUD API by anyone, including `platform_admin`** — verified, not
-assumed:
+`EnrollmentToken` stores no secret either, which took a second pass to get
+right. Modeled as a password — a random secret with its argon2 hash in the row
+— it was unmintable. The hash has to be `@hidden`; SchemaForge rejects any
+request body naming a hidden field; and a `required` field nobody may send
+cannot be created by anyone, `platform_admin` included. A `before_validate`
+hook could have filled it, but that solves the wrong half: the plaintext still
+could never reach the human doing the provisioning, because a create response
+carries only persisted fields.
+
+So the artifact is not stored at all. It is a PASETO v4 token minted with
+`schemaforge token generate` against the key the plane already holds, carrying
+the token id as `sub` and the grant as claims:
+
+```sh
+schemaforge token generate --sub tok_7f3a --lifetime 172800 \
+  --issuer garrison-enrollment --roles '' \
+  --custom-claim-string org=$ORG --custom-claim-string scope=organization \
+  --custom-claim-long max_uses=25
+
+schemaforge entity create EnrollmentToken \
+  --set token_id=tok_7f3a --set issuer=garrison-enrollment \
+  --set organization=$ORG --set scope=organization --set max_uses=25 \
+  --set issued_by=so@agency.gov --set expires_at=2026-08-31T04:00:00Z
+```
+
+Authenticity comes from the signature; the row supplies what a signature
+cannot — revocation, use counting, and who issued it. The row is an ordinary
+entity, so provisioning is scriptable with the CLI like everything else.
+
+The two token families are kept apart structurally, not by convention. An
+enrollment artifact is minted under its own `issuer`, and acton-service
+validates `iss` on every bearer, so presenting one as a session token fails
+before authorization runs:
 
 ```
-POST /api/v1/forge/schemas/EnrollmentToken/entities   (secret_hash in body)
-  422  fields cannot be set via the API (marked @hidden): secret_hash
-POST /api/v1/forge/schemas/EnrollmentToken/entities   (secret_hash omitted)
-  422  required field 'secret_hash' is missing
+GET /schemas/Organization/entities   (enrollment artifact as bearer)
+  401  Invalid PASETO token: the claim 'iss' failed validation
+GET /schemas/Organization/entities   (console bearer, same route)
+  200
 ```
 
-Minting is therefore a server-side route writing through the storage layer.
-That is a constraint, not an oversight: a provisioning credential you can POST
-into existence is one an over-broad token can POST into existence.
+The corollary is that the redemption route must verify the artifact itself,
+since the standard bearer middleware will refuse it. That is correct: a daemon
+redeeming a token has no other credential to present.
+
+The trade to write down: a database compromise still yields nothing, but a
+compromise of the signing key lets an attacker mint enrollment tokens. That key
+already protects every session token, so it concentrates no new trust.
 
 Neither schema is deletable. `policies/custom/credential-lifecycle.cedar`
 carries a `forbid` on both delete actions for the same reason the audit trail
