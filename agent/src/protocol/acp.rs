@@ -131,6 +131,24 @@ pub struct GarrisonStatus {
     pub audit: AuditStatus,
     /// What isolation the agent's writing tools run under.
     pub sandbox: SandboxStatus,
+    /// What the session supervisor holds across every connection.
+    ///
+    /// Absent when the supervisor could not be asked; the rest of the status
+    /// is still worth having.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threads: Option<ThreadsStatus>,
+}
+
+/// What the session supervisor reports about the sessions it owns.
+///
+/// Distinct from [`GarrisonStatus::sessions`], which counts only the sessions
+/// the asking connection holds: this is the daemon-wide figure.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ThreadsStatus {
+    /// How many sessions are alive in the whole daemon.
+    pub live: usize,
 }
 
 /// The approval gate's configuration, as the client may see it.
@@ -193,10 +211,10 @@ pub struct AuditStatus {
     pub enabled: bool,
     /// The hash at the end of the chain, when the runtime will disclose it.
     ///
-    /// Always `None` today: acton-ai's `AuditLog` actor answers `GetChainHead`
-    /// but `ActonAI` hands out no address for it, so a downstream crate cannot
-    /// ask. Filed upstream; the field exists so filling it in later is not a
-    /// protocol change.
+    /// Read from `ActonAI::audit_head()` at the moment of the request. Absent
+    /// when no trail is configured, or when the audit actor did not answer:
+    /// a status that cannot vouch for the chain says nothing rather than
+    /// guessing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chain_head: Option<String>,
 }

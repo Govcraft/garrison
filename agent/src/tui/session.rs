@@ -738,6 +738,7 @@ mod tests {
                 timeout_secs: Some(120),
                 memory_limit_bytes: None,
             },
+            threads: None,
         };
 
         let rendered: String = describe_status(&status)

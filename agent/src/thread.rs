@@ -32,9 +32,11 @@
 //! session owns neither. Silently resurrecting a conversation with no memory of
 //! itself is worse than reporting that it is gone.
 
+use crate::admission::{self, Admission, AdmitTurn, TurnRefusal};
 use crate::approval::{with_turn_scope, TurnScope};
 use crate::protocol::acp::{self, StopReason};
 use crate::protocol::codec::EventSink;
+use crate::protocol::conn::{Describe, StatusPart};
 use crate::router::{ClaimTurn, ReleaseTurn};
 use crate::types::{ClientId, ThreadId, TurnId};
 use acton_ai::facade::ActonAI;
@@ -70,6 +72,9 @@ pub enum TurnResult {
     },
     /// The client cancelled it.
     Cancelled,
+    /// A gate refused to admit it, and the `session/prompt` must be answered
+    /// with that gate's error code.
+    Refused(TurnRefusal),
     /// It failed, and the `session/prompt` must be answered with an error.
     Failed {
         /// What went wrong, in words a client can display.
@@ -233,6 +238,12 @@ pub struct ThreadSetup {
     pub auto_approve: Arc<Vec<String>>,
     /// The language servers this session's LSP tools reach.
     pub lsp: Arc<crate::lsp::LspRegistry>,
+    /// The gates every turn must pass, in the order they are asked.
+    ///
+    /// Each answers [`AdmitTurn`]; see [`crate::admission`]. A subsystem that
+    /// wants a say in whether a turn starts adds its actor here and never
+    /// touches the turn itself.
+    pub gates: Vec<ActorHandle>,
 }
 
 /// One conversation.
@@ -484,6 +495,17 @@ async fn drive_turn(
     cancel: CancellationToken,
     messages: Vec<Message>,
 ) -> TurnResult {
+    // Admission comes before the claim: a refused turn never touches the
+    // router, so there is nothing to release. The gates are asked in order and
+    // the first refusal ends it; a gate that cannot be asked refuses.
+    let request = AdmitTurn {
+        thread_id: setup.thread_id.clone(),
+        turn_id: turn_id.clone(),
+    };
+    if let Admission::Refuse(refusal) = admission::admit(&setup.gates, &request).await {
+        return TurnResult::Refused(refusal);
+    }
+
     // Claiming is what lets the router attribute this turn's broadcast tool
     // events. Awaiting the acknowledgement before starting is the exclusion;
     // see `crate::router`.
@@ -744,6 +766,18 @@ fn configure_supervisor(builder: &mut ManagedActor<Idle, ThreadSupervisor>) {
         let threads = actor.model.sorted();
         Reply::pending(async move {
             reply.send(ThreadList { threads }).await;
+        })
+    });
+
+    // The supervisor's contribution to `_garrison/status`: how many sessions
+    // the daemon holds in all, which no single connection can see.
+    builder.mutate_on::<Describe>(|actor, envelope| {
+        let reply = envelope.reply_envelope();
+        let part = StatusPart::Threads(acp::ThreadsStatus {
+            live: actor.model.threads.len(),
+        });
+        Reply::pending(async move {
+            reply.send(part).await;
         })
     });
 }
