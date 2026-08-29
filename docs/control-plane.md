@@ -20,10 +20,13 @@ the two gates that run without a database:
 task plane:check      # parse the schemas, then strict-mode validate the Cedar bundle
 ```
 
-13 schemas lower into 129 Cedar policies that pass strict-mode validation. The
-model has also been applied end to end against a throwaway PostgreSQL 17
-instance — 22 migration steps, 13 tables, every `unique` constraint and every
-CEL rule type-checked at apply time — and that database was discarded.
+13 schemas lower into 129 generated Cedar policies; 8 hand-written policies in
+`policies/custom/` bring the bundle to 137, all strict-mode validated. The model
+has also been applied end to end against a throwaway PostgreSQL 17 instance: 22
+migration steps, 13 tables, every `unique` constraint and every CEL rule
+type-checked at apply time. That database was discarded.
+
+Tooling: `schemaforge` 0.37.2, PostgreSQL flavor.
 
 **Planned:** everything that moves bytes. The agent does not yet pull policy
 from this plane or push audit to it, no database has been provisioned, Entra ID
@@ -128,17 +131,41 @@ re-verifies rather than trusting the install that shipped the entries, and
 `AuditChain.integrity` records what the last walk found — with a `@require`
 rule forcing a gap or a break to say what it was.
 
-Access here is deliberately lopsided:
+Access here is deliberately lopsided. Operators — that is, agents — append and
+cannot read. Auditors read and cannot append.
 
-```
-@access(read: ["team_lead", "auditor", "security_officer", "org_admin"],
-        write: ["operator"],
-        delete: [])
+Deletion needs more care than the DSL can express, and the obvious spelling is
+a trap. `delete: []` does **not** mean "nobody": an empty list reads as
+unconstrained and generates
+
+```cedar
+// Allow any authenticated user to delete AuditEvent entities
+permit (principal is Forge::Principal,
+        action == Action::"DeleteAuditEvent",
+        resource is AuditEvent);
 ```
 
-Operators — that is, agents — append and cannot read. Auditors read and cannot
-append. Nobody deletes: an append-only trail with a delete verb is a trail with
-an eraser in the drawer.
+which is the opposite of the intent, and it fails open silently — the bundle
+validates, the schema reads like a lockdown, and everyone can delete. Read the
+generated policies rather than trusting the annotation.
+
+So the generated permit is narrowed to `org_admin`, and the real rule lives in
+`policies/custom/audit-append-only.cedar` as a Cedar `forbid` over
+`UpdateAuditEvent` and `DeleteAuditEvent`. A `forbid` beats every `permit`,
+platform_admin's bypass included, which is what makes "nobody deletes" true
+rather than aspirational. Narrowing the generated permit as well means a lost
+custom policy file degrades to "only the highest role", not "everyone".
+
+Records-retention deletion, when it comes, is a deliberate edit to that file
+alongside a documented disposition schedule — not a permission somebody already
+quietly holds.
+
+Bulk export is a separate consent again. `@export` on both audit schemas
+enables the endpoint; it grants nobody. The distinct `ExportAuditEvent` /
+`ExportAuditChain` actions are permitted in the same custom file to the three
+roles that already read the trail, and the exported column set is
+`@exportable ∩ readable`. `AuditEvent.detail` is deliberately left out: a bulk
+file is the wrong place for whatever a tool happened to attach.
 
 ## Roles
 
@@ -194,10 +221,11 @@ are failures the runtime would otherwise refuse to hot-swap after merge.
 
 - **No ingest.** `PlaneSync` in the agent's actor topology is unbuilt; nothing
   pushes audit or pulls bundles yet.
-- **No export annotations.** `@export` / `@exportable` on `AuditEvent` would
-  give SIEM handoff a first-class path, but they landed in SchemaForge 0.37 and
-  the pinned CLI here is 0.35.0. The field set is already chosen; see the note
-  at the top of `schemas/audit.schema`.
+- **Schemas are unsigned.** Every command prints `schema signature
+  verification is disabled (signing.mode = off)`. SchemaForge can require
+  ed25519, SSH allowed-signers, or cosign-keyless signatures over `schemas/`
+  before parsing, which is worth adopting here well before anything federal
+  ships. The rollout is off → warn → enforce.
 - **Entra claims are modeled, not wired.** `[schema_forge.authz.principal_claims]`
   in `config.toml` is commented out because projecting `entra_object_id` onto
   `Forge::Principal` requires those columns on the system `User` schema first.

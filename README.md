@@ -36,7 +36,7 @@ the federal product described below is direction, not checkout.
 - The control plane's administrative entity model: 13 SchemaForge schemas
   covering tenancy, operators and seats, the install fleet, policy bundles and
   command rules, approved model endpoints, and audit-chain aggregation —
-  lowering into 129 strict-mode-validated Cedar policies. See
+  lowering into a 137-policy, strict-mode-validated Cedar bundle. See
   [docs/control-plane.md](docs/control-plane.md).
 - acton-ai policy, accounting, audit, planning, context, MCP, and tool-loop
   primitives where enabled by configuration.
