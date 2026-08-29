@@ -40,6 +40,7 @@ use crate::protocol::conn::{Describe, StatusPart};
 use crate::router::{ClaimTurn, ReleaseTurn};
 use crate::types::{ClientId, ThreadId, TurnId};
 use acton_ai::facade::ActonAI;
+use acton_ai::memory::{CompactionRecord, COMPACTION_NOTICE};
 use acton_ai::messages::{Message, MessageRole};
 use acton_reactive::prelude::*;
 use std::collections::HashMap;
@@ -69,6 +70,12 @@ pub enum TurnResult {
         text: String,
         /// What it cost.
         usage: TurnUsage,
+        /// The plan as it stood when the turn ended, if the model published
+        /// one. The client saw each version stream past; this is the state.
+        plan: Option<acton_ai::tools::plan::Plan>,
+        /// What the prompt loop summarized away during the turn, oldest
+        /// first. Empty unless auto-compaction is on and fired.
+        compactions: Vec<CompactionRecord>,
     },
     /// The client cancelled it.
     Cancelled,
@@ -271,14 +278,21 @@ impl Thread {
         messages
     }
 
-    /// Commits a completed exchange to the history.
+    /// Commits a completed exchange to the history, compactions and all.
     ///
     /// Only a turn that produced text is recorded. A cancelled or failed turn
     /// leaves no trace, so a client that retries sends the same conversation it
     /// thought it had rather than one containing a question the model never
     /// answered.
-    fn commit(&mut self, content: &str, text: &str) {
+    ///
+    /// With `compactions` empty this is the append it has always been. With
+    /// records present the turn's own prompt is appended first and then
+    /// [`adopt`] replays them onto the result, so what is stored is the
+    /// conversation the model actually had rather than the one it was
+    /// spared.
+    fn commit(&mut self, content: &str, text: &str, compactions: &[CompactionRecord]) {
         self.history.push(Message::user(content));
+        self.history = adopt(std::mem::take(&mut self.history), compactions);
         self.history.push(Message::assistant(text));
     }
 
@@ -308,15 +322,57 @@ impl Thread {
 /// reconstructed by the client from the tool-call updates it already saw, and
 /// replaying a system prompt as a user-visible chunk would put words in the
 /// operator's mouth.
+///
+/// A compaction summary is a user-role message the framework wrote, not
+/// something the operator said, so it replays as an agent *thought*: the
+/// closest spec-native slot for context the agent carries and did not utter.
+/// Dropping it instead would hide that the history was rewritten.
 fn replay(thread_id: &ThreadId, history: &[Message], sink: &EventSink) {
     for message in history {
         let update = match message.role {
+            MessageRole::User if is_compaction_summary(message) => {
+                acp::thought_chunk(thread_id, &message.content)
+            }
             MessageRole::User => acp::user_chunk(thread_id, &message.content),
             MessageRole::Assistant => acp::agent_chunk(thread_id, &message.content),
             MessageRole::System | MessageRole::Tool => continue,
         };
         sink.notify(acp::method::SESSION_UPDATE, &update);
     }
+}
+
+/// Whether a message is the framework's compaction summary.
+///
+/// Recognized by acton-ai's own opening line, which is a public constant for
+/// exactly this: a transcript reader, a stored session, and this replay all
+/// need to tell the summary apart from a participant's words, and matching the
+/// constant is the only way to do that which cannot drift from what the model
+/// was shown.
+#[must_use]
+fn is_compaction_summary(message: &Message) -> bool {
+    message.role == MessageRole::User && message.content.starts_with(COMPACTION_NOTICE)
+}
+
+/// Replays a turn's compactions onto the session's own copy of the history.
+///
+/// Pure, and the whole reason compaction is worth anything across turns: the
+/// prompt loop compacts *its* list and hands back records, not the rewritten
+/// list, so without this the next turn resends the elided span and pays for
+/// the same summary again.
+///
+/// Each record's [`CompactionRecord::adopt`] does the work, applied in order,
+/// each against the history the previous one produced. Upstream states the
+/// rule this depends on — a compaction is a strict prefix elision, counted
+/// from the first non-system message — as `elided_prefix_len`, so the
+/// alignment is acton-ai's promise rather than Garrison's inference. When the
+/// elided prefix reaches past everything the session owns (the loop's list
+/// also held this turn's rounds, which the session never keeps), `adopt` drops
+/// what there is and the history becomes the summary alone.
+#[must_use]
+fn adopt(history: Vec<Message>, compactions: &[CompactionRecord]) -> Vec<Message> {
+    compactions
+        .iter()
+        .fold(history, |history, record| record.adopt(&history))
 }
 
 /// Wires a session's handlers.
@@ -381,8 +437,11 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, Thread>) {
 
         actor.model.running = None;
 
-        if let TurnResult::Completed { text, .. } = &message.result {
-            actor.model.commit(&message.content, text);
+        if let TurnResult::Completed {
+            text, compactions, ..
+        } = &message.result
+        {
+            actor.model.commit(&message.content, text, compactions);
         }
 
         let Some(setup) = actor.model.setup.clone() else {
@@ -583,6 +642,8 @@ async fn drive_turn(
                 prompt_tokens: response.usage.input_tokens,
                 completion_tokens: response.usage.output_tokens,
             },
+            plan: response.plan,
+            compactions: response.compactions,
         },
         Some(Err(error)) => TurnResult::Failed {
             reason: error.to_string(),
@@ -812,15 +873,159 @@ mod tests {
         assert_eq!(messages[2], Message::user("second"));
     }
 
+    /// A record that says the summary replaced `elided` leading messages.
+    ///
+    /// The outcome's counts are the loop's, over its own longer list; the
+    /// prefix length is the one that lands on the session's copy, which is why
+    /// the two are deliberately different numbers here.
+    fn record(summary: &str, elided: usize) -> CompactionRecord {
+        CompactionRecord {
+            summary: summary.to_string(),
+            outcome: acton_ai::memory::CompactionOutcome {
+                messages_before: elided + 4,
+                messages_after: 5,
+                tokens_before: 900,
+                tokens_after: 300,
+                messages_elided: elided,
+            },
+            elided_prefix_len: elided,
+        }
+    }
+
+    /// A history of `count` alternating user and assistant messages.
+    fn conversation(count: usize) -> Vec<Message> {
+        (0..count)
+            .map(|index| {
+                if index % 2 == 0 {
+                    Message::user(format!("q{index}"))
+                } else {
+                    Message::assistant(format!("a{index}"))
+                }
+            })
+            .collect()
+    }
+
     #[test]
     fn committing_appends_the_exchange() {
         let mut thread = Thread::default();
 
-        thread.commit("question", "answer");
+        thread.commit("question", "answer", &[]);
 
         assert_eq!(
             thread.history,
             vec![Message::user("question"), Message::assistant("answer")]
+        );
+    }
+
+    #[test]
+    fn adopting_no_compactions_leaves_the_history_alone() {
+        let history = conversation(4);
+
+        assert_eq!(adopt(history.clone(), &[]), history);
+    }
+
+    #[test]
+    fn adopting_replaces_the_elided_prefix_with_the_summary() {
+        let history = conversation(6);
+
+        let adopted = adopt(history.clone(), &[record("what came before", 4)]);
+
+        assert_eq!(adopted.len(), 3, "four messages became one summary");
+        assert!(adopted[0].content.starts_with(COMPACTION_NOTICE));
+        assert!(adopted[0].content.contains("what came before"));
+        assert_eq!(adopted[1..], history[4..]);
+    }
+
+    #[test]
+    fn an_elided_prefix_past_the_sessions_own_messages_leaves_the_summary_alone() {
+        // The loop's list also held this turn's rounds, which the session
+        // never keeps, so a record can name more messages than there are.
+        let history = conversation(3);
+
+        let adopted = adopt(history, &[record("everything so far", 9)]);
+
+        assert_eq!(adopted.len(), 1);
+        assert!(adopted[0].content.starts_with(COMPACTION_NOTICE));
+    }
+
+    #[test]
+    fn two_compactions_of_one_turn_apply_in_sequence() {
+        let history = conversation(8);
+
+        let adopted = adopt(
+            history,
+            &[record("first pass", 4), record("second pass", 2)],
+        );
+
+        // The first pass left 1 summary + 4 messages; the second elided the
+        // summary and the message after it, leaving 1 summary + 3.
+        assert_eq!(adopted.len(), 4);
+        assert!(adopted[0].content.contains("second pass"));
+        assert!(
+            !adopted.iter().any(|m| m.content.contains("first pass")),
+            "the second summary stands for the first"
+        );
+    }
+
+    #[test]
+    fn committing_with_a_compaction_keeps_the_summary_then_the_answer() {
+        let mut thread = Thread::default().with_history(conversation(4));
+
+        thread.commit("question", "answer", &[record("the earlier work", 3)]);
+
+        assert_eq!(thread.history.len(), 4);
+        assert!(thread.history[0].content.starts_with(COMPACTION_NOTICE));
+        assert_eq!(thread.history[2], Message::user("question"));
+        assert_eq!(thread.history[3], Message::assistant("answer"));
+    }
+
+    #[test]
+    fn committing_a_compaction_that_swallowed_the_prompt_still_records_the_answer() {
+        let mut thread = Thread::default().with_history(conversation(2));
+
+        thread.commit("question", "answer", &[record("all of it", 3)]);
+
+        assert_eq!(thread.history.len(), 2);
+        assert!(thread.history[0].content.starts_with(COMPACTION_NOTICE));
+        assert_eq!(thread.history[1], Message::assistant("answer"));
+    }
+
+    #[test]
+    fn a_compaction_summary_is_told_apart_from_what_the_operator_said() {
+        assert!(is_compaction_summary(&acton_ai::memory::summary_message(
+            "earlier"
+        )));
+        assert!(!is_compaction_summary(&Message::user("earlier")));
+        assert!(!is_compaction_summary(&Message::assistant(
+            COMPACTION_NOTICE
+        )));
+    }
+
+    #[test]
+    fn a_replay_shows_a_compaction_summary_as_an_agent_thought() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = EventSink::new(tx);
+        let history = vec![
+            acton_ai::memory::summary_message("what came before"),
+            Message::user("and then?"),
+        ];
+
+        replay(&ThreadId::new(), &history, &sink);
+        drop(sink);
+
+        let lines: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+
+        let first: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(
+            first["params"]["update"]["sessionUpdate"], "agent_thought_chunk",
+            "the framework's summary is not something the operator said"
+        );
+
+        let second: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+        assert_eq!(
+            second["params"]["update"]["sessionUpdate"],
+            "user_message_chunk"
         );
     }
 
