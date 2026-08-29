@@ -10,8 +10,8 @@
 @tenant(parent: "Organization")
 @display("hostname")
 @access(
-    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin"],
-    write:  ["operator", "org_admin"],
+    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin", "enrollment_service"],
+    write:  ["operator", "org_admin", "enrollment_service"],
     delete: ["org_admin"]
 )
 schema AgentInstall {

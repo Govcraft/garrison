@@ -10,7 +10,7 @@
 @tenant(parent: "Organization")
 @display("upn")
 @access(
-    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin"],
+    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin", "enrollment_service"],
     write:  ["org_admin"],
     delete: ["org_admin"]
 )

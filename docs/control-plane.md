@@ -20,8 +20,8 @@ the two gates that run without a database:
 task plane:check      # parse the schemas, then strict-mode validate the Cedar bundle
 ```
 
-15 schemas lower into 146 generated Cedar policies; 10 hand-written policies in
-`policies/custom/` bring the bundle to 156, all strict-mode validated. The model
+16 schemas lower into 160 generated Cedar policies; 10 hand-written policies in
+`policies/custom/` bring the bundle to 170, all strict-mode validated. The model
 has also been applied end to end against a throwaway PostgreSQL 17 instance: 26
 migration steps, 15 tables, every `unique` constraint and every CEL rule
 type-checked at apply time. The server was then run against it and the
@@ -161,6 +161,83 @@ chain walkable back to enrollment.
 `InstallCredential.status` carries a cross-entity `@require` — a retired install
 cannot hold an active credential — resolved through the `related.install.status`
 single-hop read, with the caller's tenant scope applied.
+
+### Enrollment — `schemas/enrollment.schema`
+
+| Schema | What it answers |
+|---|---|
+| `Redemption` | Which machine presented which grant, and what was decided |
+
+Redemption is not a bespoke route. It is a schema, so SchemaForge generates the
+endpoint, the Cedar policies, and the audit for it the same way it does for
+every other entity, and creating a `Redemption` is the act of enrolling.
+
+Two mechanisms carry the security, and neither is code:
+
+```
+token_id @require("has(principal.sub) && token_id == principal.sub")
+```
+
+binds the write to the caller's own artifact. A daemon holding `tok_A` cannot
+redeem `tok_B`; the rule runs in-process before any hook, and the mismatch is a
+422 naming the rule. The `enrollee` role is scoped to exactly one action — it
+holds no read grant on `Redemption` itself, so the create response is the only
+thing a daemon ever sees of this schema.
+
+Everything that has to look at another row happens in a `before_validate` hook,
+in `hooks-service/`:
+
+| Step | Why it is there |
+|---|---|
+| Adjudicate the token | issuer, status, expiry, use count, tenant — in that order |
+| Resolve the operator | an operator-scoped grant wins over the machine's claim |
+| Create the `AgentInstall` | `status = enrolled`, not `active`: joining the fleet is not entitlement |
+| Create the `InstallCredential` | public material only, `status = active` |
+| Spend the token | one patch carrying both the new count and the status it implies |
+
+`before_validate` rather than `before_change` because it is the last phase at
+which a field the client never sent can still be added. `organization` is such
+a field: a v4.local artifact is encrypted with the plane's own key, so a daemon
+cannot read its own claims and has nothing truthful to say about its tenant.
+Resolving it in the hook means the daemon never asserts it, and a field the
+client cannot set is a field the client cannot forge.
+
+A refusal is **persisted, not aborted**. Returning `abort_reason` would fail the
+request and leave no trace, and the record that an unknown machine presented a
+revoked token at 03:00 is exactly the record a security officer wants. The
+daemon is told `outcome = refused` and nothing more. A refusal does not spend
+the token. The one case that does abort is the plane being unreachable, because
+refusing there would write a permanent verdict on a transient fault.
+
+The binding sets `required = true` on purpose. With `false`, a hook that was
+down would be logged and the create would proceed — persisting a `Redemption`
+that admitted nobody, refused nobody, and left a daemon believing it had
+enrolled.
+
+The hook talks to the plane over its REST API rather than its database, so
+every row it creates goes through the same Cedar decision, the same `@require`
+rules, and the same audit as a row a human creates. The transport is
+`acton-service-client`, the consumer-side counterpart to the framework the plane
+is built on; it already encodes the error-body shape, the versioned routes,
+bearer auth, and the retry classification, so what remains in `plane.rs` is only
+the part that is genuinely SchemaForge's. The bearer it holds is scoped by the
+`enrollment_service` role, which appears in four `@access` lists and nowhere
+else.
+
+Verified end to end against a live plane:
+
+```
+POST Redemption  tok_MATCH, unspent, operator resolvable
+  201  outcome=accepted, install + credential + organization returned
+       AgentInstall status=enrolled, InstallCredential status=active
+       EnrollmentToken uses 0 -> 1, status issued -> redeemed
+POST Redemption  tok_MATCH again
+  201  outcome=refused, "token has already been fully redeemed"
+       no install, no credential, token still at uses=1
+POST Redemption  tok_OTHER, operator_upn nobody@agency.gov
+  201  outcome=refused, "no operator is registered as 'nobody@agency.gov'"
+       token still unspent
+```
 
 ### Fleet — `schemas/fleet.schema`
 

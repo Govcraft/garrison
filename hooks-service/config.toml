@@ -1,0 +1,73 @@
+# Configuration for the hooks_service hook service.
+#
+# Loaded by `Config::load()` in src/main.rs from this file, then from
+# $XDG_CONFIG_HOME and /etc. `ACTON_*` environment variables override it.
+
+[service]
+name = "garrison-hooks"
+# 0.0.0.0 is safe here only because the surface below is authenticated.
+# Narrow it to the interface the forge reaches you on if you can.
+bind = "0.0.0.0"
+port = 9391
+
+[grpc]
+enabled = true
+# false multiplexes gRPC onto the HTTP port above, which is what the forge
+# dials. Set true only if you also want a separate gRPC listener.
+use_separate_port = false
+
+# Token authentication. acton-service applies this to every registered gRPC
+# service automatically; removing this section removes that, and the RPCs go
+# on working unauthenticated.
+#
+# `key_path` must be the same PASETO key the forge signs with, since the
+# credential on an inbound hook call is minted by the forge. Copy the path
+# from the forge's own `[token]` section.
+[token]
+format = "paseto"
+# Development: the plane's own key, since it mints the credential on
+# inbound hook calls. In a deployment this is a copy of that key at a
+# path only this service can read.
+key_path = "../keys/paseto.key"
+
+# Mutual-TLS caller authorization. Uncomment to require that the caller
+# present a certificate whose subjectAltName is on the allowlist, in addition
+# to a valid token. A private CA authenticates every workload it has ever
+# issued to; this is what narrows that to the forge.
+#
+# [tls]
+# enabled = true
+# cert_path = "/etc/hooks_service/tls/server.crt"
+# key_path = "/etc/hooks_service/tls/server.key"
+# client_ca_path = "/etc/hooks_service/tls/ca.crt"
+#
+# [caller_auth]
+# mode = "mtls"
+# allowlist = ["schema-forge.internal"]
+
+# ---------------------------------------------------------------------------
+# How this service reaches the control plane.
+#
+# It calls the plane's REST API rather than its database, so every row it
+# creates goes through the same Cedar decision and the same `@require` rules as
+# a row a human creates.
+#
+# `token` is a bearer for the `enrollment_service` role, which is
+# authorized for four operations and nothing else. Keep it out of this file in
+# any real deployment: `ACTON_GARRISON_TOKEN` overrides it, and the
+# framework's env layering makes that work with no code here. Every field here
+# is one word because that layering splits on `_`; see src/config.rs.
+#
+# Mint one with:
+#   schemaforge token generate --sub garrison-hooks \
+#     --issuer garrison-control-plane --roles enrollment_service \
+#     --lifetime 2592000
+[garrison]
+url   = "http://127.0.0.1:3000"
+token = ""
+
+# The `iss` an enrollment artifact must carry. Enrollment tokens are minted
+# under their own issuer, so a console bearer presented at the redemption
+# endpoint is refused on the issuer alone, before any status or expiry is read.
+issuer = "garrison-enrollment"
+# ---------------------------------------------------------------------------

@@ -1,0 +1,385 @@
+//! `Redemption.before_validate` — admit a daemon to the fleet, or refuse it.
+//!
+//! SchemaForge has already done three things before this runs: Cedar checked
+//! that the caller holds `enrollee`, the `@require` on `token_id` checked that
+//! the caller is spending its own token and no other, and the write-time rules
+//! filled the defaults. What is left is everything that needs to look at other
+//! rows, which is what a hook is for.
+//!
+//! It runs at `before_validate` rather than `before_change` for one reason:
+//! that phase is the last point at which a field the client never sent can
+//! still be added. `organization` is such a field. A v4.local artifact is
+//! encrypted with the plane's own key, so a daemon cannot read its own claims
+//! and has nothing truthful to say about which tenant it belongs to. Resolving
+//! it here means the daemon never asserts it, and a field the client cannot
+//! set is a field the client cannot forge.
+//!
+//! A refusal is persisted, not aborted. `abort_reason` would return an error
+//! and leave no trace, and the record that an unknown machine presented a
+//! revoked token at 03:00 is precisely the record a security officer wants.
+//! The daemon is told `outcome = refused` and nothing else; it holds no read
+//! grant on this schema, so the create response is all it ever sees.
+
+use std::collections::BTreeMap;
+
+use chrono::Utc;
+use serde_json::{json, Value};
+use tonic::{Request, Response, Status};
+use tracing::{info, warn};
+
+use crate::adjudicate::{adjudicate, operator_source, spend, OperatorSource, Verdict};
+use crate::pb::redemption::redemption_hooks_server::RedemptionHooks;
+use crate::pb::redemption::*;
+use crate::plane::{Plane, PlaneError};
+
+/// How this service reaches the plane and what it expects to see there.
+pub struct Service {
+    plane: Plane,
+    /// The `iss` an enrollment artifact must have been minted under.
+    expected_issuer: String,
+}
+
+impl Service {
+    /// Build the service from a plane client and the issuer it trusts.
+    #[must_use]
+    pub fn new(plane: Plane, expected_issuer: impl Into<String>) -> Self {
+        Self {
+            plane,
+            expected_issuer: expected_issuer.into(),
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl RedemptionHooks for Service {
+    async fn before_validate(
+        &self,
+        request: Request<RedemptionBeforeValidateRequest>,
+    ) -> Result<Response<RedemptionBeforeValidateResponse>, Status> {
+        let req = request.into_inner();
+
+        // Only a create provisions. An update to a decided redemption must not
+        // mint a second credential for the same install.
+        if req.operation != "create" {
+            return Ok(Response::new(RedemptionBeforeValidateResponse::default()));
+        }
+
+        match self.provision(&req).await {
+            Ok(response) => Ok(Response::new(response)),
+            // The plane being unreachable is not a refusal — refusing would
+            // write a permanent verdict on a transient fault. Abort instead,
+            // so the daemon retries and nothing is recorded.
+            Err(error) => {
+                warn!(
+                    token_id = %req.token_id,
+                    install_id = %req.install_id,
+                    "enrollment could not be adjudicated: {error}"
+                );
+                Ok(Response::new(RedemptionBeforeValidateResponse {
+                    abort_reason: Some(format!("enrollment temporarily unavailable: {error}")),
+                    ..Default::default()
+                }))
+            }
+        }
+    }
+}
+
+impl Service {
+    async fn provision(
+        &self,
+        req: &RedemptionBeforeValidateRequest,
+    ) -> Result<RedemptionBeforeValidateResponse, PlaneError> {
+        let now = Utc::now();
+
+        let Some(token) = self.plane.enrollment_token(&req.token_id).await? else {
+            // No such token. The @require proved the caller holds an artifact
+            // whose `sub` is this value, so a missing row means the row was
+            // deleted or never created — worth recording, not worth detail.
+            return Ok(refused(&now, "no enrollment token matches this artifact"));
+        };
+
+        let organization = match adjudicate(&token, &self.expected_issuer, now) {
+            Verdict::Accept { organization } => organization,
+            Verdict::Refuse(reason) => {
+                info!(token_id = %req.token_id, %reason, "enrollment refused");
+                return Ok(refused_within(
+                    &now,
+                    &organization_of(&token),
+                    &token.id,
+                    &reason,
+                ));
+            }
+        };
+
+        let operator =
+            match operator_source(&token, req.operator_upn.as_deref().unwrap_or_default()) {
+                OperatorSource::Bound(id) => id,
+                OperatorSource::ReportedUpn(upn) => match self.plane.operator_by_upn(&upn).await? {
+                    Some(row) => row.id,
+                    None => {
+                        return Ok(refused_within(
+                            &now,
+                            &Some(organization.clone()),
+                            &token.id,
+                            &format!("no operator is registered as '{upn}'"),
+                        ))
+                    }
+                },
+                OperatorSource::Unknown => {
+                    return Ok(refused_within(
+                        &now,
+                        &Some(organization.clone()),
+                        &token.id,
+                        "the request identifies no operator and the token names none",
+                    ))
+                }
+            };
+
+        let install = self
+            .plane
+            .create(
+                "AgentInstall",
+                install_fields(req, &organization, &operator, &token.id),
+            )
+            .await?;
+
+        let credential = self
+            .plane
+            .create(
+                "InstallCredential",
+                credential_fields(req, &organization, &install),
+            )
+            .await?;
+
+        let (uses, status) = spend(&token);
+        let mut patch = BTreeMap::new();
+        patch.insert("uses".into(), json!(uses));
+        patch.insert("status".into(), json!(status));
+        patch.insert("last_redeemed_at".into(), json!(rfc3339(&now)));
+        if token.first_redeemed_at.is_none() {
+            patch.insert("first_redeemed_at".into(), json!(rfc3339(&now)));
+        }
+        self.plane
+            .patch("EnrollmentToken", &token.id, patch)
+            .await?;
+
+        info!(
+            token_id = %req.token_id,
+            install_id = %req.install_id,
+            %install,
+            %credential,
+            "enrollment accepted"
+        );
+
+        Ok(RedemptionBeforeValidateResponse {
+            organization: Some(organization),
+            enrollment_token: Some(token.id),
+            install: Some(install),
+            credential: Some(credential),
+            outcome: Some("accepted".into()),
+            refusal_reason: Some(String::new()),
+            decided_at: Some(rfc3339(&now)),
+            ..Default::default()
+        })
+    }
+}
+
+/// The install this daemon is asking to become.
+///
+/// `status` is `enrolled`, not `active`: joining the fleet and being cleared
+/// to prompt a model are different decisions, and the second one belongs to a
+/// Seat.
+fn install_fields(
+    req: &RedemptionBeforeValidateRequest,
+    organization: &str,
+    operator: &str,
+    enrollment_token: &str,
+) -> BTreeMap<String, Value> {
+    let mut fields = BTreeMap::new();
+    fields.insert("install_id".into(), json!(req.install_id));
+    fields.insert("hostname".into(), json!(req.hostname));
+    fields.insert("operator".into(), json!(operator));
+    fields.insert("organization".into(), json!(organization));
+    fields.insert("platform".into(), json!(req.platform));
+    fields.insert("agent_version".into(), json!(req.agent_version));
+    fields.insert("sandbox_hardening".into(), json!(req.sandbox_hardening));
+    fields.insert(
+        "isolation_active".into(),
+        json!(req.isolation_active.unwrap_or(false)),
+    );
+    fields.insert("status".into(), json!("enrolled"));
+    fields.insert("enrolled_via".into(), json!(enrollment_token));
+    if let Some(version) = req.acton_ai_version.as_deref().filter(|v| !v.is_empty()) {
+        fields.insert("acton_ai_version".into(), json!(version));
+    }
+    fields
+}
+
+/// The credential the daemon will sign with from now on.
+///
+/// `status` is `active` because an install that just proved it holds a
+/// spendable token has proved everything this credential is for. Public
+/// material only — the private half never left the machine.
+fn credential_fields(
+    req: &RedemptionBeforeValidateRequest,
+    organization: &str,
+    install: &str,
+) -> BTreeMap<String, Value> {
+    let mut fields = BTreeMap::new();
+    fields.insert("credential_id".into(), json!(credential_id(req)));
+    fields.insert("install".into(), json!(install));
+    fields.insert("organization".into(), json!(organization));
+    fields.insert("kind".into(), json!(req.credential_kind));
+    fields.insert("public_key".into(), json!(req.public_key));
+    fields.insert("status".into(), json!("active"));
+    if let Some(fingerprint) = req.cert_fingerprint.as_deref().filter(|f| !f.is_empty()) {
+        fields.insert("cert_fingerprint".into(), json!(fingerprint));
+    }
+    fields
+}
+
+/// A stable, non-secret key id for the credential.
+///
+/// Derived from the install and the token being spent rather than randomly
+/// generated, so a retried redemption of the same token by the same install
+/// collides on `credential_id`'s unique index instead of silently minting a
+/// second live credential.
+fn credential_id(req: &RedemptionBeforeValidateRequest) -> String {
+    format!("{}.{}", req.install_id, req.token_id)
+}
+
+fn refused(now: &chrono::DateTime<Utc>, reason: &str) -> RedemptionBeforeValidateResponse {
+    RedemptionBeforeValidateResponse {
+        outcome: Some("refused".into()),
+        refusal_reason: Some(reason.to_string()),
+        decided_at: Some(rfc3339(now)),
+        ..Default::default()
+    }
+}
+
+/// A refusal that still knows which tenant it belongs to.
+///
+/// Worth the extra arguments: a refused row outside every tenant is a row the
+/// organization it concerns cannot read.
+fn refused_within(
+    now: &chrono::DateTime<Utc>,
+    organization: &Option<String>,
+    enrollment_token: &str,
+    reason: &str,
+) -> RedemptionBeforeValidateResponse {
+    RedemptionBeforeValidateResponse {
+        organization: organization.clone(),
+        enrollment_token: Some(enrollment_token.to_string()),
+        ..refused(now, reason)
+    }
+}
+
+fn organization_of(token: &crate::plane::EnrollmentTokenRow) -> Option<String> {
+    token.organization.clone().filter(|o| !o.is_empty())
+}
+
+fn rfc3339(instant: &chrono::DateTime<Utc>) -> String {
+    instant.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request() -> RedemptionBeforeValidateRequest {
+        RedemptionBeforeValidateRequest {
+            operation: "create".into(),
+            token_id: "tok_7f3a".into(),
+            install_id: "inst-a".into(),
+            hostname: "ws-01".into(),
+            platform: "linux".into(),
+            agent_version: "0.1.0".into(),
+            sandbox_hardening: "best_effort".into(),
+            credential_kind: "ed25519".into(),
+            public_key: "BASE64SPKI".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_install_joins_as_enrolled_not_active() {
+        let fields = install_fields(&request(), "org_1", "operator_1", "tok_row");
+        assert_eq!(fields["status"], json!("enrolled"));
+        assert_eq!(fields["enrolled_via"], json!("tok_row"));
+        assert_eq!(fields["operator"], json!("operator_1"));
+    }
+
+    #[test]
+    fn an_absent_acton_version_is_omitted_rather_than_sent_empty() {
+        let mut req = request();
+        req.acton_ai_version = Some(String::new());
+        assert!(!install_fields(&req, "o", "p", "t").contains_key("acton_ai_version"));
+        req.acton_ai_version = Some("0.34.0".into());
+        assert_eq!(
+            install_fields(&req, "o", "p", "t")["acton_ai_version"],
+            json!("0.34.0")
+        );
+    }
+
+    #[test]
+    fn isolation_defaults_to_false_when_the_daemon_says_nothing() {
+        assert_eq!(
+            install_fields(&request(), "o", "p", "t")["isolation_active"],
+            json!(false)
+        );
+    }
+
+    #[test]
+    fn a_credential_carries_only_public_material() {
+        let fields = credential_fields(&request(), "org_1", "install_1");
+        assert_eq!(fields["public_key"], json!("BASE64SPKI"));
+        assert_eq!(fields["status"], json!("active"));
+        assert!(!fields.contains_key("cert_fingerprint"));
+        for key in fields.keys() {
+            assert!(
+                !key.contains("secret") && !key.contains("private"),
+                "credential field {key} looks secret-bearing"
+            );
+        }
+    }
+
+    #[test]
+    fn an_mtls_enrollment_carries_its_fingerprint_through() {
+        let mut req = request();
+        req.credential_kind = "x509_mtls".into();
+        req.cert_fingerprint = Some("a".repeat(64));
+        assert_eq!(
+            credential_fields(&req, "o", "i")["cert_fingerprint"],
+            json!("a".repeat(64))
+        );
+    }
+
+    #[test]
+    fn the_credential_id_is_stable_so_a_retry_collides_instead_of_duplicating() {
+        assert_eq!(credential_id(&request()), credential_id(&request()));
+        assert_eq!(credential_id(&request()), "inst-a.tok_7f3a");
+    }
+
+    #[test]
+    fn a_refusal_records_the_reason_and_no_identity() {
+        let response = refused(&Utc::now(), "token expired");
+        assert_eq!(response.outcome, Some("refused".into()));
+        assert_eq!(response.refusal_reason, Some("token expired".into()));
+        assert!(response.install.is_none());
+        assert!(response.credential.is_none());
+        assert!(response.abort_reason.is_none());
+    }
+
+    #[test]
+    fn a_tenant_scoped_refusal_keeps_the_organization() {
+        let response = refused_within(
+            &Utc::now(),
+            &Some("org_1".into()),
+            "tok_row",
+            "token has been revoked",
+        );
+        assert_eq!(response.organization, Some("org_1".into()));
+        assert_eq!(response.enrollment_token, Some("tok_row".into()));
+        assert_eq!(response.outcome, Some("refused".into()));
+    }
+}

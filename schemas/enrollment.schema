@@ -1,0 +1,103 @@
+// Garrison control plane — redemption.
+//
+// A daemon that has never spoken to the plane presents its enrollment
+// artifact and asks to be admitted. This is that request, modeled as an
+// entity rather than as a bespoke route, because SchemaForge already
+// generates the endpoint, the authorization, and the audit for one.
+//
+// The daemon authenticates with the artifact itself. It is a PASETO minted
+// under the console issuer carrying the single role `enrollee`, which is
+// granted write on this schema and nothing else anywhere in the bundle — an
+// allowlist of exactly one action rather than a credential that is merely
+// refused everywhere else. Verified: a token bearing a role no policy grants
+// is a 403 on every route, so the failure mode of getting this wrong is a
+// daemon that cannot enroll, not one that can do more than enroll.
+//
+// Binding the request to the artifact is a @require on `principal.sub`, not
+// a Cedar policy, and that is a limitation worth stating rather than
+// discovering. On a create there is no entity yet, so the engine authorizes
+// against a placeholder resource whose attributes are type defaults
+// (schema-forge-acton, authz/adapters.rs). `resource.token_id` is therefore
+// "" no matter what the daemon sent, and no Cedar rule can compare the two.
+// Cedar decides who may redeem; CEL decides that they may only redeem the
+// token they are holding.
+//
+// Everything the plane must not take on faith is left for the hook, which
+// runs before persistence-side validation and can therefore fill fields the
+// daemon never sends. `organization` is one of them: a v4.local artifact is
+// encrypted with the plane's own key, so a daemon cannot read its own claims
+// and has nothing truthful to assert about which tenant it belongs to. The
+// hook resolves it from the EnrollmentToken row instead. A field the client
+// cannot know is a field the client cannot lie about.
+
+@version(1)
+@tenant(parent: "Organization")
+@display("hostname")
+@access(
+    read:   ["auditor", "security_officer", "org_admin"],
+    write:  ["enrollee"],
+    delete: ["org_admin"]
+)
+@hook(before_validate) """Resolve the enrollment token, admit or refuse the install, and provision its credential"""
+schema Redemption {
+    // The artifact's `sub`. The @require is the whole anti-replay story: a
+    // holder may spend the token they carry and no other.
+    token_id:          text(max: 64)
+                       required
+                       indexed
+                       @require(
+                           "has(principal.sub) && token_id == principal.sub",
+                           "a redemption must be presented with its own enrollment token"
+                       )
+
+    // Resolved by the hook, never sent by the daemon.
+    organization:      -> Organization
+    enrollment_token:  -> EnrollmentToken
+
+    // What the daemon reports about itself. Claims, not facts, until the
+    // hook writes them onto the AgentInstall it creates.
+    install_id:        text(max: 64) required indexed
+    hostname:          text(max: 255) required @list(primary)
+
+    // Who this machine is for. An AgentInstall must name an Operator, and an
+    // organization-scoped token names none, so the daemon reports the UPN and
+    // the hook resolves it. For an operator-scoped token the hook ignores this
+    // and uses the token's own binding — a claim is only trusted where the
+    // grant did not already answer the question.
+    operator_upn:      text(max: 320)
+    platform:          enum("linux", "macos", "windows") required
+    agent_version:     text(max: 32) required @list(column)
+    acton_ai_version:  text(max: 32)
+    sandbox_hardening: enum("enforce", "best_effort", "unavailable")
+                       required
+                       @enum_colors(enforce: "green", best_effort: "amber", unavailable: "red")
+    isolation_active:  boolean default(false)
+
+    // The credential it wants registered. Public material only, matching
+    // InstallCredential — the daemon keeps its private key.
+    credential_kind:   enum("ed25519", "x509_mtls") required
+    public_key:        text(max: 1024) required
+    cert_fingerprint:  text(max: 128)
+                       @default("''")
+                       @require(
+                           "credential_kind != 'x509_mtls' || size(cert_fingerprint) == 64",
+                           "an mTLS enrollment must present its certificate fingerprint"
+                       )
+
+    // The verdict. The hook writes these onto the entity, and because the
+    // create response is the persisted entity, they are how the daemon
+    // learns its own identity — the one thing a generic CRUD create can
+    // hand back that was not in the request.
+    outcome:           enum("pending", "accepted", "refused")
+                       default("pending")
+                       @default("'pending'")
+                       @enum_colors(pending: "gray", accepted: "green", refused: "red")
+                       @list(column)
+    refusal_reason:    text(max: 512) @default("''")
+    install:           -> AgentInstall
+    credential:        -> InstallCredential
+
+    requested_at:      datetime @default("now") @format("relative")
+    decided_at:        datetime
+    source_ip:         text(max: 45)
+}
