@@ -254,21 +254,9 @@ impl AgentClient {
                         Ok(result) => serde_json::from_value(result).map_err(|error| {
                             GarrisonError::transport(method, format!("unexpected result: {error}"))
                         }),
-                        // `data` is where an agent says *why*, and dropping
-                        // it leaves a person holding "Invalid params" with no
-                        // idea which param or what was wrong with it.
                         Err(error) => Err(GarrisonError::transport(
                             method,
-                            match error.data.as_ref().and_then(serde_json::Value::as_str) {
-                                Some(detail) => format!(
-                                    "{} (code {}): {detail}",
-                                    error.message,
-                                    i32::from(error.code)
-                                ),
-                                None => {
-                                    format!("{} (code {})", error.message, i32::from(error.code))
-                                }
-                            },
+                            crate::protocol::jsonrpc::describe(&error),
                         )),
                     };
                 }

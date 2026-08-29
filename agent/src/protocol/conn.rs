@@ -795,8 +795,14 @@ fn project_root(context: &Dispatch, cwd: &Path) -> Result<PathBuf, ErrorObject> 
                 rejection = %rejection,
                 "refused a session root",
             );
+            // Name the remedy, not just the refusal. The boundary is an
+            // administrator's decision, so somebody reading this needs to
+            // know which knob moves it rather than guessing that the answer
+            // is to restart the agent somewhere else.
             ErrorObject::invalid_params().data(Value::String(format!(
-                "cannot open a session there: {rejection}"
+                "cannot open a session there: {rejection}. Approve the tree by \
+                 listing it under [threads] workspace_roots in the agent's \
+                 config, or start the agent in it"
             )))
         },
     )

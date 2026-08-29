@@ -30,6 +30,40 @@ pub use agent_client_protocol_schema::v1::{Error as ErrorObject, ErrorCode, Requ
 /// The only JSON-RPC version this agent speaks.
 pub const JSONRPC_VERSION: &str = "2.0";
 
+/// Renders one error object as a line a person can act on.
+///
+/// JSON-RPC splits an error into a code, a short `message` that is fixed by
+/// the code, and a `data` field carrying the part that is specific to this
+/// failure. "Invalid params" tells a reader nothing on its own: `data` is
+/// where the agent says *which* param and what was wrong with it, so dropping
+/// it leaves somebody holding a number.
+///
+/// Pure, and the single place either client path formats a refusal, so the
+/// two cannot drift into saying different amounts about the same error.
+#[must_use]
+pub fn describe(error: &ErrorObject) -> String {
+    let code = i32::from(error.code);
+    match error.data.as_ref().and_then(detail) {
+        Some(detail) => format!("{} (code {code}): {detail}", error.message),
+        None => format!("{} (code {code})", error.message),
+    }
+}
+
+/// The human-readable part of a `data` field.
+///
+/// A string is the common case and is taken as-is. Anything else — an object
+/// an agent chose to structure — is rendered as JSON rather than discarded,
+/// because a reader confronted with `{"root": "/srv"}` still learns more than
+/// one shown nothing at all.
+fn detail(data: &Value) -> Option<String> {
+    match data {
+        Value::Null => None,
+        Value::String(text) if text.is_empty() => None,
+        Value::String(text) => Some(text.clone()),
+        other => Some(other.to_string()),
+    }
+}
+
 /// Error codes Garrison defines on top of ACP's.
 ///
 /// JSON-RPC reserves -32000 to -32099 for implementation-defined server
@@ -323,6 +357,49 @@ pub fn encode<T: Serialize>(value: &T) -> Result<Value, ErrorObject> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_description_carries_the_reason_the_agent_gave() {
+        // The refusal a client actually has to act on: "Invalid params"
+        // alone names nothing, so the boundary it fell outside must survive.
+        let error = ErrorObject::invalid_params().data(Value::String(
+            "cannot open a session there: '/srv/other' is outside the approved roots".to_string(),
+        ));
+
+        let described = describe(&error);
+        assert!(
+            described.contains("outside the approved roots"),
+            "the reason must survive: {described}"
+        );
+        assert!(
+            described.contains("-32602"),
+            "and so must the code: {described}"
+        );
+    }
+
+    #[test]
+    fn a_description_without_data_is_still_readable() {
+        let described = describe(&ErrorObject::invalid_params());
+        assert!(described.contains("-32602"), "got: {described}");
+        assert!(
+            !described.ends_with(": "),
+            "no empty detail clause: {described}"
+        );
+    }
+
+    #[test]
+    fn a_structured_data_field_is_rendered_rather_than_dropped() {
+        // An agent that answers with an object still tells the reader more
+        // than one that answers with nothing.
+        let error = ErrorObject::invalid_params().data(json!({"root": "/srv"}));
+        assert!(describe(&error).contains("/srv"), "{}", describe(&error));
+    }
+
+    #[test]
+    fn an_empty_data_string_adds_no_clause() {
+        let error = ErrorObject::invalid_params().data(Value::String(String::new()));
+        assert_eq!(describe(&error), describe(&ErrorObject::invalid_params()));
+    }
 
     #[test]
     fn a_call_with_an_id_is_a_request() {

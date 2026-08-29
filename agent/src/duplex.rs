@@ -147,11 +147,13 @@ impl DuplexClient {
                         Ok(result) => serde_json::from_value(result).map_err(|error| {
                             GarrisonError::transport(method, format!("unexpected result: {error}"))
                         }),
-                        Err(error) => Err(GarrisonError::transport(
-                            method,
-                            format!("{} (code {})", error.message, i32::from(error.code)),
-                        )),
-                    }
+                        // `data` is where the agent says *why*. The TUI is
+                        // the path with no second chance to ask, so it must
+                        // carry the same detail the one-shot client does.
+                        Err(error) => {
+                            Err(GarrisonError::transport(method, jsonrpc::describe(&error)))
+                        }
+                    };
                 }
                 Some(AgentEvent::Closed { reason }) => {
                     return Err(GarrisonError::transport(method, reason))
