@@ -19,3 +19,7 @@ dist/
 !README.md
 !docs/**/*.md
 !CHANGELOG.md
+
+# Regenerated into the project root by hooks-service/build.rs on every build,
+# so the plane can reference a stable path without picking up a stale copy.
+hooks-service/hooks_descriptor.bin

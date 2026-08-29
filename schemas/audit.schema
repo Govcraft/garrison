@@ -127,6 +127,8 @@ schema AuditChain {
 
     integrity:        enum("unverified", "intact", "gap", "broken")
                       default("unverified")
+                      // Binds the value for the @require on `finding`; see below.
+                      @default("'unverified'")
                       @enum_colors(unverified: "gray", intact: "green", gap: "amber", broken: "red")
                       @list(column)
                       @exportable
@@ -134,6 +136,7 @@ schema AuditChain {
     // Set when integrity leaves 'intact'; a broken chain that says nothing is
     // worse than no chain at all.
     finding:          text(max: 1024)
+                      @default("''")
                       @require(
                           "integrity == 'unverified' || integrity == 'intact' || size(finding) > 0",
                           "a gap or a broken chain must record what was found"

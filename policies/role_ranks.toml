@@ -19,3 +19,15 @@ security_officer = 800
 auditor          = 600
 team_lead        = 400
 operator         = 100
+
+# The enrollment artifact's only role. Ranked below every human role: a
+# daemon that has not yet enrolled outranks nobody, and role_rank drives the
+# no-upward-visibility rule.
+enrollee         = 10
+
+# The hook service that provisions an accepted enrollment. Ranked at the very
+# bottom deliberately: role_rank gates visibility of *user* records, and a
+# machine-provisioning service must never see one. Its actual authority comes
+# from the @access lists that name it — AgentInstall, InstallCredential and
+# EnrollmentToken writes, Operator reads — and nothing else.
+enrollment_service = 20

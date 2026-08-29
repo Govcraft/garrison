@@ -10,7 +10,7 @@
 @tenant(parent: "Organization")
 @display("upn")
 @access(
-    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin"],
+    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin", "enrollment_service"],
     write:  ["org_admin"],
     delete: ["org_admin"]
 )
@@ -63,6 +63,11 @@ schema Seat {
 
     status:            enum("assigned", "active", "revoked", "expired")
                        default("assigned")
+                       // The @default annotation is what binds this value for the
+                       // @require below: a literal default() alone is applied after
+                       // the rule phases, so the predicate would hit an unbound
+                       // reference and fail the write with a 500.
+                       @default("'assigned'")
                        @enum_colors(
                            assigned: "blue",
                            active: "green",
@@ -77,6 +82,7 @@ schema Seat {
     revoked_at:        datetime
 
     revocation_reason: text(max: 512)
+                       @default("''")
                        @require(
                            "status != 'revoked' || size(revocation_reason) > 0",
                            "revoking a seat requires a recorded reason"

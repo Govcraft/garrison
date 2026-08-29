@@ -33,10 +33,11 @@ the federal product described below is direction, not checkout.
   `edit_file` run in a re-exec'd child with resource limits and, on Linux,
   landlock and seccomp hardening, confined to the session's root.
 - Provider login/logout helpers and a `ping` smoke client.
-- The control plane's administrative entity model: 13 SchemaForge schemas
-  covering tenancy, operators and seats, the install fleet, policy bundles and
-  command rules, approved model endpoints, and audit-chain aggregation —
-  lowering into a 137-policy, strict-mode-validated Cedar bundle. See
+- The control plane's administrative entity model: 15 SchemaForge schemas
+  covering tenancy, operators and seats, machine identity for the daemons, the
+  install fleet, policy bundles and command rules, approved model endpoints,
+  and audit-chain aggregation — lowering into a 170-policy, strict-mode-
+  validated Cedar bundle. See
   [docs/control-plane.md](docs/control-plane.md).
 - acton-ai policy, accounting, audit, planning, context, MCP, and tool-loop
   primitives where enabled by configuration.
@@ -86,7 +87,8 @@ architecture in [docs/garrison-agent-design.md](docs/garrison-agent-design.md).
 | `acton-ai.toml` | Implemented | Provider, context, sandbox, and acton-ai runtime configuration |
 | `config.toml` | Implemented | Control-plane (SchemaForge on acton-service) configuration |
 | `Taskfile.yml` | Implemented | Tasks that operate on this checkout |
-| `hooks-service/`, `site/` | Planned | Control-plane hook services and administration site |
+| `hooks-service/` | Working | The enrollment hook: adjudicates a token, provisions the install and its credential |
+| `site/` | Planned | Control-plane administration site |
 | `extensions/vscode/` | Implemented | VS Code ACP client, sidebar chat, approvals, and status |
 | `extensions/jetbrains/` | Implemented | JetBrains ACP client, tool-window chat, approvals, and status |
 | `infra/`, `docs/compliance/` | Planned | Deployment and compliance material |

@@ -1,0 +1,137 @@
+//! The settings this service needs beyond the framework's own.
+//!
+//! These arrive through `acton_service::Config<HooksConfig>`, which means the
+//! same file, the same XDG search order, and the same `ACTON_*` environment
+//! override the framework already implements. `ACTON_GARRISON_TOKEN` is
+//! therefore the way to supply the bearer in a deployment that keeps secrets
+//! out of files, with no code here to make that work.
+//!
+//! Every field is one word for that reason. The framework's env provider is
+//! `Env::prefixed("ACTON_").split("_")`, so a `service_token` field would only
+//! be reachable as `garrison.service.token` — which is not where it lives, so
+//! the variable would be ignored and the file value would quietly win. A
+//! single-word name is the difference between an override that works and one
+//! that only appears to.
+//!
+//! Every value is validated at startup rather than at first use. A hook that
+//! discovers a missing plane URL on the night of the first enrollment has
+//! turned a typo into an outage; refusing to boot turns it into a deploy that
+//! fails loudly with the field named.
+
+use serde::{Deserialize, Serialize};
+
+/// The `[garrison]` section of `config.toml`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HooksConfig {
+    #[serde(default)]
+    pub garrison: GarrisonConfig,
+}
+
+/// Where the control plane is, and what this service presents to it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GarrisonConfig {
+    /// Origin of the control plane, e.g. `https://plane.agency.gov`. The
+    /// `/api/v1` prefix is the framework's and is appended by the client.
+    #[serde(default)]
+    pub url: String,
+
+    /// Bearer for the `enrollment_service` role. Not a human's token: it is
+    /// authorized for four operations and nothing else.
+    #[serde(default)]
+    pub token: String,
+
+    /// The `iss` an enrollment artifact must carry. A token minted for any
+    /// other purpose against the same key is refused on this alone.
+    #[serde(default = "default_issuer")]
+    pub issuer: String,
+}
+
+impl Default for GarrisonConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            token: String::new(),
+            issuer: default_issuer(),
+        }
+    }
+}
+
+fn default_issuer() -> String {
+    "garrison-enrollment".to_string()
+}
+
+impl GarrisonConfig {
+    /// The names of every setting that is missing or blank.
+    ///
+    /// Returns all of them rather than the first, so one restart reveals the
+    /// whole gap instead of one field per attempt.
+    #[must_use]
+    pub fn missing(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if self.url.trim().is_empty() {
+            missing.push("garrison.url");
+        }
+        if self.token.trim().is_empty() {
+            missing.push("garrison.token");
+        }
+        if self.issuer.trim().is_empty() {
+            missing.push("garrison.issuer");
+        }
+        missing
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn configured() -> GarrisonConfig {
+        GarrisonConfig {
+            url: "https://plane.gov".into(),
+            token: "v4.local.abc".into(),
+            issuer: "garrison-enrollment".into(),
+        }
+    }
+
+    #[test]
+    fn a_fully_configured_section_is_missing_nothing() {
+        assert!(configured().missing().is_empty());
+    }
+
+    #[test]
+    fn the_issuer_has_a_default_so_only_the_two_secrets_must_be_supplied() {
+        assert_eq!(
+            GarrisonConfig::default().missing(),
+            vec!["garrison.url", "garrison.token"]
+        );
+    }
+
+    #[test]
+    fn a_whitespace_only_setting_counts_as_missing() {
+        let mut config = configured();
+        config.token = "   ".into();
+        assert_eq!(config.missing(), vec!["garrison.token"]);
+    }
+
+    #[test]
+    fn every_gap_is_reported_at_once_not_one_per_restart() {
+        let config = GarrisonConfig {
+            url: String::new(),
+            token: String::new(),
+            issuer: String::new(),
+        };
+        assert_eq!(config.missing().len(), 3);
+    }
+
+    #[test]
+    fn the_section_deserializes_from_the_flattened_table() {
+        let toml = r#"
+            [garrison]
+            url = "https://plane.gov"
+            token = "v4.local.abc"
+        "#;
+        let parsed: HooksConfig = toml::from_str(toml).expect("section parses");
+        assert_eq!(parsed.garrison.url, "https://plane.gov");
+        assert_eq!(parsed.garrison.issuer, "garrison-enrollment");
+    }
+}

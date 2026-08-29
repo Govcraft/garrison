@@ -61,10 +61,36 @@ issuer   = "garrison-control-plane"
 # Mappings are read at startup only. Changing them needs a daemon restart.
 # ---------------------------------------------------------------------------
 
-# Lifecycle hooks are not wired yet. When audit ingest needs to fan out to a
-# SIEM, or seat activation needs to call Entra, the binding goes here and the
-# service is scaffolded with `schemaforge hooks generate`.
-# [schema_forge.hooks]
-# enabled            = true
-# default_timeout_ms = 5000
-# max_concurrent_async = 100
+# ---------------------------------------------------------------------------
+# Lifecycle hooks.
+#
+# One binding, and it is the enrollment decision. Creating a Redemption is the
+# only way a machine joins the fleet, and `before_validate` is where the token
+# is adjudicated and the install and its credential are provisioned. The hook
+# service is `hooks-service/` in this repo; run it with `task hooks:serve`.
+[schema_forge.hooks]
+enabled              = true
+default_timeout_ms   = 15000
+max_concurrent_async = 100
+
+# Development only. The hook runs on loopback here, so the field snapshot and
+# the bearer SchemaForge presents never leave the machine. In any deployment
+# where the hook is a separate host this must go back to false and the endpoint
+# must be `https://`, or the enrollment payload and a replayable credential are
+# readable by anything on the path.
+allow_plaintext = true
+
+[[schema_forge.hooks.bindings]]
+schema     = "Redemption"
+event      = "BeforeValidate"
+endpoint   = "http://127.0.0.1:9391"
+timeout_ms = 15000
+
+# `required = true` is the whole point. With `false`, a hook that is down would
+# be logged and the create would proceed — persisting a Redemption that admitted
+# nobody, refused nobody, and left a daemon believing it had enrolled. Failing
+# the request is the only honest outcome.
+required = true
+
+descriptor_path = "./hooks-service/hooks_descriptor.bin"
+# ---------------------------------------------------------------------------

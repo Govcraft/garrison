@@ -10,8 +10,8 @@
 @tenant(parent: "Organization")
 @display("hostname")
 @access(
-    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin"],
-    write:  ["operator", "org_admin"],
+    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin", "enrollment_service"],
+    write:  ["operator", "org_admin", "enrollment_service"],
     delete: ["org_admin"]
 )
 schema AgentInstall {
@@ -50,6 +50,11 @@ schema AgentInstall {
 
     enrolled_at:       datetime @default("now")
     last_heartbeat:    datetime
+
+    // How this machine got into the fleet, and every key it has held since.
+    // The credential rotation chain hangs off the newest of these.
+    enrolled_via:      -> EnrollmentToken
+    credentials:       -> InstallCredential[]
 
     sessions:          -> AgentSession[]
 }

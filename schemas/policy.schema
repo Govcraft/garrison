@@ -21,6 +21,9 @@ schema PolicyBundle {
 
     status:                enum("draft", "published", "retired")
                            default("draft")
+                           // Binds the value for the @require on `checksum` below.
+                           // A literal default() alone lands after the rule phases.
+                           @default("'draft'")
                            @enum_colors(draft: "gray", published: "green", retired: "neutral")
                            @list(column)
 
@@ -36,6 +39,7 @@ schema PolicyBundle {
     // BLAKE3 of the serialized bundle as distributed. An install reports the
     // checksum it loaded; a mismatch is drift.
     checksum:              text(max: 128) indexed
+                           @default("''")
                            @require(
                                "status != 'published' || size(checksum) == 64",
                                "a published bundle must carry its BLAKE3 checksum"
@@ -151,6 +155,8 @@ schema ModelEndpoint {
 
     authorization:       enum("pilot", "interim_ato", "ato", "denied")
                          default("pilot")
+                         // Binds the value for the @require on `approved_by`.
+                         @default("'pilot'")
                          @enum_colors(pilot: "gray", interim_ato: "amber", ato: "green", denied: "red")
                          @list(column)
 
@@ -159,6 +165,7 @@ schema ModelEndpoint {
 
     approved_at:         datetime
     approved_by:         text(max: 320)
+                         @default("''")
                          @require(
                              "authorization != 'ato' || size(approved_by) > 0",
                              "an ATO endpoint must record who authorized it"

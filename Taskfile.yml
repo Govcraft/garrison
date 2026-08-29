@@ -128,3 +128,27 @@ tasks:
     desc: Export the control plane's OpenAPI specification
     cmds:
       - schemaforge export openapi schemas -o control-plane.openapi.json
+
+  # --- Enrollment hooks ----------------------------------------------------
+
+  hooks:generate:
+    desc: Regenerate the hook proto and stubs from the annotated schemas
+    # Additive: user-owned files (src/hooks/*.rs, src/main.rs, Cargo.toml) are
+    # left alone, so this is safe to re-run after a schema edit.
+    cmds:
+      - schemaforge hooks generate --all -o hooks-service
+
+  hooks:check:
+    desc: Lint, test, and format-check the enrollment hook service
+    cmds:
+      - cargo clippy -p garrison-hooks --all-targets -- -D warnings
+      - cargo nextest run -p garrison-hooks
+      - cargo fmt -p garrison-hooks -- --check
+
+  hooks:serve:
+    desc: Run the enrollment hook service against the local control plane
+    # It refuses to boot until [garrison] names a plane and a service token;
+    # supply the token as ACTON_GARRISON_TOKEN rather than in the file.
+    dir: hooks-service
+    cmds:
+      - cargo run -p garrison-hooks
