@@ -137,6 +137,43 @@ pub struct GarrisonStatus {
     /// is still worth having.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<ThreadsStatus>,
+    /// How this daemon's one authenticated path to the control plane is
+    /// faring.
+    ///
+    /// Absent on a standalone agent, which has no plane to report on, and on
+    /// a governed one whose plane session could not be asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plane: Option<PlaneStatus>,
+}
+
+/// What the daemon's credential holder reports about reaching the plane.
+///
+/// This is the field an operator reads first when turns are being refused,
+/// because every governed subsystem spends the same bearer: if the exchange
+/// is failing, the policy pull, the seat check, and the audit shipper are all
+/// failing for one reason, and it is here.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct PlaneStatus {
+    /// Whether the last thing that happened was the plane answering.
+    ///
+    /// False before the first exchange as well as after a failed one: this
+    /// says "a bearer is not known to be obtainable", not "the network is
+    /// down".
+    pub reachable: bool,
+    /// When a bearer was last obtained, RFC 3339, if ever.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_exchange_at: Option<String>,
+    /// When the bearer in hand stops being accepted, RFC 3339.
+    ///
+    /// Absent when there is no bearer, which is the same thing the daemon
+    /// knows and worth saying rather than showing a stale time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    /// What went wrong last time, if the last attempt failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 /// What the session supervisor reports about the sessions it owns.

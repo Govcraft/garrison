@@ -52,8 +52,20 @@ impl InstallKey {
         Ok(key)
     }
 
-    /// Reads an existing PKCS#8 PEM key.
-    fn load(path: &Path) -> Result<Self, GarrisonError> {
+    /// Reads an existing PKCS#8 PEM key, and never creates one.
+    ///
+    /// The distinction from [`load_or_create`](Self::load_or_create) is the
+    /// whole point. Before enrollment there is no identity to lose, so
+    /// generating one is correct. After enrollment the plane holds the public
+    /// half of a specific key, and a process that quietly made a new one would
+    /// be a daemon that had silently stopped being itself. Every caller past
+    /// the enrollment gate uses this.
+    ///
+    /// # Errors
+    ///
+    /// [`GarrisonErrorKind::Enrollment`](crate::error::GarrisonErrorKind::Enrollment)
+    /// when the file is absent, unreadable, or not an Ed25519 key.
+    pub fn load(path: &Path) -> Result<Self, GarrisonError> {
         let pem = std::fs::read_to_string(path).map_err(|error| {
             GarrisonError::enrollment(format!(
                 "install key '{}' could not be read: {error}",
@@ -104,6 +116,21 @@ impl InstallKey {
                 path.display()
             ))
         })
+    }
+
+    /// Signs `message` with the private half.
+    ///
+    /// The only use of the private key anywhere in Garrison, and the reason
+    /// the type exposes this rather than the key: an install assertion is the
+    /// one thing this daemon ever signs, and a caller that could take the
+    /// `SigningKey` out could sign something else.
+    ///
+    /// Infallible — Ed25519 signing cannot fail for a well-formed key, and
+    /// this type cannot hold one that is not.
+    #[must_use]
+    pub fn sign(&self, message: &[u8]) -> [u8; 64] {
+        use ed25519_dalek::Signer as _;
+        self.signing.sign(message).to_bytes()
     }
 
     /// The public half, base64-encoded SPKI: what the plane stores.
@@ -222,6 +249,56 @@ mod tests {
         // 12-byte SPKI header for Ed25519, then the 32-byte key.
         assert_eq!(der.len(), 44);
         assert_eq!(&der[..2], &[0x30, 0x2a], "a DER SEQUENCE of 42 bytes");
+    }
+
+    #[test]
+    fn a_signature_verifies_against_the_public_half_the_plane_stored() {
+        use ed25519_dalek::pkcs8::DecodePublicKey as _;
+
+        let key = InstallKey::generate().unwrap();
+        let signature = key.sign(b"garrison install assertion");
+
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(key.public_spki_base64().unwrap())
+            .unwrap();
+        let public = ed25519_dalek::VerifyingKey::from_public_key_der(&der).unwrap();
+        public
+            .verify_strict(
+                b"garrison install assertion",
+                &ed25519_dalek::Signature::from_bytes(&signature),
+            )
+            .expect("the plane must be able to verify what this install signs");
+    }
+
+    #[test]
+    fn a_signature_does_not_verify_over_different_bytes() {
+        use ed25519_dalek::pkcs8::DecodePublicKey as _;
+
+        let key = InstallKey::generate().unwrap();
+        let signature = key.sign(b"one assertion");
+
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(key.public_spki_base64().unwrap())
+            .unwrap();
+        let public = ed25519_dalek::VerifyingKey::from_public_key_der(&der).unwrap();
+        assert!(public
+            .verify_strict(
+                b"another assertion",
+                &ed25519_dalek::Signature::from_bytes(&signature)
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn loading_never_creates_a_key_the_plane_has_not_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = key_path(dir.path());
+
+        let Err(error) = InstallKey::load(&path) else {
+            panic!("an enrolled daemon must not mint itself a new identity");
+        };
+        assert!(error.is_enrollment());
+        assert!(!path.exists(), "nothing was written");
     }
 
     #[test]

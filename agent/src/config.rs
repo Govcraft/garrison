@@ -46,6 +46,18 @@ pub struct PlaneConfig {
     /// you, so this is an origin and not a route.
     pub url: String,
 
+    /// Origin of the service that runs the install-token exchange.
+    ///
+    /// `None` means "the same origin as [`url`](Self::url)", which is the
+    /// deployment the shipped `config.toml` describes: `garrison-hooks` sits
+    /// behind the same name as the plane. It is an option rather than a
+    /// defaulted string because the two are genuinely one setting in the
+    /// common case, and a second copy of a hostname is a second thing to get
+    /// wrong when a plane moves. Set it when the exchange is reverse-proxied
+    /// somewhere else, or when a developer runs the hook service on its own
+    /// port.
+    pub hooks_url: Option<String>,
+
     /// The enrollment packet placed on this machine by whoever provisioned it.
     ///
     /// A path rather than the values themselves, for the reason every
@@ -61,6 +73,22 @@ pub struct PlaneConfig {
     /// prefers its own record over anything a machine claims, so leaving this
     /// unset is correct whenever the grant was issued to an individual.
     pub operator_upn: Option<String>,
+}
+
+impl PlaneConfig {
+    /// Where the install-token exchange lives.
+    ///
+    /// Pure, and the only place the fallback is spelled, so a caller cannot
+    /// forget it and end up posting an assertion at the plane, which would
+    /// answer 404 and look like a missing route rather than a missing
+    /// setting.
+    #[must_use]
+    pub fn hooks_url(&self) -> &str {
+        match self.hooks_url.as_deref() {
+            Some(url) if !url.trim().is_empty() => url,
+            _ => &self.url,
+        }
+    }
 }
 
 /// Listener settings, and how a client behaves when nothing is listening.
@@ -411,6 +439,48 @@ auto_start = false
 
         assert!(plane.enrollment_packet.is_none());
         assert!(plane.operator_upn.is_none());
+    }
+
+    #[test]
+    fn an_unstated_exchange_is_the_plane_itself() {
+        let plane = GarrisonConfig::from_toml("[plane]\nurl = \"https://plane.agency.gov\"\n")
+            .unwrap()
+            .plane
+            .expect("the section was declared");
+
+        assert_eq!(
+            plane.hooks_url(),
+            "https://plane.agency.gov",
+            "one name for one deployment; a second copy is a second thing to get wrong"
+        );
+    }
+
+    #[test]
+    fn a_reverse_proxied_exchange_is_named_separately() {
+        let plane = GarrisonConfig::from_toml(
+            r#"
+            [plane]
+            url = "https://plane.agency.gov"
+            hooks_url = "https://hooks.agency.gov"
+            "#,
+        )
+        .unwrap()
+        .plane
+        .expect("the section was declared");
+
+        assert_eq!(plane.hooks_url(), "https://hooks.agency.gov");
+    }
+
+    #[test]
+    fn a_blank_exchange_url_falls_back_rather_than_posting_at_nothing() {
+        let plane = GarrisonConfig::from_toml(
+            "[plane]\nurl = \"https://plane.agency.gov\"\nhooks_url = \"   \"\n",
+        )
+        .unwrap()
+        .plane
+        .expect("the section was declared");
+
+        assert_eq!(plane.hooks_url(), "https://plane.agency.gov");
     }
 
     #[test]
