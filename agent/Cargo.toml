@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-acton-ai = { version = "0.34.0", path = "../../acton-ai" }
+acton-ai = { version = "0.35.0", path = "../../acton-ai" }
 acton-reactive = "9.1.0"
 acton-service-client = "0.1.2"
 agent-client-protocol-schema = "1.6.0"
