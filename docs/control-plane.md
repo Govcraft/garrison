@@ -704,6 +704,137 @@ any principal that does not carry `entra_object_id`. A console login whose
 with `schemaforge token generate` never does. Taking a copy of the trail is
 the one action that must be attributable to a person the directory knows.
 
+## Audit durability, degraded state, and anchoring
+
+The three schemas above are the plane's view of a trail. This section is the
+agent's, and it is deliberately independent of the plane: **the plane is not
+on the durability path.** Durability is enforced on the machine that writes
+the trail, the local anchor is written unconditionally, and no turn is ever
+refused because a control plane was unreachable. Pushing the anchored head to
+`AuditChain` is issue #8's job and is best effort; its staleness is reported
+in `_garrison/status` and never blocks a turn. A deployment that wants "no
+plane, no turns" is asking for a seat gate, not for this.
+
+### What an append promises
+
+`acton-ai.toml`'s `[audit] durability` says what an entry must have done
+before the loop moves on:
+
+| Value | What an append does | What a failed append does |
+|---|---|---|
+| `best_effort` | Appends and flushes | Logs, marks the writer degraded, and the turn continues |
+| `strict` (Garrison's shipped default) | Appends, `fsync`s, and is acknowledged before the next tool call | Refuses every tool not declared idempotent for the rest of the process, and refuses the next turn outright |
+
+Strict mode refuses at two layers, and they are different refusals for
+different moments. Inside a turn, acton-ai's own guard refuses each
+non-idempotent tool call. The tool that already ran cannot be un-run, so
+failing the whole turn would lose the model's account of what happened, and a
+read-only investigation stays possible. Between turns, Garrison's anchor
+keeper answers `AdmitTurn` and refuses the next turn before a single tool
+runs, with JSON-RPC code `-32017`. A writer that does not answer the health
+question within its deadline is refused exactly as a degraded one is: "I
+cannot find out whether this will be recorded" and "this will not be
+recorded" have the same consequence for the record.
+
+### The four states an operator triages on
+
+`_garrison/status` reports `audit.state`, and `garrison-agent ping` prints it
+first:
+
+| State | Meaning | What to do |
+|---|---|---|
+| `disabled` | No trail is armed | Nothing is being recorded. Add `[audit]` to `acton-ai.toml`, or accept it on a standalone install |
+| `configured` | A trail is armed and intact; nothing written yet in this process | Nothing. The daemon has not yet proved it can write, which is why this is not `healthy` |
+| `healthy` | Every append in this process reached the disk | Nothing |
+| `degraded` | At least one append did not | Stop the daemon, fix the disk, verify, restart (see below) |
+
+A daemon that cannot ask its own writer reports `degraded`, never `healthy`.
+
+Recovering from `degraded` is an operator procedure, not a self-healing one:
+
+1. Stop the daemon. In strict mode it is already refusing turns; in
+   best effort it is running and recording nothing.
+2. Fix the cause the status names in `audit.lastError`: a full filesystem, a
+   permission change, a trail replaced by something that is not a file.
+3. Run `garrison-agent audit verify`. **Keep the trail.** A trail with a gap
+   in it is evidence: the gap plus `audit.firstFailedSequence` plus
+   `audit.degradedSince` are what an auditor needs to bound what was lost.
+4. Restart. The in-memory head keeps advancing past a failed append on
+   purpose, so a restart is what returns the writer to healthy; healing the
+   gap silently would make the trail lie about the entry it lost.
+
+### The anchor, and what a hash chain cannot notice
+
+A hash chain detects a rewrite and detects an insertion. It does not detect a
+**truncation**, because a prefix of a valid chain is itself a valid chain:
+delete the last ten entries of a trail and `verify_chain` still reports it
+intact, at a lower head, with nothing to say about what used to be above it.
+
+So the daemon keeps the head somewhere the trail is not. `[audit] anchor_path`
+in `garrison.toml` (default `$XDG_STATE_HOME/garrison/audit-anchor.json`, mode
+0600) holds the last head this install vouched for, rewritten after **every
+finished turn** rather than only at shutdown, so the window in which entries
+could be deleted unnoticed is one turn rather than one session. The anchor
+keeper learns a turn finished by subscribing to acton-ai's turn lifecycle;
+nothing on the turn path knows it exists.
+
+The anchor is not a security boundary. It sits on the same host, under the
+same user, as the trail. It turns silent tail deletion into a refusal to start
+and a non-zero exit from `garrison-agent audit verify`, which is precisely the
+failure that would otherwise leave no trace. The independently protected copy
+is the plane's `AuditChain` row, and `Anchor` carries exactly the fields that
+row wants so #8 adds a sink rather than a mechanism.
+
+Comparing a trail against its anchor has five verdicts, and only three of them
+stop a daemon:
+
+| Verdict | Meaning | At startup |
+|---|---|---|
+| `matches` | The trail ends where the anchor says | Starts |
+| `advanced` | The trail grew past the anchor | Starts, with a warning. A daemon that died between its last append and its next anchor produces this routinely |
+| `truncated` | The trail ends *before* the anchor: entries were removed from the tail | Refuses (exit 2) |
+| `diverged` | Same sequence, different hash: history at or below the anchor was rewritten | Refuses (exit 2) |
+| `trail_changed` | The file carries a different trail identity | Refuses (exit 2) |
+
+`[audit] on_anchor_mismatch = "warn"` relaxes the three refusals into a log
+line for a deployment that would rather run than stop. An anchor written for a
+different trail path is treated as evidence about another file: the daemon
+warns and re-anchors rather than refusing something it cannot reason about.
+
+### `garrison-agent audit verify`
+
+Two questions, two exit codes, and files only. It never talks to the daemon,
+so it works on a trail copied off the machine:
+
+```sh
+garrison-agent audit verify                 # the armed trail and the configured anchor
+garrison-agent audit verify --file t.jsonl --anchor a.json --json
+```
+
+| Exit | Finding |
+|---|---|
+| 0 | The chain verifies and agrees with its anchor |
+| 2 | The trail or the anchor could not be read; no verdict was reached |
+| 3 | The chain does not verify: an entry was rewritten or inserted |
+| 4 | The chain verifies and no longer ends where the anchor says it ended |
+
+4 is the only code this binary uses for that finding, and nothing else uses 4.
+The comparison is run over the whole chain rather than the head alone, so a
+trail rewritten *below* the anchor and then extended past it is caught rather
+than read as ordinary growth.
+
+### When a trail is required
+
+**A `[plane]` section present while acton-ai arms no trail is a refusal to
+start** (exit 2). An install that answers to an agency was configured to be
+accountable to it, and an accountable agent that records nothing is the exact
+failure an audit exists to prevent. A standalone developer install with no
+`[plane]` starts unrecorded, with a warning, so first-run in an editor works.
+`garrison.toml`'s `[audit] required = true|false` overrides the inference in
+either direction. This rule lives in exactly one function,
+`GarrisonConfig::audit_required`, because more than one subsystem asks it and
+they must get the same answer.
+
 ## Write-time rules: `@default` is what binds a value for `@require`
 
 A `@require` predicate is evaluated against the in-flight write. A field the

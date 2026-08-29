@@ -27,6 +27,7 @@
 //! dispatches its tool call and exits without ever parsing a command line.
 
 use clap::{Parser, Subcommand};
+use garrison_agent::audit;
 use garrison_agent::client::{update_text, AgentClient, Interactions, Quiet};
 use garrison_agent::config::{GarrisonConfig, ServerConfig};
 use garrison_agent::daemon;
@@ -109,6 +110,11 @@ enum Command {
         #[arg(value_enum)]
         provider: ProviderArg,
     },
+    /// Inspects the audit trail this install writes.
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommand,
+    },
     /// Talks to a running daemon.
     Chat {
         /// The socket to connect to.
@@ -124,6 +130,36 @@ enum Command {
         /// Approve every tool call without asking at the terminal.
         #[arg(long)]
         approve_all: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AuditCommand {
+    /// Walks the chain, then measures it against the anchor.
+    ///
+    /// Two questions with two answers. Exit 3 means the chain does not hang
+    /// together: an entry was rewritten or one was inserted. Exit 4 means it
+    /// hangs together perfectly and no longer ends where the anchor says it
+    /// ended, which is what deleting the tail of a trail looks like and is
+    /// the one thing the chain cannot notice about itself. Exit 0 means
+    /// neither. Reads files only: it never talks to the daemon, so it works
+    /// on a trail copied off the machine.
+    Verify {
+        /// The trail to read. Defaults to the one acton-ai.toml arms.
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// The anchor to measure against. Defaults to `[audit] anchor_path`.
+        #[arg(long)]
+        anchor: Option<PathBuf>,
+        /// Garrison's own config file, read for `[audit]`.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// acton-ai's config file, read for the trail's path.
+        #[arg(long)]
+        acton_config: Option<PathBuf>,
+        /// Print the finding as JSON rather than as lines.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -241,12 +277,63 @@ async fn run(cli: Cli) -> Result<(), GarrisonError> {
             key_stdin,
         } => garrison_agent::auth::login(provider.into(), key_stdin).await,
         Command::Logout { provider } => garrison_agent::auth::logout(provider.into()),
+        Command::Audit {
+            command:
+                AuditCommand::Verify {
+                    file,
+                    anchor,
+                    config,
+                    acton_config,
+                    json,
+                },
+        } => audit_verify(file, anchor, config, acton_config, json),
         Command::Chat {
             socket,
             message,
             approve_all,
         } => chat(socket, message, approve_all).await,
     }
+}
+
+/// `audit verify`: read the trail, read the anchor, report both.
+///
+/// The finding is printed either way — an operator triaging a truncation
+/// needs the numbers, not just an exit status — and only then does the
+/// non-zero outcome become an error, so the report always reaches the screen
+/// before the process ends.
+fn audit_verify(
+    file: Option<PathBuf>,
+    anchor: Option<PathBuf>,
+    config: Option<PathBuf>,
+    acton_config: Option<PathBuf>,
+    json: bool,
+) -> Result<(), GarrisonError> {
+    let garrison = load_config(config)?;
+    let trail = match file {
+        Some(path) => path,
+        None => audit::verify::configured_trail(acton_config.as_deref()).ok_or_else(|| {
+            GarrisonError::configuration(
+                "audit",
+                "no audit trail is armed: acton-ai.toml has no [audit] section, so there is \
+                 nothing to verify. Name one with --file",
+            )
+        })?,
+    };
+    let anchor_path = anchor.unwrap_or_else(|| garrison.audit.anchor_path());
+
+    let report = audit::verify::run(&trail, &anchor_path)?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .map_err(|error| GarrisonError::runtime(error.to_string()))?
+        );
+    } else {
+        println!("{}", audit::verify::render(&report));
+    }
+
+    audit::verify::refusal(&report).map_or(Ok(()), Err)
 }
 
 /// Loads Garrison's config from the named file, or the search path.
@@ -373,7 +460,7 @@ async fn ping(socket: Option<PathBuf>) -> Result<(), GarrisonError> {
         status.policy.approval_timeout_secs,
         status.policy.auto_approve.join(", "),
     );
-    println!("  audit:      {}", status.audit.enabled);
+    println!("  audit:      {}", audit_line(&status.audit));
     println!(
         "  sandbox:    {}",
         if status.sandbox.enabled {
@@ -388,6 +475,39 @@ async fn ping(socket: Option<PathBuf>) -> Result<(), GarrisonError> {
     );
 
     Ok(())
+}
+
+/// The audit summary `ping` prints, in one line. Pure.
+///
+/// The state comes first because it is the word an operator triages on, and
+/// the anchor's sequence comes last because a head that has run away from its
+/// anchor is the thing worth noticing once the state itself looks fine.
+fn audit_line(status: &acp::AuditStatus) -> String {
+    let mut line = status.state.to_string();
+
+    if let Some(durability) = status.durability.as_deref() {
+        line.push_str(&format!(" ({durability})"));
+    }
+    if let (Some(sequence), Some(hash)) = (status.sequence, status.chain_head.as_deref()) {
+        line.push_str(&format!(" head={sequence}/{}", &hash[..hash.len().min(8)]));
+    }
+    if status.failures > 0 {
+        line.push_str(&format!(" failures={}", status.failures));
+        if let Some(error) = status.last_error.as_deref() {
+            line.push_str(&format!(" last_error={error}"));
+        }
+    }
+    if let Some(anchor) = status.anchor.as_ref() {
+        match anchor.sequence {
+            Some(sequence) => line.push_str(&format!(" anchor={sequence}")),
+            None => line.push_str(" anchor=none"),
+        }
+        if let Some(error) = anchor.last_error.as_deref() {
+            line.push_str(&format!(" anchor_error={error}"));
+        }
+    }
+
+    line
 }
 
 /// The smoke client's reactions: print what arrives, ask before every tool.

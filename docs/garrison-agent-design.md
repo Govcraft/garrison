@@ -206,6 +206,8 @@ means every §1 item has a socket to plug into.
 | execpolicy, git-utils, AGENTS.md, PTY sessions, turn diff, review mode, coding prompts, Bitbucket DC | **garrison-agent** (`agent/`) — planned | Coding-domain; acton-ai stays a general framework |
 | Compaction, checkpoint/resume, `get_context_remaining`, plan tool/events | **acton-ai upstream** — implemented in 0.35.0 | Garrison exposes compaction and plan events; checkpoint/resume is still to wire |
 | Central policy pull, audit push | **garrison-agent ↔ control plane** | Product glue over acton-ai's policy/audit APIs |
+| Audit durability, writer health, strict-mode refusal | **acton-ai upstream** — implemented in 0.35.0 | The writer owns what an append promises and whether it kept the promise |
+| Chain-head anchoring, four-state status, `audit verify`, the turn gate | **garrison-agent** (`agent/src/audit/`) — implemented | A chain cannot notice its own truncation; only a record kept outside it can, and only a deployment can say whether that stops a turn |
 
 ## 4. Actor topology (garrison-agent)
 
@@ -224,6 +226,11 @@ GarrisonRuntime (acton-ai / acton-reactive)
 │                            one, so there is a single renewal, a single
 │                            reading of a 401, and a single `plane` block in
 │                            `_garrison/status`.
+├── AnchorKeeper          — implemented: subscribes to acton-ai's turn lifecycle,
+│                            anchors the audit chain head outside the trail after
+│                            every finished turn, describes the writer's health to
+│                            `_garrison/status`, and answers `AdmitTurn` so a strict
+│                            trail with a degraded writer refuses the next turn
 ├── PtySupervisor         — planned
 ├── TurnDiff              — planned
 ├── RepoContext           — planned

@@ -76,6 +76,22 @@ pub enum GarrisonErrorKind {
         /// Why the safety assessment refused it.
         reason: String,
     },
+    /// An audit trail did not verify as a hash chain.
+    AuditChainBroken {
+        /// Where the walk stopped, and why.
+        reason: String,
+    },
+    /// An audit trail verifies but no longer ends where its anchor says it
+    /// ended: history was removed or rewritten.
+    ///
+    /// Its own kind, and its own exit code, because it is the one finding a
+    /// chain cannot make about itself — a prefix of a valid chain is a valid
+    /// chain — and a caller scripting `audit verify` needs to tell it apart
+    /// from a chain that simply does not hang together.
+    AuditAnchorMismatch {
+        /// What the comparison found.
+        reason: String,
+    },
 }
 
 impl GarrisonError {
@@ -168,10 +184,32 @@ impl GarrisonError {
         })
     }
 
+    /// An audit trail did not verify as a hash chain.
+    #[must_use]
+    pub fn audit_chain_broken(reason: impl Into<String>) -> Self {
+        Self::new(GarrisonErrorKind::AuditChainBroken {
+            reason: reason.into(),
+        })
+    }
+
+    /// An audit trail no longer ends where its anchor says it ended.
+    #[must_use]
+    pub fn audit_anchor_mismatch(reason: impl Into<String>) -> Self {
+        Self::new(GarrisonErrorKind::AuditAnchorMismatch {
+            reason: reason.into(),
+        })
+    }
+
     /// Whether this is a configuration failure.
     #[must_use]
     pub const fn is_configuration(&self) -> bool {
         matches!(self.kind, GarrisonErrorKind::Configuration { .. })
+    }
+
+    /// Whether a trail disagrees with the anchor that vouched for it.
+    #[must_use]
+    pub const fn is_audit_anchor_mismatch(&self) -> bool {
+        matches!(self.kind, GarrisonErrorKind::AuditAnchorMismatch { .. })
     }
 
     /// Whether this is an enrollment failure.
@@ -194,12 +232,16 @@ impl GarrisonError {
 
     /// Whether this is a refusal rather than a malfunction.
     ///
-    /// A rejected patch is a decision the system made on purpose. Callers that
-    /// report failures to an operator should say so differently from the ones
-    /// that mean something broke.
+    /// A rejected patch and a trail that does not verify are both decisions
+    /// the system made on purpose. Callers that report failures to an
+    /// operator should say so differently from the ones that mean something
+    /// broke.
     #[must_use]
     pub const fn is_rejection(&self) -> bool {
-        matches!(self.kind, GarrisonErrorKind::PatchRejected { .. })
+        matches!(
+            self.kind,
+            GarrisonErrorKind::PatchRejected { .. } | GarrisonErrorKind::AuditChainBroken { .. }
+        )
     }
 }
 
@@ -228,6 +270,12 @@ impl fmt::Display for GarrisonError {
             }
             GarrisonErrorKind::PatchRejected { reason } => {
                 write!(f, "patch rejected: {reason}")
+            }
+            GarrisonErrorKind::AuditChainBroken { reason } => {
+                write!(f, "the audit trail does not verify: {reason}")
+            }
+            GarrisonErrorKind::AuditAnchorMismatch { reason } => {
+                write!(f, "the audit trail disagrees with its anchor: {reason}")
             }
         }
     }

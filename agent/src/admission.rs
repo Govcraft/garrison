@@ -86,6 +86,19 @@ pub enum TurnRefusal {
         /// What the shipper is stuck on.
         reason: String,
     },
+    /// The local audit writer cannot promise this turn will be recorded, and
+    /// the trail is strict.
+    ///
+    /// Distinct from [`Self::AuditShipping`], which is about the copy the
+    /// control plane holds: this one is about the trail on this machine, and
+    /// it is refused before the turn starts rather than after a tool has
+    /// already run unrecorded. Both report under the same JSON-RPC code,
+    /// because a client's remedy is the same — stop, and look at the audit
+    /// section of `_garrison/status`.
+    AuditDegraded {
+        /// What the writer is stuck on, and what an operator does about it.
+        reason: String,
+    },
     /// The session store the turn would be recorded in is unavailable.
     StoreUnavailable,
     /// The session has an interrupted turn that must be resumed or abandoned
@@ -114,6 +127,9 @@ impl fmt::Display for TurnRefusal {
             Self::AuditShipping { reason } => {
                 write!(f, "the audit trail cannot be shipped: {reason}")
             }
+            Self::AuditDegraded { reason } => {
+                write!(f, "this turn cannot be recorded: {reason}")
+            }
             Self::StoreUnavailable => write!(f, "the session store is unavailable"),
             Self::TurnInterrupted { turn_id } => write!(
                 f,
@@ -138,7 +154,9 @@ pub const fn refusal_code(refusal: &TurnRefusal) -> i32 {
         TurnRefusal::Seat { .. } => error_code::SEAT_REFUSED,
         TurnRefusal::PlaneUnavailable { .. } => error_code::PLANE_UNREACHABLE,
         TurnRefusal::Policy { .. } => error_code::POLICY_REFUSED,
-        TurnRefusal::AuditShipping { .. } => error_code::AUDIT_SHIPPING_REFUSED,
+        TurnRefusal::AuditShipping { .. } | TurnRefusal::AuditDegraded { .. } => {
+            error_code::AUDIT_SHIPPING_REFUSED
+        }
         TurnRefusal::StoreUnavailable => error_code::STORE_UNAVAILABLE,
         TurnRefusal::TurnInterrupted { .. } => error_code::TURN_INTERRUPTED,
         TurnRefusal::GateUnreachable { .. } => error_code::TURN_FAILED,
@@ -266,6 +284,12 @@ mod tests {
             ),
             (
                 TurnRefusal::AuditShipping {
+                    reason: String::new(),
+                },
+                error_code::AUDIT_SHIPPING_REFUSED,
+            ),
+            (
+                TurnRefusal::AuditDegraded {
                     reason: String::new(),
                 },
                 error_code::AUDIT_SHIPPING_REFUSED,

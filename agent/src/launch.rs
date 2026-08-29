@@ -236,13 +236,18 @@ pub async fn build_setup(
     let router = spawn_router(&mut runtime, ai).await;
     let supervisor = spawn_supervisor(&mut runtime).await;
     let lsp = spawn_lsp(&mut runtime, config, &project_root).await;
-    let plane = spawn_plane(&mut runtime, config.plane.as_ref(), enrollment).await?;
+    let plane = spawn_plane(&mut runtime, config.plane.as_ref(), enrollment.clone()).await?;
+    let audit = spawn_audit(&mut runtime, ai, config, enrollment).await?;
 
     // Ordered lists, because order is the contract: gates are asked first to
     // last and the first refusal wins; describers fill the status in sequence.
-    let gates: Vec<ActorHandle> = Vec::new();
+    let mut gates: Vec<ActorHandle> = Vec::new();
     let mut describers: Vec<ActorHandle> = vec![supervisor.clone(), router.clone()];
     describers.extend(plane.clone());
+    if let Some(keeper) = audit {
+        gates.push(keeper.clone());
+        describers.push(keeper);
+    }
 
     Ok(ServerSetup {
         supervisor,
@@ -331,6 +336,20 @@ async fn spawn_plane(
         "the install will authenticate to the control plane by signed assertion"
     );
     Ok(Some(PlaneSession::spawn(runtime, identity).await))
+}
+
+/// The audit anchor keeper, which is also a turn gate.
+///
+/// Refuses to start when a required trail is not armed, or when the trail and
+/// its anchor disagree; see [`crate::audit::spawn`], which owns both rules.
+async fn spawn_audit(
+    runtime: &mut ActorRuntime,
+    ai: &ActonAI,
+    config: &GarrisonConfig,
+    enrolled: Option<crate::enrollment::Record>,
+) -> Result<Option<ActorHandle>, GarrisonError> {
+    let install = enrolled.map(|record| record.install);
+    crate::audit::spawn(runtime, ai, config, install).await
 }
 
 /// The configured language servers.

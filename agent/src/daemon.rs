@@ -48,6 +48,14 @@ pub const EXIT_REFUSED_TO_START: u8 = 2;
 /// Exit status for "the system refused on purpose" (a rejection).
 pub const EXIT_REJECTED: u8 = 3;
 
+/// Exit status for "an audit trail no longer ends where its anchor says".
+///
+/// The only user of 4 in this binary, and only `audit verify` produces it. It
+/// is separate from 3 because the two findings mean different things to
+/// whoever is scripting the check: 3 says the chain does not hang together,
+/// and 4 says it hangs together perfectly but is missing its tail.
+pub const EXIT_AUDIT_MISMATCH: u8 = 4;
+
 /// The process exit status an error maps to.
 ///
 /// Pure, because the mapping is a contract: `RestartPreventExitStatus=2 3`
@@ -56,6 +64,8 @@ pub const EXIT_REJECTED: u8 = 3;
 pub const fn exit_code(error: &GarrisonError) -> u8 {
     if error.is_refusal_to_start() {
         EXIT_REFUSED_TO_START
+    } else if error.is_audit_anchor_mismatch() {
+        EXIT_AUDIT_MISMATCH
     } else if error.is_rejection() {
         EXIT_REJECTED
     } else {
@@ -446,10 +456,26 @@ mod tests {
         );
         assert_eq!(exit_code(&GarrisonError::enrollment("refused")), 2);
         assert_eq!(exit_code(&GarrisonError::patch_rejected("outside root")), 3);
+        assert_eq!(exit_code(&GarrisonError::audit_chain_broken("line 4")), 3);
         assert_eq!(exit_code(&GarrisonError::runtime("boom")), 1);
         assert_eq!(
             exit_code(&GarrisonError::transport("/x.sock", "refused")),
             1
+        );
+    }
+
+    #[test]
+    fn an_anchor_mismatch_has_its_own_exit_code() {
+        // A trail that verifies but lost its tail is not the same finding as
+        // a trail that does not verify, and a script checking the two must be
+        // able to tell them apart.
+        assert_eq!(
+            exit_code(&GarrisonError::audit_anchor_mismatch("truncated")),
+            EXIT_AUDIT_MISMATCH
+        );
+        assert_ne!(
+            exit_code(&GarrisonError::audit_anchor_mismatch("truncated")),
+            exit_code(&GarrisonError::audit_chain_broken("line 4")),
         );
     }
 

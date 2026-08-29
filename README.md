@@ -78,9 +78,8 @@ These components are not present in this repository today:
   project-instruction discovery, persistent PTYs, and Bitbucket review mode.
 
 Active tracking issues include
-[documentation alignment](https://github.com/Govcraft/garrison/issues/2),
-[session persistence](https://github.com/Govcraft/garrison/issues/3), and
-[audit durability](https://github.com/Govcraft/garrison/issues/4).
+[documentation alignment](https://github.com/Govcraft/garrison/issues/2) and
+[session persistence](https://github.com/Govcraft/garrison/issues/3).
 
 ## Current architecture
 
@@ -188,8 +187,56 @@ Cloud providers require credentials configured in `acton-ai.toml`; use
 `cargo run -p garrison-agent -- login <anthropic|openai>` where supported, or
 populate the provider's configured key file. Ollama can be selected for a local
 deployment. `garrison.toml` configures the project root, approval behavior,
-optional language servers, and an optional `[plane]` section naming the control
-plane to enroll with. Without that section the agent runs standalone.
+optional language servers, an optional `[audit]` section, and an optional
+`[plane]` section naming the control plane to enroll with. Without that last
+section the agent runs standalone.
+
+## The audit trail
+
+Every tool call is appended to a BLAKE3-chained JSONL trail that acton-ai
+seals, one trail per daemon and so one per user. Garrison adds what a
+deployment needs on top of it.
+
+`acton-ai.toml`'s `[audit] durability` says what an append promises.
+`best_effort` appends and flushes. `strict`, which the shipped configuration
+sets, fsyncs and waits for the acknowledgement; once an append has failed it
+refuses every tool not declared idempotent, and Garrison refuses the next turn
+outright with JSON-RPC code `-32017` rather than running it unrecorded. A
+writer that will not answer the health question is refused the same way,
+because "I cannot find out whether this will be recorded" and "this will not
+be recorded" mean the same thing to the record.
+
+`_garrison/status` reports `audit.state` as one of four words, and
+`garrison-agent ping` prints it first: `disabled` (nothing is being recorded),
+`configured` (a trail is armed and nothing has been written to it yet),
+`healthy` (every append reached the disk), `degraded` (at least one did not,
+so the record is incomplete). A daemon that cannot ask its own writer says
+`degraded`, never `healthy`. Recovery is an operator procedure and not a
+self-healing one: stop, fix the disk, verify, keep the trail as evidence,
+restart.
+
+A hash chain cannot notice its own truncation, because a prefix of a valid
+chain is a valid chain. So the daemon writes the head somewhere the trail is
+not: `[audit] anchor_path` in `garrison.toml`, defaulting to
+`$XDG_STATE_HOME/garrison/audit-anchor.json` at mode 0600, rewritten after
+every finished turn. A trail that ends before its anchor, or that reaches the
+anchored sequence carrying a different hash, refuses to start the daemon (exit
+2) unless `[audit] on_anchor_mismatch = "warn"` says otherwise.
+
+```sh
+garrison-agent audit verify        # exit 0 clean, 3 broken chain, 4 anchor mismatch
+```
+
+Exit 3 says the chain does not hang together. Exit 4 says it hangs together
+perfectly and no longer ends where the anchor says it ended, which is what
+deleting the tail of a trail looks like and is the one finding the chain
+cannot make about itself. The command reads files only, so it works on a trail
+copied off the machine.
+
+A `[plane]` section present while `acton-ai.toml` arms no trail is a refusal to
+start: an install that answers to an agency and records nothing is the failure
+an audit exists to prevent. `[audit] required` overrides that inference either
+way.
 
 ## Target architecture
 
