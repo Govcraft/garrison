@@ -206,10 +206,19 @@ GarrisonRuntime (acton-ai / acton-reactive)
 │                            (one daemon per user; `acp` is a stdio relay to it)
 ├── ThreadSupervisor      — implemented: one in-memory Thread per conversation
 ├── LspServer             — implemented: one actor per configured language server
+├── PlaneSession          — implemented: the daemon's one credential holder.
+│                            Signs a 120s install assertion, trades it for a
+│                            15-minute bearer at the hook service, and answers
+│                            `Authenticate` with an already-authenticated
+│                            client. Nothing outside `agent/src/plane/` builds
+│                            one, so there is a single renewal, a single
+│                            reading of a 401, and a single `plane` block in
+│                            `_garrison/status`.
 ├── PtySupervisor         — planned
 ├── TurnDiff              — planned
 ├── RepoContext           — planned
-└── PlaneSync             — planned control-plane policy/audit/seat integration
+└── PlaneSync             — planned control-plane policy/audit/seat integration,
+                            all of it consuming `PlaneSession`
                             (the plane side already deprovisions: the directory
                             sync in hooks-service revokes a seat when Entra
                             disables the account; the daemon side reads it)
