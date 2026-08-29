@@ -52,16 +52,18 @@ key_path = "../keys/paseto.key"
 # creates goes through the same Cedar decision and the same `@require` rules as
 # a row a human creates.
 #
-# `token` is a bearer for the `enrollment_service` role, which is
-# authorized for four operations and nothing else. Keep it out of this file in
-# any real deployment: `ACTON_GARRISON_TOKEN` overrides it, and the
-# framework's env layering makes that work with no code here. Every field here
-# is one word because that layering splits on `_`; see src/config.rs.
+# `token` is a bearer carrying two service roles and nothing else:
+# `enrollment_service` (provision an accepted enrollment, assemble a bundle
+# for the publish gate) and `audit_service` (the only writer of AuditChain).
+# Keep it out of this file in any real deployment: `ACTON_GARRISON_TOKEN`
+# overrides it, and the framework's env layering makes that work with no code
+# here. Every field here is one word because that layering splits on `_`; see
+# src/config.rs.
 #
-# Mint one with:
+# Mint one with (the tenant chain is required; see docs/control-plane.md):
 #   schemaforge token generate --sub garrison-hooks \
-#     --issuer garrison-control-plane --roles enrollment_service \
-#     --lifetime 2592000
+#     --issuer garrison-control-plane --roles enrollment_service,audit_service \
+#     --lifetime 2592000 --tenant-chain "$CHAIN"
 [garrison]
 url   = "http://127.0.0.1:3000"
 token = ""

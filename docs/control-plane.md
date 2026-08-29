@@ -20,11 +20,12 @@ the two gates that run without a database:
 task plane:check      # parse the schemas, then strict-mode validate the Cedar bundle
 ```
 
-16 schemas lower into 160 generated Cedar policies; 10 hand-written policies in
-`policies/custom/` bring the bundle to 170, all strict-mode validated. The model
-has also been applied end to end against a throwaway PostgreSQL 17 instance: 26
-migration steps, 15 tables, every `unique` constraint and every CEL rule
-type-checked at apply time. The server was then run against it and the
+18 schemas lower into a Cedar bundle of 231 policies, 12 of them hand-written
+in `policies/custom/`, all strict-mode validated. The model has also been
+applied end to end against a throwaway PostgreSQL 16 instance: 31 migration
+steps, 18 tables, every `unique` constraint and every CEL rule type-checked at
+apply time, and the three hook bindings validated against the generated
+descriptor at startup. The server was then run against it and the
 authorization and write-time rules exercised over HTTP — both delete
 `forbid`s against a control case that succeeds, issuer separation between
 enrollment artifacts and console bearers, and every `@require` on both its
@@ -59,7 +60,10 @@ the agent needs a console account.
 
 ## The model
 
-Six files, fifteen schemas, one tenancy root.
+Eight files, eighteen schemas, one tenancy root. Seventeen are Garrison's; the
+eighteenth, `schemas/user.schema`, is the deployment's override of
+SchemaForge's system `User` schema, redeclared verbatim plus the two columns
+that carry directory identity into a console token.
 
 ### Tenancy — `schemas/organization.schema`
 
@@ -72,6 +76,25 @@ record-level Cedar decision, not a `WHERE` clause somebody has to remember.
 `Team` groups operators so policy can be assigned to a squad rather than to
 every developer by name.
 
+`Organization.entra_group_id` names the Entra ID group whose members are the
+organization's operators, and the three `directory_*` fields are the
+reconciler's report: when it last ran, whether it succeeded, and what it
+found. The `directory_service` role may write those three fields and no
+others. Every field that says what the organization is (`name`, `slug`,
+`entra_tenant_id`, `entra_group_id`, `impact_level`, `seats_licensed`,
+`active`) carries `@field_access(write: ["org_admin"])`, so the sync can
+report on the boundary but never move it. `directory_sync_status` starts at
+`never`; a stale or `failed` view refuses new enrollments and changes no
+operator.
+
+The system `User` gains `entra_object_id` and `org_slug`. Both are projected
+onto `Forge::Principal` at every console login and refresh through
+`[schema_forge.authz.principal_claims]` in `config.toml`, which is what lets a
+Cedar policy ask whether the person behind a bearer is someone the directory
+knows. `roles`, `role_rank`, and `metadata` are fenced to `platform_admin`, so
+the `directory_service` bearer can deactivate a login when the directory
+disables a person but cannot promote one.
+
 ### Identity and entitlement — `schemas/identity.schema`
 
 | Schema | What it answers |
@@ -83,6 +106,16 @@ every developer by name.
 agent presents and can change. `Seat` carries the offboarding lever, and a
 `@require` rule makes revocation state what it is for — a revoked seat with no
 recorded reason is rejected at write time, in-process, before any hook.
+
+The `directory_service` role reads and writes `Operator`: a rename in the
+directory patches `upn`, `email`, and `display_name` on the same row and
+nothing else changes, because every relation to an operator is by id. A
+disabled account becomes `suspended`, a removed member becomes `offboarded`,
+and `directory_synced_at` on the row is per-person proof the reconciler saw
+them. On `Seat` the same role may write, but `@field_access` fences `operator`,
+`organization`, `tier`, `activated_at`, and `expires_at` to `org_admin`. What
+is left is `status`, `revoked_at`, and `revocation_reason`: the sync can take
+a seat away and say why, and cannot grant, move, or extend one.
 
 ### Machine identity — `schemas/credential.schema`
 
@@ -165,6 +198,13 @@ chain walkable back to enrollment.
 cannot hold an active credential — resolved through the `related.install.status`
 single-hop read, with the caller's tenant scope applied.
 
+The credential triplet is named the same on both sides of enrollment:
+`credential_kind`, `public_key`, `cert_fingerprint` on `Redemption` and on
+`InstallCredential`. The hook copies the fields across without translating,
+and a reader of either wire shape sees one vocabulary. (The field was `kind`
+on `InstallCredential` before 1.0; the rename is a column migration, and the
+one live row is recreated by re-enrolling.)
+
 ### Enrollment — `schemas/enrollment.schema`
 
 | Schema | What it answers |
@@ -224,8 +264,9 @@ rules, and the same audit as a row a human creates. The transport is
 is built on; it already encodes the error-body shape, the versioned routes,
 bearer auth, and the retry classification, so what remains in `plane.rs` is only
 the part that is genuinely SchemaForge's. The bearer it holds is scoped by the
-`enrollment_service` role, which appears in four `@access` lists and nowhere
-else.
+`enrollment_service` role, which appears in the `@access` lists of the
+schemas it provisions, resolves, and (for the policy publish gate) assembles,
+and nowhere else.
 
 One constraint is worth recording because it is easy to design around and
 impossible to configure around. The plane validates every bearer against the
@@ -402,6 +443,18 @@ examples refuses to load.
 published. An install reports the checksum it loaded; a mismatch is drift, and
 drift is visible rather than deniable.
 
+Publishing is gated by a `before_validate` hook on `PolicyBundle`, bound in
+`config.toml` with `required = true`. When a bundle moves to `published`, the
+hook assembles its rules and endpoints, runs every rule's own match examples,
+and refuses the publish if any fail; otherwise it computes the checksum over
+the canonical bundle and stamps `checksum`, `published_at`, and `published_by`
+onto the row before it persists. The hook reads those rows with the hook
+service's own bearer, which is why `enrollment_service` appears in the read
+lists of `PolicyBundle`, `CommandRule`, `ToolRule`, and `ModelEndpoint`. It
+holds no write grant on any of them: the checksum lands through the hook
+response, not a PATCH. Until the gate is implemented, the hook refuses every
+publish and passes drafting and retiring through untouched.
+
 `ModelEndpoint` records authorization state (`pilot`, `interim_ato`, `ato`,
 `denied`) alongside hosting, and an ATO endpoint must name who authorized it.
 
@@ -409,18 +462,57 @@ drift is visible rather than deniable.
 
 | Schema | What it answers |
 |---|---|
-| `AuditEvent` | One entry from an install's BLAKE3 chain |
-| `AuditChain` | Where a session's chain is, and whether it still verifies |
+| `AuditTrail` | What the install says about its own trail: local head, shipped through |
+| `AuditEvent` | One entry from an install's BLAKE3 chain, the sealed line verbatim |
+| `AuditChain` | Where the plane has verified a trail's chain to, and whether it holds |
 
-The agent already keeps a hash-chained JSONL trail locally. `AuditEvent` is
-where those entries land centrally with the links intact: `entry_hash` is
-unique, `prev_hash` names its predecessor, `chain_seq` orders them. The plane
-re-verifies rather than trusting the install that shipped the entries, and
-`AuditChain.integrity` records what the last walk found — with a `@require`
-rule forcing a gap or a break to say what it was.
+The agent keeps a hash-chained JSONL trail locally; acton-ai seals every entry
+with its sequence, the previous hash, and the trail id it belongs to. The
+three schemas are three vantage points on that one trail, and the split is
+along who is allowed to say what.
+
+`AuditTrail` is the daemon's claim. The `operator` token creates one row per
+trail id and patches it as it ships: `local_head_seq` and `local_head_hash`
+are where the local file is, `shipped_through` is the highest sequence the
+daemon believes the plane acknowledged, `reported_at` is when it last said so,
+and `halted_reason` is set when the daemon stops shipping on its own account.
+Nothing here is verified.
+
+`AuditEvent` is one shipped entry. `entry` holds the acton-ai `AuditEntry`
+JSONL object verbatim, and `chain_seq`, `entry_hash`, and `prev_hash` are
+lifted out of it for indexing: `entry_hash` is unique so a replay collides
+instead of duplicating, `prev_hash` names the predecessor, `chain_seq` orders
+them. The promise is that the plane can re-run chain verification over the
+`entry` column of a trail and reproduce `head_hash`; that is the auditor's
+proof. Every other column (`kind`, `decision`, `decider`, `outcome`,
+`elapsed_ms`, and the rest) is a projection of `entry` that may be re-derived
+and may change; the verbatim entry may not. `session` is optional: a trail
+belongs to an install, and an entry can be sealed before any session is known
+to the plane. `trail` is required.
+
+`AuditChain` is the plane's answer, one per trail rather than one per session.
+Only the `audit_service` role writes it. The `before_validate` hook on
+`AuditEvent`, bound in `config.toml` with `required = true`, loads the chain
+for the entry's trail, re-links the entry against `head_hash` and `head_seq`,
+and either advances the chain, records a gap in `integrity` and `finding`, or
+refuses the write outright as a fork or an edit. `verified_through` says how
+far a background walk has re-derived the chain, and the `@require` on
+`finding` forces a gap or a break to say what it was. `format` names the
+sealing format of the entries, `acton-ai/1` for 1.0, defaulted so a row the
+hook creates never fails on a field it did not send. Until the verifying
+ingest is implemented, the hook refuses every `AuditEvent` write; a stub that
+accepted would persist entries nobody verified while the daemon took the
+success as an acknowledgement.
+
+Silence is the difference between the first and the third over time. A trail
+whose `local_head_seq` keeps moving while its chain's `head_seq` does not is
+an install that stopped shipping; a trail whose `reported_at` stops moving is
+an install that went dark. The two rows disagreeing is the finding, which is
+why the install cannot write the chain and the plane does not write the trail.
 
 Access here is deliberately lopsided. Operators — that is, agents — append and
-cannot read. Auditors read and cannot append.
+cannot read. Auditors read and cannot append. `audit_service` reads all three
+and writes only the chain.
 
 Deletion needs more care than the DSL can express, and the obvious spelling is
 a trap. `delete: []` does **not** mean "nobody": an empty list reads as
@@ -439,7 +531,8 @@ generated policies rather than trusting the annotation.
 
 So the generated permit is narrowed to `org_admin`, and the real rule lives in
 `policies/custom/audit-append-only.cedar` as a Cedar `forbid` over
-`UpdateAuditEvent` and `DeleteAuditEvent`. A `forbid` beats every `permit`,
+`UpdateAuditEvent`, `DeleteAuditEvent`, `DeleteAuditChain`, and
+`DeleteAuditTrail`. A `forbid` beats every `permit`,
 platform_admin's bypass included, which is what makes "nobody deletes" true
 rather than aspirational. Narrowing the generated permit as well means a lost
 custom policy file degrades to "only the highest role", not "everyone".
@@ -452,8 +545,17 @@ Bulk export is a separate consent again. `@export` on both audit schemas
 enables the endpoint; it grants nobody. The distinct `ExportAuditEvent` /
 `ExportAuditChain` actions are permitted in the same custom file to the three
 roles that already read the trail, and the exported column set is
-`@exportable ∩ readable`. `AuditEvent.detail` is deliberately left out: a bulk
-file is the wrong place for whatever a tool happened to attach.
+`@exportable ∩ readable`. `AuditEvent.detail` and `AuditEvent.entry` are
+deliberately left out: a bulk file is the wrong place for whatever a tool
+happened to attach, and the verbatim entry is the verification input, not a
+report column.
+
+One more `forbid` sits on top of those permits, in
+`policies/custom/directory-identity.cedar`: `ExportAuditEvent` is refused to
+any principal that does not carry `entra_object_id`. A console login whose
+`User` row has one gets it projected onto the token; a service bearer minted
+with `schemaforge token generate` never does. Taking a copy of the trail is
+the one action that must be attributable to a person the directory knows.
 
 ## Write-time rules: `@default` is what binds a value for `@require`
 
@@ -505,10 +607,20 @@ no-upward-visibility rule (`principal.role_rank >= resource.role_rank`), so a
 | `auditor` | 600 | Reads the trail, writes nothing |
 | `team_lead` | 400 | Their team's operators, installs, sessions |
 | `operator` | 100 | Pulls policy, appends audit, nothing more |
+| `directory_service` | 30 | The Entra reconciler: operators, seats, console logins, three organization fields |
+| `enrollment_service` | 20 | The hook service provisioning an accepted enrollment |
+| `audit_service` | 20 | The hook service verifying shipped audit entries; the only writer of `AuditChain` |
+| `enrollee` | 10 | An enrollment artifact: create one `Redemption`, nothing else |
 
 `platform_admin` is SchemaForge's reserved operator role, hardcoded at
 `i64::MAX`. It is not a Garrison role and must not appear in that file or in
 any `@access` list.
+
+The four machine roles are ranked below every human role on purpose. Rank
+gates visibility of *user* records, and none of them has any business seeing
+one; their actual authority is the `@access` lists that name them and the
+`@field_access` fences that bound what a write may touch. One hook-service
+bearer carries both `enrollment_service` and `audit_service`.
 
 The `operator` row is the one to read twice: it is the role a *daemon* holds,
 and it is scoped to exactly the two things a daemon needs — read the policy it
@@ -554,10 +666,20 @@ are failures the runtime would otherwise refuse to hot-swap after merge.
   ed25519, SSH allowed-signers, or cosign-keyless signatures over `schemas/`
   before parsing, which is worth adopting here well before anything federal
   ships. The rollout is off → warn → enforce.
-- **Entra claims are modeled, not wired.** `[schema_forge.authz.principal_claims]`
-  in `config.toml` is commented out because projecting `entra_object_id` onto
-  `Forge::Principal` requires those columns on the system `User` schema first.
-  Until then, custom Cedar policies cannot scope by Entra identity.
+- **Entra claims are projected, not yet populated.**
+  `[schema_forge.authz.principal_claims]` in `config.toml` is enabled with
+  `required = false`, and `schemas/user.schema` supplies the columns it reads.
+  Nothing writes those columns yet: the directory reconciler that would is
+  planned, so every console login still carries no `entra_object_id` and the
+  export `forbid` in `directory-identity.cedar` currently refuses everyone.
+  That is the fail-closed direction, and it is stated here so nobody reads a
+  403 on export as a bug. `required` cannot be `true`: it is enforced against
+  every bearer the plane accepts, including enrollment artifacts and service
+  tokens, which carry no such claim by construction.
+- **Two hooks are declared and refuse.** The `AuditEvent` and `PolicyBundle`
+  `before_validate` hooks are bound and served, and both are stubs that fail
+  closed: every audit ingest is refused, and every bundle publish is refused,
+  until the verifying ingest and the publish gate are implemented.
 - **No provisioned database.** The apply path has been exercised against a
   throwaway container, not against an environment anyone can point a client at.
   There is no migration history, no seeded organization, and no bootstrapped

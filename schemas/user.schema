@@ -1,0 +1,42 @@
+// Garrison control plane — the console login, extended.
+//
+// SchemaForge seeds a system `User` schema as the login store for this
+// administrative console. This file redeclares it with two additional columns
+// so a console login can carry directory identity into its token:
+//
+//   entra_object_id  the Entra ID objectId of the person behind the login
+//   org_slug         the Organization the login belongs to
+//
+// `[schema_forge.authz.principal_claims]` in config.toml reads both columns
+// off the row at every login and refresh and projects them onto
+// `Forge::Principal`, which is what lets policies/custom/directory-identity.cedar
+// require a directory identity for an audit export.
+//
+// The first eight fields are the seeded definition verbatim; `apply` diffs
+// this against the stored metadata and lands only the additions. Dropping the
+// schema is refused by SchemaForge's system-schema protection.
+//
+// `directory_service` is the reconciler that flips `active` when the
+// directory disables or removes a person. The `@field_access` fences on
+// `roles`, `role_rank`, and `metadata` are what stop that bearer from
+// promoting a login through the entity route; `/api/v1/forge/users` keeps its
+// own role-rank guards on top. A console user holding `platform_admin` is
+// never deactivated by the sync; that rule lives in the reconciler, not here,
+// because the DSL cannot express it.
+
+@system
+@display("email")
+@access(read: ["directory_service"], write: ["directory_service"])
+schema User {
+    email:           text(max: 512) required indexed
+    display_name:    text(max: 255) required
+    roles:           text[] @field_access(write: ["platform_admin"])
+    role_rank:       integer required @field_access(write: ["platform_admin"])
+    active:          boolean default(true)
+    password_hash:   text(max: 512) @hidden
+    last_login:      datetime
+    metadata:        json @field_access(write: ["platform_admin"])
+
+    entra_object_id: text(max: 64) unique indexed
+    org_slug:        text(max: 100) indexed
+}

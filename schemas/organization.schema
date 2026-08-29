@@ -4,22 +4,44 @@
 // that runs its own Garrison deployment. Everything else in this directory is
 // scoped to it, so a control plane serving two agencies can never leak one's
 // policy, seats, or audit trail into the other's console.
+//
+// Two service roles read this row. `enrollment_service` needs it to resolve
+// a tenant during redemption; `directory_service` needs it for the Entra
+// group it reconciles and writes back only the three `directory_*` fields.
+// Every field that says what the organization *is* carries a `@field_access`
+// fence to org_admin, so the sync can report on the boundary but never move
+// it.
 
 @version(1)
 @tenant(root)
 @display("name")
 @access(
-    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin"],
-    write:  ["org_admin"],
+    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin", "enrollment_service", "directory_service"],
+    write:  ["org_admin", "directory_service"],
     delete: ["org_admin"]
 )
 schema Organization {
-    name:            text(max: 255) required indexed
-    slug:            text(max: 100) required unique indexed @list(column)
+    name:            text(max: 255) required indexed @field_access(write: ["org_admin"])
+    slug:            text(max: 100) required unique indexed @list(column) @field_access(write: ["org_admin"])
 
     // Entra ID directory (tenant) GUID. Operators are matched to this
     // organization by the `tid` claim their agent presents.
-    entra_tenant_id: text(max: 64) indexed
+    entra_tenant_id: text(max: 64) indexed @field_access(write: ["org_admin"])
+
+    // Entra ID group whose members are this organization's operators. The
+    // reconciler lists this group and nothing wider.
+    entra_group_id:  text(max: 64) indexed @field_access(write: ["org_admin"])
+
+    // What the reconciler last did and when. `never` until the first tick;
+    // `failed` on an unreachable directory, an empty listing, or a change that
+    // would offboard more of the fleet than the configured fraction allows.
+    // A stale or failed view refuses new enrollments and changes no operator.
+    directory_synced_at:   datetime @format("relative")
+    directory_sync_status: enum("never", "ok", "failed")
+                           default("never")
+                           @enum_colors(never: "gray", ok: "green", failed: "red")
+                           @list(column)
+    directory_sync_detail: text(max: 512) @default("''")
 
     impact_level:    enum("commercial", "fedramp_moderate", "fedramp_high", "il2", "il4", "il5")
                      default("commercial")
@@ -31,9 +53,10 @@ schema Organization {
                          il4: "amber",
                          il5: "red"
                      )
+                     @field_access(write: ["org_admin"])
 
-    seats_licensed:  integer(min: 0) default(0)
-    active:          boolean default(true)
+    seats_licensed:  integer(min: 0) default(0) @field_access(write: ["org_admin"])
+    active:          boolean default(true) @field_access(write: ["org_admin"])
 
     owner_id:        text required @owner
     created_at:      datetime @default("now")
@@ -47,7 +70,7 @@ schema Organization {
 @tenant(parent: "Organization")
 @display("name")
 @access(
-    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin"],
+    read:   ["operator", "team_lead", "auditor", "security_officer", "org_admin", "directory_service"],
     write:  ["org_admin", "team_lead"],
     delete: ["org_admin"]
 )

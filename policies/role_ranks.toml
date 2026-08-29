@@ -31,3 +31,17 @@ enrollee         = 10
 # from the @access lists that name it — AgentInstall, InstallCredential and
 # EnrollmentToken writes, Operator reads — and nothing else.
 enrollment_service = 20
+
+# The hook service's second hat: the verifying ingest for shipped audit
+# entries. Same reasoning as enrollment_service, same rank. It is the only
+# writer of AuditChain, so an install's bearer can report a trail but never
+# assert what the plane verified. One bearer carries both service roles:
+#   --roles enrollment_service,audit_service
+audit_service    = 20
+
+# The directory reconciler: projects Entra ID group membership onto Operator
+# and Seat rows and the console User. Ranked above the other services only so
+# it may not be managed by them, and still below every human role. Its
+# authority is the @access lists that name it and the @field_access fences
+# that keep it from rebinding an organization or promoting a user.
+directory_service = 30
