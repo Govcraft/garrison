@@ -400,8 +400,14 @@ mod tests {
 
     #[test]
     fn an_active_linked_operator_is_admissible_either_way() {
-        assert_eq!(operator_admissible(&operator("active", Some("A")), false), Ok(()));
-        assert_eq!(operator_admissible(&operator("active", Some("A")), true), Ok(()));
+        assert_eq!(
+            operator_admissible(&operator("active", Some("A")), false),
+            Ok(())
+        );
+        assert_eq!(
+            operator_admissible(&operator("active", Some("A")), true),
+            Ok(())
+        );
     }
 
     #[test]
@@ -414,7 +420,10 @@ mod tests {
 
     #[test]
     fn an_unlinked_operator_is_refused_only_when_the_directory_is_the_authority() {
-        assert_eq!(operator_admissible(&operator("active", None), false), Ok(()));
+        assert_eq!(
+            operator_admissible(&operator("active", None), false),
+            Ok(())
+        );
         assert_eq!(
             operator_admissible(&operator("active", Some("")), true),
             Err("operator is not linked to the directory".into())
@@ -424,7 +433,10 @@ mod tests {
     #[test]
     fn a_recently_synced_organization_is_fresh() {
         let org = organization(Some("2026-08-28T23:50:00Z"), Some("ok"));
-        assert_eq!(directory_fresh(&org, now(), Duration::from_secs(900)), Ok(()));
+        assert_eq!(
+            directory_fresh(&org, now(), Duration::from_secs(900)),
+            Ok(())
+        );
     }
 
     #[test]
@@ -435,7 +447,9 @@ mod tests {
 
     #[test]
     fn a_never_synced_organization_is_stale_by_definition() {
-        assert!(directory_fresh(&organization(None, None), now(), Duration::from_secs(900)).is_err());
+        assert!(
+            directory_fresh(&organization(None, None), now(), Duration::from_secs(900)).is_err()
+        );
     }
 
     #[test]

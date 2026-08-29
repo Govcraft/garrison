@@ -116,7 +116,8 @@ impl Plan {
     /// A one-line summary for `Organization.directory_sync_detail`.
     #[must_use]
     pub fn summary(&self) -> String {
-        let count = |pred: fn(&OperatorChange) -> bool| self.operators.iter().filter(|c| pred(c)).count();
+        let count =
+            |pred: fn(&OperatorChange) -> bool| self.operators.iter().filter(|c| pred(c)).count();
         format!(
             "created {}, linked {}, renamed {}, reactivated {}, suspended {}, offboarded {}, unlinked {}, users changed {}",
             count(|c| matches!(c, OperatorChange::Create { .. })),
@@ -137,7 +138,10 @@ pub enum Refusal {
     /// The directory answered "nobody". Never treated as "everyone left".
     EmptyDirectory,
     /// The plan would deprovision too much of the active fleet at once.
-    OffboardFractionExceeded { would_deprovision: usize, active: usize },
+    OffboardFractionExceeded {
+        would_deprovision: usize,
+        active: usize,
+    },
 }
 
 impl std::fmt::Display for Refusal {
@@ -292,7 +296,12 @@ fn guard_fraction(
     }
     let would_deprovision = changes
         .iter()
-        .filter(|c| matches!(c, OperatorChange::Suspend { .. } | OperatorChange::Offboard { .. }))
+        .filter(|c| {
+            matches!(
+                c,
+                OperatorChange::Suspend { .. } | OperatorChange::Offboard { .. }
+            )
+        })
         .filter_map(OperatorChange::id)
         .filter(|id| active.contains(id))
         .count();
@@ -484,7 +493,10 @@ mod tests {
         let plan = reconcile(&[member("A", "a@x.gov", false)], &[], &[], ORG, &policy()).unwrap();
         assert!(matches!(
             plan.operators[0],
-            OperatorChange::Create { status: "suspended", .. }
+            OperatorChange::Create {
+                status: "suspended",
+                ..
+            }
         ));
     }
 
@@ -548,9 +560,14 @@ mod tests {
         let listing = [member("A", "a@x.gov", false)];
         assert!(matches!(
             reconcile(&listing, &ops, &[], ORG, &policy()),
-            Err(Refusal::OffboardFractionExceeded { would_deprovision: 1, active: 1 })
+            Err(Refusal::OffboardFractionExceeded {
+                would_deprovision: 1,
+                active: 1
+            })
         ));
-        let lenient = Policy { max_offboard_fraction: 1.0 };
+        let lenient = Policy {
+            max_offboard_fraction: 1.0,
+        };
         assert!(reconcile(&listing, &ops, &[], ORG, &lenient).is_ok());
     }
 
@@ -600,10 +617,13 @@ mod tests {
             &policy(),
         )
         .unwrap();
-        assert_eq!(plan.operators[0], OperatorChange::Link {
-            id: "o1".into(),
-            entra_object_id: "D".into()
-        });
+        assert_eq!(
+            plan.operators[0],
+            OperatorChange::Link {
+                id: "o1".into(),
+                entra_object_id: "D".into()
+            }
+        );
         // The link also normalises the directory-owned attributes.
         assert!(matches!(plan.operators[1], OperatorChange::Rename { .. }));
         assert_eq!(plan.confirmed, vec!["o1"]);
@@ -613,16 +633,12 @@ mod tests {
     #[test]
     fn a_hand_typed_row_matching_nobody_is_reported_not_offboarded() {
         let ops = [operator("o1", "ghost@agency.gov", None, "active")];
-        let plan = reconcile(
-            &[member("A", "a@x.gov", true)],
-            &ops,
-            &[],
-            ORG,
-            &policy(),
-        )
-        .unwrap();
+        let plan = reconcile(&[member("A", "a@x.gov", true)], &ops, &[], ORG, &policy()).unwrap();
         assert_eq!(plan.unlinked, vec!["o1"]);
-        assert!(plan.operators.iter().all(|c| matches!(c, OperatorChange::Create { .. })));
+        assert!(plan
+            .operators
+            .iter()
+            .all(|c| matches!(c, OperatorChange::Create { .. })));
     }
 
     #[test]
@@ -632,7 +648,10 @@ mod tests {
             operator("o2", "a@x.gov", None, "active"),
         ];
         let plan = reconcile(&[member("A", "a@x.gov", true)], &ops, &[], ORG, &policy()).unwrap();
-        assert!(!plan.operators.iter().any(|c| matches!(c, OperatorChange::Link { .. })));
+        assert!(!plan
+            .operators
+            .iter()
+            .any(|c| matches!(c, OperatorChange::Link { .. })));
         assert_eq!(plan.unlinked, vec!["o2"]);
     }
 
@@ -720,7 +739,14 @@ mod tests {
             user("u1", "a@x.gov", Some("A"), Some(ORG)),
             user("u2", "b@x.gov", Some("B"), Some(ORG)),
         ];
-        let plan = reconcile(&[member("A", "a@x.gov", false)], &[], &users, ORG, &policy()).unwrap();
+        let plan = reconcile(
+            &[member("A", "a@x.gov", false)],
+            &[],
+            &users,
+            ORG,
+            &policy(),
+        )
+        .unwrap();
         assert_eq!(
             plan.users,
             vec![

@@ -121,7 +121,12 @@ impl Directory for GraphDirectory {
             let mut members = Vec::new();
             for page in 0..MAX_PAGES {
                 let (mut batch, next) = self.page(&token, &url).await?;
-                debug!(page, count = batch.len(), more = next.is_some(), "graph page");
+                debug!(
+                    page,
+                    count = batch.len(),
+                    more = next.is_some(),
+                    "graph page"
+                );
                 members.append(&mut batch);
                 match next {
                     Some(next) => url = next,
@@ -189,7 +194,10 @@ fn graph_error_message(body: &str) -> Option<String> {
     if let Some(description) = value.get("error_description").and_then(Value::as_str) {
         return Some(description.to_string());
     }
-    value.get("error").and_then(Value::as_str).map(str::to_owned)
+    value
+        .get("error")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 /// A successful token response, in the fields used here.
@@ -213,7 +221,9 @@ pub fn parse_token_response(text: &str) -> Result<AccessToken, DirectoryError> {
     let token: AccessToken = serde_json::from_value(value)
         .map_err(|e| DirectoryError::Malformed(format!("token: {e}")))?;
     if token.access_token.is_empty() {
-        return Err(DirectoryError::Malformed("token: empty access_token".into()));
+        return Err(DirectoryError::Malformed(
+            "token: empty access_token".into(),
+        ));
     }
     Ok(token)
 }
@@ -376,7 +386,9 @@ mod tests {
             "https://login.microsoftonline.com/tenant-1/oauth2/v2.0/token"
         );
         let group = members_url("https://graph.microsoft.com/v1.0", Some("g1"));
-        assert!(group.starts_with("https://graph.microsoft.com/v1.0/groups/g1/members/microsoft.graph.user?"));
+        assert!(group.starts_with(
+            "https://graph.microsoft.com/v1.0/groups/g1/members/microsoft.graph.user?"
+        ));
         assert!(group.contains("$top=999"));
         let all = members_url("https://graph.microsoft.com/v1.0/", None);
         assert!(all.starts_with("https://graph.microsoft.com/v1.0/users?"));

@@ -26,11 +26,11 @@
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use acton_service::extensions::ActorExtension;
 use acton_reactive::prelude::{
-    acton_actor, acton_message, ActorHandleInterface, Cadence, Idle, Interval, ManagedActor,
-    Reply, Request, ScheduledSend,
+    acton_actor, acton_message, ActorHandleInterface, Cadence, Idle, Interval, ManagedActor, Reply,
+    Request, ScheduledSend,
 };
+use acton_service::extensions::ActorExtension;
 use chrono::{SecondsFormat, Utc};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -324,10 +324,7 @@ async fn reconcile_organization(
     ran_at: &str,
 ) -> std::result::Result<String, SyncError> {
     let query = DirectoryQuery {
-        tenant_id: organization
-            .entra_tenant_id
-            .clone()
-            .unwrap_or_default(),
+        tenant_id: organization.entra_tenant_id.clone().unwrap_or_default(),
         group_id: organization
             .entra_group_id
             .clone()
@@ -518,8 +515,8 @@ fn clip(detail: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use acton_reactive::prelude::ActonApp;
     use crate::directory::{DirectoryError, DirectoryUser, MembersFuture};
+    use acton_reactive::prelude::ActonApp;
 
     struct Nobody;
 

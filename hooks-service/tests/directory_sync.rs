@@ -263,13 +263,7 @@ allow_plaintext      = true
     )
 }
 
-fn hooks_config(
-    port: u16,
-    key: &Path,
-    plane: &str,
-    snapshot: &Path,
-    organization: &str,
-) -> String {
+fn hooks_config(port: u16, key: &Path, plane: &str, snapshot: &Path, organization: &str) -> String {
     format!(
         r#"
 [service]
@@ -358,7 +352,10 @@ async fn provisioning_and_deprovisioning_flow_through_a_real_plane() {
             return;
         }
     };
-    let pg_port = postgres.get_host_port_ipv4(5432).await.expect("mapped port");
+    let pg_port = postgres
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("mapped port");
     let db_url = format!("postgres://garrison:garrison@127.0.0.1:{pg_port}/garrison_plane");
 
     // A private copy of the repository's model, so nothing here can touch the
@@ -510,7 +507,12 @@ async fn provisioning_and_deprovisioning_flow_through_a_real_plane() {
     // No console User is seeded. The plane's user store has no tenant
     // column, so the tenant-scoped sync cannot list it; that half is
     // recorded in the sync detail and asserted below, not faked.
-    let hook_token = mint(&key, "garrison-hooks", "enrollment_service,audit_service", &chain);
+    let hook_token = mint(
+        &key,
+        "garrison-hooks",
+        "enrollment_service,audit_service",
+        &chain,
+    );
     let directory_token = mint(&key, "garrison-directory", "directory_service", &chain);
     let enrollee_1 = mint(&key, "tok_alice_1", "enrollee", &chain);
     let enrollee_2 = mint(&key, "tok_alice_2", "enrollee", &chain);
@@ -547,10 +549,14 @@ async fn provisioning_and_deprovisioning_flow_through_a_real_plane() {
 
     // 1. Provisioning. The first tick creates alice and links dev.
     let synced = plane
-        .wait_for("the first successful sync", Duration::from_secs(60), || async {
-            let row = plane.get("Organization", &org_id).await;
-            (row["fields"]["directory_sync_status"] == json!("ok")).then_some(row)
-        })
+        .wait_for(
+            "the first successful sync",
+            Duration::from_secs(60),
+            || async {
+                let row = plane.get("Organization", &org_id).await;
+                (row["fields"]["directory_sync_status"] == json!("ok")).then_some(row)
+            },
+        )
         .await;
     assert!(synced["fields"]["directory_synced_at"].is_string());
 
@@ -638,10 +644,14 @@ async fn provisioning_and_deprovisioning_flow_through_a_real_plane() {
     // The operator row is patched before its seats, so the seat can lag
     // the status by one round trip.
     let seat = plane
-        .wait_for("alice's seat to be revoked", Duration::from_secs(30), || async {
-            let row = plane.get("Seat", &seat_id).await;
-            (row["fields"]["status"] == json!("revoked")).then_some(row)
-        })
+        .wait_for(
+            "alice's seat to be revoked",
+            Duration::from_secs(30),
+            || async {
+                let row = plane.get("Seat", &seat_id).await;
+                (row["fields"]["status"] == json!("revoked")).then_some(row)
+            },
+        )
         .await;
     assert_eq!(
         seat["fields"]["revocation_reason"],
@@ -650,14 +660,18 @@ async fn provisioning_and_deprovisioning_flow_through_a_real_plane() {
     assert!(seat["fields"]["revoked_at"].is_string());
 
     let org = plane
-        .wait_for("the sync to record the tick", Duration::from_secs(30), || async {
-            let row = plane.get("Organization", &org_id).await;
-            (row["fields"]["directory_sync_status"] == json!("ok")
-                && row["fields"]["directory_sync_detail"]
-                    .as_str()
-                    .is_some_and(|d| d.contains("suspended 1")))
-            .then_some(row)
-        })
+        .wait_for(
+            "the sync to record the tick",
+            Duration::from_secs(30),
+            || async {
+                let row = plane.get("Organization", &org_id).await;
+                (row["fields"]["directory_sync_status"] == json!("ok")
+                    && row["fields"]["directory_sync_detail"]
+                        .as_str()
+                        .is_some_and(|d| d.contains("suspended 1")))
+                .then_some(row)
+            },
+        )
         .await;
     assert!(
         org["fields"]["directory_sync_detail"]

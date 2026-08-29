@@ -212,7 +212,11 @@ mod tests {
         };
         assert_eq!(
             config.missing(),
-            vec!["directory.path", "directory.token", "directory.organization"]
+            vec![
+                "directory.path",
+                "directory.token",
+                "directory.organization"
+            ]
         );
     }
 

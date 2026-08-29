@@ -36,9 +36,9 @@ pub fn parse_snapshot(text: &str) -> Result<Vec<DirectoryUser>, DirectoryError> 
 impl Directory for FileDirectory {
     fn members<'a>(&'a self, _query: &'a DirectoryQuery) -> MembersFuture<'a> {
         Box::pin(async move {
-            let text = fs::read_to_string(&self.path).await.map_err(|e| {
-                DirectoryError::Transport(format!("{}: {e}", self.path.display()))
-            })?;
+            let text = fs::read_to_string(&self.path)
+                .await
+                .map_err(|e| DirectoryError::Transport(format!("{}: {e}", self.path.display())))?;
             parse_snapshot(&text)
         })
     }

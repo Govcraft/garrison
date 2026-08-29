@@ -233,7 +233,9 @@ impl Service {
         Ok(match source {
             OperatorSource::Bound(id) => match self.plane.operator_by_id(&id).await? {
                 Some(row) => Ok(row),
-                None => Err(format!("the operator this token names ({id}) no longer exists")),
+                None => Err(format!(
+                    "the operator this token names ({id}) no longer exists"
+                )),
             },
             OperatorSource::ReportedUpn(upn) => match self.plane.operator_by_upn(&upn).await? {
                 Some(row) => Ok(row),
