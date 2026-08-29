@@ -732,6 +732,7 @@ mod tests {
                 enabled: true,
                 chain_head: None,
             },
+            context: None,
             sandbox: acp::SandboxStatus {
                 enabled: true,
                 hardening: Some("enforce".to_string()),

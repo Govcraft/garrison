@@ -17,7 +17,7 @@ use crate::enrollment::key::InstallKey;
 use crate::error::GarrisonError;
 use crate::plane::session::{Identity, PlaneSession};
 use crate::protocol::acp::{
-    AgentCapabilities, PromptCapabilities, SandboxStatus, SessionCapabilities,
+    AgentCapabilities, CompactionStatus, PromptCapabilities, SandboxStatus, SessionCapabilities,
     SessionListCapabilities,
 };
 use crate::protocol::conn::ThreadDefaults;
@@ -26,6 +26,7 @@ use crate::protocol::transport::{Listener, UnixListener};
 use crate::router::TurnRouter;
 use crate::thread::ThreadSupervisor;
 use acton_ai::facade::ActonAI;
+use acton_ai::memory::CompactionConfig;
 use acton_ai::policy::ToolPolicy;
 use acton_ai::tools::sandbox::{HardeningMode, ProcessSandboxConfig};
 use acton_reactive::prelude::*;
@@ -232,7 +233,7 @@ pub async fn build_setup(
     let mut runtime = ai.runtime().clone();
     let project_root = resolve_project_root(config.threads.project_root.as_deref())?;
 
-    let router = spawn_router(&mut runtime).await;
+    let router = spawn_router(&mut runtime, ai).await;
     let supervisor = spawn_supervisor(&mut runtime).await;
     let lsp = spawn_lsp(&mut runtime, config, &project_root).await;
     let plane = spawn_plane(&mut runtime, config.plane.as_ref(), enrollment).await?;
@@ -240,7 +241,7 @@ pub async fn build_setup(
     // Ordered lists, because order is the contract: gates are asked first to
     // last and the first refusal wins; describers fill the status in sequence.
     let gates: Vec<ActorHandle> = Vec::new();
-    let mut describers: Vec<ActorHandle> = vec![supervisor.clone()];
+    let mut describers: Vec<ActorHandle> = vec![supervisor.clone(), router.clone()];
     describers.extend(plane.clone());
 
     Ok(ServerSetup {
@@ -257,8 +258,25 @@ pub async fn build_setup(
 }
 
 /// The turn router, subscribed to the broker before anything can be missed.
-async fn spawn_router(runtime: &mut ActorRuntime) -> ActorHandle {
-    TurnRouter::spawn(runtime).await
+///
+/// It is handed the resolved compaction policy because it is also the daemon's
+/// describer for what happens to a history that outgrows the window.
+async fn spawn_router(runtime: &mut ActorRuntime, ai: &ActonAI) -> ActorHandle {
+    TurnRouter::spawn(runtime, compaction_status(ai.compaction())).await
+}
+
+/// Describes the auto-compaction policy in force, for `_garrison/status`.
+///
+/// `None` means the oldest exchanges are truncated rather than summarized,
+/// which is acton-ai's default and stays the default here: Garrison never
+/// calls `.compaction()` on the builder, so `[context] auto_compact` in
+/// `acton-ai.toml` is the single source of truth and this only reads it back.
+/// Pure.
+fn compaction_status(config: Option<&CompactionConfig>) -> Option<CompactionStatus> {
+    config.map(|config| CompactionStatus {
+        threshold: config.threshold.get(),
+        keep_recent_turns: config.keep_recent_turns.get(),
+    })
 }
 
 /// The session supervisor.
@@ -567,6 +585,25 @@ mod tests {
             launch_refusal("no provider configured"),
             "no provider configured"
         );
+    }
+
+    #[test]
+    fn no_compaction_policy_is_reported_as_no_compaction() {
+        assert_eq!(compaction_status(None), None);
+    }
+
+    #[test]
+    fn a_configured_compaction_policy_reports_the_terms_it_applies() {
+        use acton_ai::memory::{CompactionThreshold, KeepRecentTurns};
+
+        let config = CompactionConfig::new()
+            .with_threshold(CompactionThreshold::new(0.7).expect("0.7 is a fraction"))
+            .with_keep_recent_turns(KeepRecentTurns::new(5).expect("five turns is not zero"));
+
+        let status = compaction_status(Some(&config)).expect("a policy must be reported");
+
+        assert!((status.threshold - 0.7).abs() < f64::EPSILON);
+        assert_eq!(status.keep_recent_turns, 5);
     }
 
     #[test]

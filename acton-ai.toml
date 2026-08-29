@@ -67,6 +67,27 @@ tokens_per_minute = 1000000
 # keeps only a recent tail and would.
 strategy = "keep-system-and-recent"
 
+# Auto-compaction. With auto_compact = true a history that reaches
+# compact_threshold of the window's available budget has its oldest exchanges
+# summarized by the turn's own provider and replaced with that summary,
+# instead of being truncated away unread. The summary is a paid request to the
+# same provider and faces the same budget and rate limits as the turn's own
+# rounds, so a long session costs a little more; what it buys is a model that
+# still knows what happened at the start of the conversation.
+#
+# Compaction is off unless auto_compact is true, and the other two keys are
+# inert without it. An out-of-range value (a threshold outside 0 < x <= 1, or
+# keep_recent_turns = 0) refuses the launch rather than being rounded.
+#
+# Garrison never sets this in code: this file is the only place it is decided.
+# What the daemon resolved is readable at `_garrison/status` under `context`,
+# and each pass is announced to the owning session as
+# `_garrison/session/compacted` and summarized in the prompt response's
+# `_meta.garrison.compactions`.
+auto_compact = true
+compact_threshold = 0.8
+keep_recent_turns = 3
+
 [defaults]
 max_tool_rounds = 25
 

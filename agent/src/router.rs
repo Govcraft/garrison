@@ -2,16 +2,32 @@
 //!
 //! # The problem this actor exists to solve
 //!
-//! acton-ai broadcasts a turn's tool lifecycle — [`TurnLifecycle::ToolStarted`]
-//! and [`LLMStreamToolResult`] — to the runtime-wide broker, keyed by an
-//! `acton_ai::types::TurnId` that the prompt loop mints internally. A caller of
-//! `collect()` is never told that identifier, and no callback carries it. One
-//! process serving several clients therefore receives every client's tool
-//! events on one channel with no way to tell them apart.
+//! acton-ai broadcasts a turn's whole observable life — [`TurnLifecycle`],
+//! [`LLMStreamToolResult`] and [`PlanUpdated`] — to the runtime-wide broker,
+//! keyed by an `acton_ai::types::TurnId` that the prompt loop mints
+//! internally. A caller of `collect()` is never told that identifier, and no
+//! callback carries it. One process serving several clients therefore receives
+//! every client's events on one channel with no way to tell them apart.
 //!
 //! Approvals do not have this problem: they run on the turn's own task, so
 //! [`crate::approval`] identifies them exactly with a task-local. Only the
 //! broadcast events, which arrive on the broker's task, need a registry.
+//!
+//! # What this router forwards
+//!
+//! - tool calls starting and finishing, as ACP tool-call updates;
+//! - the model's plan, as a spec-native `sessionUpdate: "plan"` carrying
+//!   Garrison's correlation in `_meta.garrison`;
+//! - a history summarized to fit the window, as
+//!   [`acp::ext::SESSION_COMPACTED`].
+//!
+//! Each goes to the one session that owns the turn it names and to no other,
+//! which is what the table below is for. Successive plans of one turn are
+//! forwarded by one actor onto one FIFO sink, so a client sees them in the
+//! order the model published them; the final plan also rides in the
+//! `session/prompt` response's `_meta`, which is the authoritative end state
+//! because the response comes from a different actor and can overtake the last
+//! notification.
 //!
 //! # The claim protocol
 //!
@@ -38,8 +54,9 @@
 
 use crate::protocol::acp;
 use crate::protocol::codec::EventSink;
+use crate::protocol::conn::{Describe, StatusPart};
 use crate::types::{ThreadId, TurnId};
-use acton_ai::messages::{LLMStreamToolResult, TurnLifecycle};
+use acton_ai::messages::{LLMStreamToolResult, PlanUpdated, TurnLifecycle};
 use acton_ai::types::{CorrelationId, TurnId as ActonTurnId};
 use acton_reactive::prelude::*;
 use std::collections::{HashMap, VecDeque};
@@ -125,21 +142,36 @@ pub struct TurnRouter {
     generation: u64,
     /// The armed expiry for [`Self::outstanding`].
     expiry: Option<ScheduledSend>,
+    /// The auto-compaction policy the runtime launched under, for
+    /// `_garrison/status`. `None` means histories are truncated rather than
+    /// summarized.
+    compaction: Option<acp::CompactionStatus>,
+    /// How many compactions this daemon has routed since it started.
+    compactions: usize,
 }
 
 impl TurnRouter {
-    /// Spawns the router and subscribes it to the two events it routes.
+    /// Spawns the router and subscribes it to the events it routes.
     ///
     /// Subscriptions go on the builder, before `start`: registering them
     /// afterwards is silently ignored and would leave a router that runs
     /// happily and routes nothing.
-    pub async fn spawn(runtime: &mut ActorRuntime) -> ActorHandle {
+    ///
+    /// `compaction` is the policy acton-ai resolved at launch. It is held here
+    /// because this is the actor that watches compaction happen, so one actor
+    /// answers both "what is the rule" and "how often has it fired".
+    pub async fn spawn(
+        runtime: &mut ActorRuntime,
+        compaction: Option<acp::CompactionStatus>,
+    ) -> ActorHandle {
         let mut builder = runtime.new_actor_with_name::<Self>("turn_router".to_string());
 
+        builder.model.compaction = compaction;
         configure_handlers(&mut builder);
 
         builder.handle().subscribe::<TurnLifecycle>().await;
         builder.handle().subscribe::<LLMStreamToolResult>().await;
+        builder.handle().subscribe::<PlanUpdated>().await;
 
         builder.start().await
     }
@@ -207,6 +239,64 @@ impl TurnRouter {
             return;
         };
         self.forget(&acton_turn);
+    }
+
+    /// Finds the claim an event that names its own turn belongs to.
+    ///
+    /// No fallback, deliberately: a plan and a compaction each carry the turn
+    /// id acton-ai minted, which the claim protocol bound to a session at
+    /// `TurnStarted`. There is never a reason to guess, so an event for a turn
+    /// this router does not know is dropped rather than shown to whichever
+    /// client happens to be the only one talking.
+    fn route_turn(&self, turn_id: &ActonTurnId) -> Option<&Claim> {
+        self.turns.get(turn_id)
+    }
+
+    /// The plan update one broadcast becomes, and the sink it belongs on.
+    ///
+    /// Pure, which is what makes owner-only routing testable without a model:
+    /// the answer is a notification and an address, and nothing has been
+    /// written anywhere yet.
+    fn plan_delivery(&self, event: &PlanUpdated) -> Option<(&EventSink, acp::SessionNotification)> {
+        let claim = self.route_turn(&event.turn_id)?;
+        Some((
+            &claim.sink,
+            acp::plan_update(
+                &claim.thread_id,
+                &claim.turn_id,
+                &event.tool_call_id,
+                &event.plan,
+            ),
+        ))
+    }
+
+    /// The compaction notice one broadcast becomes, and its sink. Pure.
+    fn compaction_delivery(
+        &self,
+        turn_id: &ActonTurnId,
+        tokens_before: u64,
+        tokens_after: u64,
+        messages_elided: u64,
+    ) -> Option<(&EventSink, acp::CompactionNotice)> {
+        let claim = self.route_turn(turn_id)?;
+        Some((
+            &claim.sink,
+            acp::compaction_notice(
+                &claim.thread_id,
+                &claim.turn_id,
+                tokens_before,
+                tokens_after,
+                messages_elided,
+            ),
+        ))
+    }
+
+    /// What the router contributes to `_garrison/status`.
+    fn context_status(&self) -> acp::ContextStatus {
+        acp::ContextStatus {
+            compaction: self.compaction.clone(),
+            compactions: self.compactions,
+        }
     }
 
     /// Finds the claim a tool result belongs to.
@@ -332,10 +422,27 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, TurnRouter>) {
             // The outcome travels on `LLMStreamToolResult`, which carries the
             // success flag and summary this variant lacks.
             TurnLifecycle::ToolFinished { .. } => {}
+            TurnLifecycle::ContextCompacted {
+                turn_id,
+                tokens_before,
+                tokens_after,
+                messages_elided,
+            } => {
+                // Counted whether or not it can be attributed: the figure in
+                // `_garrison/status` is the daemon's, not one session's.
+                actor.model.compactions = actor.model.compactions.saturating_add(1);
+                if let Some((sink, notice)) = actor.model.compaction_delivery(
+                    turn_id,
+                    *tokens_before,
+                    *tokens_after,
+                    *messages_elided,
+                ) {
+                    sink.notify(acp::ext::SESSION_COMPACTED, &notice);
+                }
+            }
             // The enum is non_exhaustive: variants this router has no ACP
-            // mapping for yet (compaction notices, plan updates, and whatever
-            // arrives next) are deliberately not surfaced rather than being a
-            // compile error on every upgrade.
+            // mapping for yet are deliberately not surfaced rather than being
+            // a compile error on every upgrade.
             _ => {}
         }
 
@@ -343,6 +450,35 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, TurnRouter>) {
             if let Some(reply) = next {
                 reply.send(TurnClaimed).await;
             }
+        })
+    });
+
+    // `mutate_on` for the same reason the others are: one FIFO mailbox is
+    // what makes successive plans of one turn reach the client in the order
+    // the model published them.
+    builder.mutate_on::<PlanUpdated>(|actor, envelope| {
+        let event = envelope.message();
+
+        match actor.model.plan_delivery(event) {
+            Some((sink, update)) => {
+                sink.notify(acp::method::SESSION_UPDATE, &update);
+            }
+            None => tracing::debug!(
+                turn_id = %event.turn_id,
+                "dropping a plan that belongs to no known turn",
+            ),
+        }
+
+        Reply::ready()
+    });
+
+    // The router's contribution to `_garrison/status`: what this daemon does
+    // when a history outgrows the window, and how often it has had to.
+    builder.mutate_on::<Describe>(|actor, envelope| {
+        let reply = envelope.reply_envelope();
+        let part = StatusPart::Context(actor.model.context_status());
+        Reply::pending(async move {
+            reply.send(part).await;
         })
     });
 
@@ -546,6 +682,128 @@ mod tests {
         assert!(router
             .route_result("never-started", &CorrelationId::new())
             .is_none());
+    }
+
+    /// A two-step plan, published by `turn_id` as call `call-1`.
+    fn plan_event(
+        turn_id: &ActonTurnId,
+        first: acton_ai::tools::plan::PlanStepStatus,
+    ) -> PlanUpdated {
+        use acton_ai::tools::plan::{Plan, PlanStep, PlanStepStatus};
+
+        let plan = Plan::new(
+            vec![
+                PlanStep::parse("read the parser", first).unwrap(),
+                PlanStep::parse("fix the parser", PlanStepStatus::Pending).unwrap(),
+            ],
+            None,
+        )
+        .expect("a two-step plan is valid");
+
+        PlanUpdated {
+            turn_id: turn_id.clone(),
+            correlation_id: CorrelationId::new(),
+            tool_call_id: "call-1".to_string(),
+            plan,
+        }
+    }
+
+    #[test]
+    fn a_plan_reaches_only_the_session_that_owns_its_turn() {
+        use acton_ai::tools::plan::PlanStepStatus;
+
+        let mut router = TurnRouter::default();
+        let (mine, mut rx_mine) = sink();
+        let (theirs, mut rx_theirs) = sink();
+
+        let my_turn = ActonTurnId::new();
+        let staked = claim(mine);
+        let expected = staked.thread_id.clone();
+        router.turns.insert(my_turn.clone(), staked);
+        router.turns.insert(ActonTurnId::new(), claim(theirs));
+
+        let (sink, update) = router
+            .plan_delivery(&plan_event(&my_turn, PlanStepStatus::InProgress))
+            .expect("a bound turn's plan must route");
+        sink.notify(acp::method::SESSION_UPDATE, &update);
+
+        let line = rx_mine.try_recv().expect("the owner must be told");
+        let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(frame["params"]["sessionId"], expected.to_string());
+        assert_eq!(frame["params"]["update"]["sessionUpdate"], "plan");
+        assert!(
+            rx_theirs.try_recv().is_err(),
+            "the other session must hear nothing about a plan it did not make"
+        );
+    }
+
+    #[test]
+    fn a_plan_for_a_turn_this_router_never_bound_is_dropped() {
+        use acton_ai::tools::plan::PlanStepStatus;
+
+        let mut router = TurnRouter::default();
+        let (only, _rx) = sink();
+        router.turns.insert(ActonTurnId::new(), claim(only));
+
+        // One turn is open, so the single-turn fallback the *tool result*
+        // route allows would deliver this. A plan names its own turn, so
+        // there is nothing to fall back to and nothing to deliver.
+        assert!(router
+            .plan_delivery(&plan_event(&ActonTurnId::new(), PlanStepStatus::Pending))
+            .is_none());
+    }
+
+    #[test]
+    fn a_compaction_notice_reaches_only_the_session_whose_history_shrank() {
+        let mut router = TurnRouter::default();
+        let (mine, mut rx_mine) = sink();
+        let (theirs, mut rx_theirs) = sink();
+
+        let my_turn = ActonTurnId::new();
+        let staked = claim(mine);
+        let expected = staked.thread_id.clone();
+        router.turns.insert(my_turn.clone(), staked);
+        router.turns.insert(ActonTurnId::new(), claim(theirs));
+
+        let (sink, notice) = router
+            .compaction_delivery(&my_turn, 900, 300, 8)
+            .expect("a bound turn's compaction must route");
+        sink.notify(acp::ext::SESSION_COMPACTED, &notice);
+
+        let line = rx_mine.try_recv().expect("the owner must be told");
+        let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(frame["method"], acp::ext::SESSION_COMPACTED);
+        assert_eq!(frame["params"]["sessionId"], expected.to_string());
+        assert_eq!(frame["params"]["messagesElided"], 8);
+        assert!(rx_theirs.try_recv().is_err());
+    }
+
+    #[test]
+    fn the_status_reports_the_policy_and_what_it_has_done() {
+        let router = TurnRouter {
+            compaction: Some(acp::CompactionStatus {
+                threshold: 0.8,
+                keep_recent_turns: 3,
+            }),
+            compactions: 2,
+            ..TurnRouter::default()
+        };
+
+        let status = router.context_status();
+
+        assert_eq!(status.compactions, 2);
+        assert_eq!(
+            status.compaction.map(|policy| policy.keep_recent_turns),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn a_router_with_no_compaction_policy_says_so() {
+        let status = TurnRouter::default().context_status();
+
+        assert!(status.compaction.is_none());
+        assert_eq!(status.compactions, 0);
     }
 
     #[test]

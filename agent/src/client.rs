@@ -85,6 +85,16 @@ pub trait Interactions {
     /// Called for every `session/update` notification.
     fn update(&mut self, _notification: &acp::SessionNotification) {}
 
+    /// Called for every notification in Garrison's own `_garrison/`
+    /// namespace.
+    ///
+    /// These are extensions rather than ACP, so the parameters arrive
+    /// unparsed: their shape belongs to the extension, and a client that does
+    /// not recognize one has nothing useful to do with it. The default
+    /// ignores them, which is why adding an extension never breaks a client
+    /// that predates it.
+    fn extension(&mut self, _method: &str, _params: Option<&serde_json::Value>) {}
+
     /// Called for every `session/request_permission` request.
     ///
     /// The default refuses. Approving is a decision a caller must make
@@ -366,14 +376,20 @@ impl AgentClient {
 ///
 /// Pure but for the callback: an unreadable or unknown notification is logged
 /// and dropped, because a client that failed the whole turn over an event it
-/// did not recognize would break every time ACP grew a new one.
+/// did not recognize would break every time ACP grew a new one. Garrison's
+/// own `_garrison/` notifications go to [`Interactions::extension`] instead of
+/// being parsed here, because this client does not own their shapes.
 fn deliver_update(
     interactions: &mut impl Interactions,
     method: &str,
     params: Option<&serde_json::Value>,
 ) {
     if method != acp::method::SESSION_UPDATE {
-        tracing::debug!(method, "ignoring an unknown notification");
+        if method.starts_with(acp::ext::NAMESPACE) {
+            interactions.extension(method, params);
+        } else {
+            tracing::debug!(method, "ignoring an unknown notification");
+        }
         return;
     }
 
@@ -416,6 +432,7 @@ mod tests {
     struct Recorder {
         text: String,
         asked: Vec<String>,
+        extensions: Vec<(String, serde_json::Value)>,
     }
 
     impl Interactions for Recorder {
@@ -423,6 +440,13 @@ mod tests {
             if let Some(text) = update_text(notification) {
                 self.text.push_str(text);
             }
+        }
+
+        fn extension(&mut self, method: &str, params: Option<&serde_json::Value>) {
+            self.extensions.push((
+                method.to_string(),
+                params.cloned().unwrap_or(serde_json::Value::Null),
+            ));
         }
 
         fn permission(
@@ -471,6 +495,25 @@ mod tests {
         deliver_update(&mut recorder, "session/somethingNew", None);
 
         assert!(recorder.text.is_empty());
+        assert!(recorder.extensions.is_empty());
+    }
+
+    #[test]
+    fn a_garrison_notification_reaches_the_extension_hook_unparsed() {
+        let mut recorder = Recorder::default();
+        let notice =
+            acp::compaction_notice(&ThreadId::new(), &crate::types::TurnId::new(), 9, 3, 4);
+        let params = serde_json::to_value(&notice).unwrap();
+
+        deliver_update(&mut recorder, acp::ext::SESSION_COMPACTED, Some(&params));
+
+        assert_eq!(recorder.extensions.len(), 1);
+        assert_eq!(recorder.extensions[0].0, acp::ext::SESSION_COMPACTED);
+        assert_eq!(recorder.extensions[0].1["messagesElided"], 4);
+        assert!(
+            recorder.text.is_empty(),
+            "an extension is not a session update"
+        );
     }
 
     #[test]

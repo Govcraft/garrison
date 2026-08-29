@@ -223,16 +223,34 @@ impl LspServerConfig {
     }
 }
 
-/// The read-only builtins that never need a human.
+/// The builtins that never need a human.
 ///
-/// Every one of them only observes. `bash`, `write_file`, `edit_file` and
-/// `apply_patch` are deliberately absent: they change the world, so they are
-/// exactly what a governed agent asks about.
+/// Every one of them only observes or restates the turn's own state. `bash`,
+/// `write_file`, `edit_file` and `apply_patch` are deliberately absent: they
+/// change the world, so they are exactly what a governed agent asks about.
+///
+/// `update_plan` is here because it is how the model narrates itself: it
+/// touches no file, no socket and no process, it only replaces the plan the
+/// turn already owns, and without it every step of every plan would raise a
+/// permission dialog in the editor. It is still recorded in the audit chain
+/// with its arguments, like any other call.
+///
+/// This list stays short on purpose. It is a *name* allowlist that knows
+/// nothing about arguments, and the policy engine that replaces it reads
+/// acton-ai's own `idempotent` declaration instead — which is upstream and
+/// cannot be widened by a local file.
 fn default_auto_approve() -> Vec<String> {
-    ["read_file", "glob", "grep", "list_files", "calculate"]
-        .iter()
-        .map(|name| (*name).to_string())
-        .collect()
+    [
+        "read_file",
+        "glob",
+        "grep",
+        "list_files",
+        "calculate",
+        "update_plan",
+    ]
+    .iter()
+    .map(|name| (*name).to_string())
+    .collect()
 }
 
 /// The default socket path: under `$XDG_RUNTIME_DIR` when there is one.
@@ -331,6 +349,10 @@ mod tests {
 
         assert_eq!(config.approval.timeout_secs, 300);
         assert!(config.approval.auto_approve.contains(&"grep".to_string()));
+        assert!(config
+            .approval
+            .auto_approve
+            .contains(&"update_plan".to_string()));
         assert!(config.threads.project_root.is_none());
     }
 

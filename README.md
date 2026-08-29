@@ -21,6 +21,12 @@ described below is direction, not checkout.
   daemon: the spawned process runs no engine of its own.
 - In-memory session create, load, list, prompt, and cancellation.
 - Streaming model text and tool lifecycle events.
+- Plans and context compaction as protocol events: an `update_plan` call
+  reaches the one session that owns the turn as an ACP `plan` update, a
+  summarized history is announced on `_garrison/session/compacted`, and the
+  turn's final plan and every compaction pass are repeated in the prompt
+  response's `_meta`. Compaction is off unless `[context] auto_compact` in
+  `acton-ai.toml` turns it on.
 - Human approval round-trips, timeouts, and per-connection approval caching.
 - A structural `apply_patch` tool with fuzzy context matching, atomic planning,
   and project-root safety checks.

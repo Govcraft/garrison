@@ -163,6 +163,8 @@ pub enum StatusPart {
     Threads(acp::ThreadsStatus),
     /// From the plane session, when this daemon is governed.
     Plane(acp::PlaneStatus),
+    /// From the turn router, which sees every compaction.
+    Context(acp::ContextStatus),
 }
 
 impl Request for Describe {
@@ -573,13 +575,25 @@ fn permission_request(request: &RequestApproval) -> acp::RequestPermissionReques
 fn answer_prompt(sink: &EventSink, id: RequestId, finished: &TurnFinished) {
     match &finished.result {
         TurnResult::Completed {
-            stop_reason, usage, ..
+            stop_reason,
+            usage,
+            plan,
+            compactions,
+            ..
         } => {
             let mut response = acp::PromptResponse::new(*stop_reason);
             // Token counts ride in `_meta`: they are not part of stable ACP,
             // and inventing a core field for them would make Garrison's frames
-            // unreadable to a conformant client.
-            let meta = turn_meta(&finished.turn_id.to_string(), usage);
+            // unreadable to a conformant client. The final plan rides there
+            // too, and is the authoritative one: the streamed plan updates
+            // come from the router, so the last of them can arrive after this
+            // response.
+            let meta = turn_meta(
+                &finished.turn_id.to_string(),
+                usage,
+                plan.as_ref(),
+                compactions,
+            );
             response.meta = Some(meta);
             sink.respond(id, &response);
         }
@@ -604,22 +618,24 @@ fn answer_prompt(sink: &EventSink, id: RequestId, finished: &TurnFinished) {
     }
 }
 
-/// Wraps turn usage in the one `_meta` key Garrison claims.
-fn turn_meta(turn_id: &str, usage: &crate::thread::TurnUsage) -> serde_json::Map<String, Value> {
-    let payload = acp::TurnMeta {
+/// Wraps what a turn ended up costing, planning, and forgetting in the one
+/// `_meta` key Garrison claims.
+///
+/// Pure, so the shape a client reads at the end of a turn is testable without
+/// a socket.
+fn turn_meta(
+    turn_id: &str,
+    usage: &crate::thread::TurnUsage,
+    plan: Option<&acton_ai::tools::plan::Plan>,
+    compactions: &[acton_ai::memory::CompactionRecord],
+) -> acp::Meta {
+    acp::garrison_meta(&acp::TurnMeta {
         turn_id: turn_id.to_string(),
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: usage.completion_tokens,
-    };
-
-    let mut meta = serde_json::Map::new();
-    match serde_json::to_value(payload) {
-        Ok(value) => {
-            meta.insert(acp::ext::META_KEY.to_string(), value);
-        }
-        Err(error) => tracing::error!(%error, "dropping unserializable turn metadata"),
-    }
-    meta
+        plan: plan.map(acp::plan_summary),
+        compactions: compactions.iter().map(acp::compaction_summary).collect(),
+    })
 }
 
 /// Removes a suspended permission request and cancels its timer.
@@ -1004,6 +1020,7 @@ fn own_status(context: &Dispatch) -> acp::GarrisonStatus {
         sandbox: context.setup.sandbox.clone(),
         threads: None,
         plane: None,
+        context: None,
     }
 }
 
@@ -1056,6 +1073,7 @@ fn assemble(
         match part {
             StatusPart::Threads(threads) => status.threads = Some(threads),
             StatusPart::Plane(plane) => status.plane = Some(plane),
+            StatusPart::Context(context) => status.context = Some(context),
         }
     }
     status
@@ -1170,6 +1188,8 @@ mod tests {
                     prompt_tokens: 11,
                     completion_tokens: 7,
                 },
+                plan: None,
+                compactions: Vec::new(),
             },
         };
 
@@ -1181,6 +1201,54 @@ mod tests {
         assert_eq!(parsed["result"]["stopReason"], "end_turn");
         assert_eq!(parsed["result"]["_meta"]["garrison"]["promptTokens"], 11);
         assert_eq!(parsed["result"]["_meta"]["garrison"]["completionTokens"], 7);
+        assert!(
+            parsed["result"]["_meta"]["garrison"]["plan"].is_null(),
+            "a turn with no plan says nothing about one"
+        );
+        assert!(
+            parsed["result"]["_meta"]["garrison"]["compactions"].is_null(),
+            "a turn that compacted nothing says nothing about compaction"
+        );
+    }
+
+    #[test]
+    fn a_completed_turn_reports_its_final_plan_and_compactions_in_meta() {
+        use acton_ai::memory::{CompactionOutcome, CompactionRecord};
+        use acton_ai::tools::plan::{Plan, PlanStep, PlanStepStatus};
+
+        let plan = Plan::new(
+            vec![
+                PlanStep::parse("read the parser", PlanStepStatus::Completed).unwrap(),
+                PlanStep::parse("fix the parser", PlanStepStatus::InProgress).unwrap(),
+            ],
+            None,
+        )
+        .expect("a two-step plan is valid");
+        let record = CompactionRecord {
+            summary: "the earlier exchanges".to_string(),
+            outcome: CompactionOutcome {
+                messages_before: 12,
+                messages_after: 5,
+                tokens_before: 900,
+                tokens_after: 300,
+                messages_elided: 8,
+            },
+            elided_prefix_len: 8,
+        };
+
+        let meta = turn_meta(
+            "turn_abc",
+            &TurnUsage::default(),
+            Some(&plan),
+            std::slice::from_ref(&record),
+        );
+        let garrison = &meta[acp::ext::META_KEY];
+
+        assert_eq!(garrison["plan"]["completed"], 1);
+        assert_eq!(garrison["plan"]["total"], 2);
+        assert_eq!(garrison["plan"]["steps"][1]["status"], "in_progress");
+        assert_eq!(garrison["compactions"][0]["messagesElided"], 8);
+        assert_eq!(garrison["compactions"][0]["elidedPrefixLen"], 8);
     }
 
     #[test]
@@ -1254,7 +1322,30 @@ mod tests {
             sandbox: acp::SandboxStatus::disabled(),
             threads: None,
             plane: None,
+            context: None,
         }
+    }
+
+    #[test]
+    fn assembling_places_the_compaction_policy() {
+        let assembled = assemble(
+            bare_status(),
+            None,
+            vec![StatusPart::Context(acp::ContextStatus {
+                compaction: Some(acp::CompactionStatus {
+                    threshold: 0.8,
+                    keep_recent_turns: 3,
+                }),
+                compactions: 2,
+            })],
+        );
+
+        let context = assembled.context.expect("the context part must land");
+        assert_eq!(context.compactions, 2);
+        assert_eq!(
+            context.compaction.map(|policy| policy.keep_recent_turns),
+            Some(3)
+        );
     }
 
     #[test]

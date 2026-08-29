@@ -21,6 +21,15 @@
 //!
 //! Nothing sleeps. Rounds are handed out in order, and asking for one that was
 //! never scripted is a 500 rather than a hang.
+//!
+//! # Two sessions at once
+//!
+//! A single counter is only deterministic while one turn is in flight. Two
+//! concurrent sessions race for it, and the loser is answered with the other
+//! one's round. [`MockServer::start_keyed`] instead picks a script by a
+//! substring of the request body, and gives each script its own position: the
+//! provider is then a pure function of what was asked, which is the only
+//! version of it a concurrency test can assert against.
 
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -135,6 +144,39 @@ impl Round {
     }
 }
 
+/// One script, served only to requests that mention its key.
+struct KeyedScript {
+    key: String,
+    rounds: Vec<Round>,
+    served: AtomicUsize,
+}
+
+/// How the server decides what to answer with.
+enum Script {
+    /// Rounds handed out in the order they were written.
+    InOrder(Vec<Round>),
+    /// A script per key, each holding its own place in its own list.
+    Keyed(Vec<KeyedScript>),
+}
+
+impl Script {
+    /// The round that answers `body`, or `None` when nothing scripted one.
+    ///
+    /// `index` is the server-wide request count, which only the in-order form
+    /// reads: a keyed script advances by its own key, not by what other
+    /// sessions did while it was thinking.
+    fn round_for(&self, body: &str, index: usize) -> Option<Round> {
+        match self {
+            Self::InOrder(rounds) => rounds.get(index).cloned(),
+            Self::Keyed(scripts) => {
+                let script = scripts.iter().find(|script| body.contains(&script.key))?;
+                let position = script.served.fetch_add(1, Ordering::SeqCst);
+                script.rounds.get(position).cloned()
+            }
+        }
+    }
+}
+
 /// A running scripted server.
 pub struct MockServer {
     base_url: String,
@@ -146,6 +188,31 @@ pub struct MockServer {
 impl MockServer {
     /// Binds an ephemeral port and serves `script`, one round per request.
     pub async fn start(script: Vec<Round>) -> Self {
+        Self::serving(Script::InOrder(script)).await
+    }
+
+    /// The same, but each script is chosen by a substring of the request.
+    ///
+    /// The key must be something the session keeps saying — its own prompt
+    /// text, which every request in that conversation carries — so that the
+    /// summarization request a compaction makes is routed with the rounds it
+    /// belongs to.
+    pub async fn start_keyed(scripts: Vec<(&str, Vec<Round>)>) -> Self {
+        Self::serving(Script::Keyed(
+            scripts
+                .into_iter()
+                .map(|(key, rounds)| KeyedScript {
+                    key: key.to_string(),
+                    rounds,
+                    served: AtomicUsize::new(0),
+                })
+                .collect(),
+        ))
+        .await
+    }
+
+    /// Binds an ephemeral port and serves one script.
+    async fn serving(script: Script) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("binding an ephemeral port must succeed");
@@ -221,7 +288,7 @@ impl MockServer {
 /// Answers requests on one connection until the client hangs up.
 async fn serve(
     mut stream: TcpStream,
-    script: Arc<Vec<Round>>,
+    script: Arc<Script>,
     served: Arc<AtomicUsize>,
     received: Arc<Mutex<Vec<Value>>>,
     rounds: mpsc::UnboundedSender<usize>,
@@ -241,7 +308,7 @@ async fn serve(
         }
 
         let index = served.fetch_add(1, Ordering::SeqCst);
-        let response = match script.get(index) {
+        let response = match script.round_for(&request, index) {
             Some(round) => http_ok(&round.to_sse()),
             // Asking for a round nobody scripted is a bug in the test, and a
             // 500 says so in a way that ends the turn instead of hanging it.
