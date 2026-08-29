@@ -34,6 +34,7 @@
 
 use crate::admission::{self, Admission, AdmitTurn, TurnRefusal};
 use crate::approval::{with_turn_scope, TurnScope};
+use crate::entitlement::EntitlementLost;
 use crate::protocol::acp::{self, StopReason};
 use crate::protocol::codec::EventSink;
 use crate::protocol::conn::{Describe, StatusPart};
@@ -259,6 +260,10 @@ pub struct Thread {
     setup: Option<ThreadSetup>,
     history: Vec<Message>,
     running: Option<RunningTurn>,
+    /// Why the turn in flight was cancelled, when it was cancelled by losing
+    /// entitlement rather than by the client. Consumed by [`TurnOutcome`], so
+    /// what reaches the client is the refusal and not a bare `cancelled`.
+    revoked: Option<TurnRefusal>,
 }
 
 impl Thread {
@@ -394,6 +399,10 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, Thread>) {
             return Reply::ready();
         };
 
+        // The gates decide whether this turn runs; `revoked` only ever
+        // explains a cancellation, so a new turn starts without one.
+        actor.model.revoked = None;
+
         let content = envelope.message().content.clone();
         let messages = actor.model.turn_messages(&content);
         let turn_id = TurnId::new();
@@ -437,6 +446,19 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, Thread>) {
 
         actor.model.running = None;
 
+        // A turn cancelled because this install lost its seat is not a
+        // cancellation from the client's point of view: nobody asked for it
+        // to stop, and answering `stopReason: cancelled` would hide a
+        // governance decision behind a word that means the operator changed
+        // their mind. The refusal replaces it, with the same code and the
+        // same words the next turn would be refused with.
+        let mut message = message;
+        if matches!(message.result, TurnResult::Cancelled) {
+            if let Some(refusal) = actor.model.revoked.take() {
+                message.result = TurnResult::Refused(refusal);
+            }
+        }
+
         if let TurnResult::Completed {
             text, compactions, ..
         } = &message.result
@@ -469,6 +491,27 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, Thread>) {
                 })
                 .await;
         })
+    });
+
+    // Losing entitlement ends the turn in flight. The seat monitor
+    // broadcasts; every session hears it. A turn that was already going to be
+    // refused on its next `AdmitTurn` must not be allowed to finish this one,
+    // because the model is still being spent on an install the plane has
+    // stopped entitling.
+    builder.mutate_on::<EntitlementLost>(|actor, envelope| {
+        let refusal = envelope.message().refusal.clone();
+        let Some(running) = &actor.model.running else {
+            return Reply::ready();
+        };
+
+        tracing::warn!(
+            turn_id = %running.turn_id,
+            %refusal,
+            "ending a turn in flight: this install no longer holds an entitlement",
+        );
+        running.cancel.cancel();
+        actor.model.revoked = Some(refusal);
+        Reply::ready()
     });
 
     builder.mutate_on::<InterruptTurn>(|actor, envelope| {
@@ -851,6 +894,11 @@ async fn spawn_thread(runtime: &mut ActorRuntime, message: CreateThread) -> Acto
     builder.model.setup = Some(message.setup);
     builder.model.history = message.history;
     configure_handlers(&mut builder);
+
+    // Before `start`, because a subscription registered afterwards is
+    // silently ignored — which would leave a session that runs happily and
+    // never hears that its seat was taken away.
+    builder.handle().subscribe::<EntitlementLost>().await;
 
     builder.start().await
 }

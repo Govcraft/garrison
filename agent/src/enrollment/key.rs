@@ -158,7 +158,10 @@ impl InstallKey {
 /// The explicit `set_permissions` is not redundant: `mode` on `OpenOptions`
 /// applies only when the file is created, so a key rewritten over a
 /// world-readable file would silently keep the wrong mode.
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+///
+/// Shared with [`crate::entitlement::store`], which writes the cached seat
+/// standing beside this key and wants the same guarantee for the same reason.
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
     let mut file = std::fs::OpenOptions::new()

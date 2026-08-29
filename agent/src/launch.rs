@@ -237,13 +237,22 @@ pub async fn build_setup(
     let supervisor = spawn_supervisor(&mut runtime).await;
     let lsp = spawn_lsp(&mut runtime, config, &project_root).await;
     let plane = spawn_plane(&mut runtime, config.plane.as_ref(), enrollment.clone()).await?;
+    let entitlement = spawn_entitlement(&mut runtime, config, plane.as_ref()).await;
     let audit = spawn_audit(&mut runtime, ai, config, enrollment).await?;
 
     // Ordered lists, because order is the contract: gates are asked first to
     // last and the first refusal wins; describers fill the status in sequence.
+    //
+    // Entitlement is asked first. An install that holds no seat is not
+    // entitled to the answer any other gate would give, and "you have no
+    // seat" is the more actionable of two simultaneous refusals.
     let mut gates: Vec<ActorHandle> = Vec::new();
     let mut describers: Vec<ActorHandle> = vec![supervisor.clone(), router.clone()];
     describers.extend(plane.clone());
+    if let Some(monitor) = entitlement {
+        gates.push(monitor.clone());
+        describers.push(monitor);
+    }
     if let Some(keeper) = audit {
         gates.push(keeper.clone());
         describers.push(keeper);
@@ -336,6 +345,21 @@ async fn spawn_plane(
         "the install will authenticate to the control plane by signed assertion"
     );
     Ok(Some(PlaneSession::spawn(runtime, identity).await))
+}
+
+/// The seat monitor, which is also a turn gate.
+///
+/// `None` on a standalone agent: no plane, no organization, no seat to hold.
+/// A governed install always gets one, whatever the plane is doing, because a
+/// daemon that refuses to start when the plane is down is a daemon nobody can
+/// ask *why* it is refusing. It starts, it answers `_garrison/status`, and it
+/// refuses turns until the plane confirms a seat; see [`crate::entitlement`].
+async fn spawn_entitlement(
+    runtime: &mut ActorRuntime,
+    config: &GarrisonConfig,
+    plane: Option<&ActorHandle>,
+) -> Option<ActorHandle> {
+    crate::entitlement::spawn(runtime, config.plane.as_ref(), plane).await
 }
 
 /// The audit anchor keeper, which is also a turn gate.

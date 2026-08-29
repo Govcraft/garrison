@@ -162,6 +162,69 @@ pub struct GarrisonStatus {
     /// is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<ContextStatus>,
+    /// Whether a seat entitles this install to run turns at all.
+    ///
+    /// Absent on a standalone agent, which belongs to no organization and
+    /// holds no seat, and on a governed one whose seat monitor could not be
+    /// asked. Present and refusing is the first thing to read when every
+    /// prompt is coming back with code -32014 or -32015.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entitlement: Option<EntitlementStatus>,
+}
+
+/// What the seat monitor reports about this install's entitlement.
+///
+/// The three states an operator triages on are `entitled`, `unavailable`
+/// (the plane could not confirm and the grace has run out) and a refusal,
+/// which reports as the specific reason rather than a generic "refused":
+/// `seat_revoked`, `seat_expired`, `seat_not_active`, `no_seat`,
+/// `install_not_active`, `install_unbound` or `credential_rejected`. A daemon
+/// that has never had an answer reports `unchecked`, which is deliberately
+/// not the same word as `unavailable`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct EntitlementStatus {
+    /// Where the entitlement stands, in one word.
+    pub state: String,
+    /// The `Seat` row this install is running on, when one entitles it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat: Option<String>,
+    /// That seat's tier: `standard` or `elevated`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+    /// The refusal in prose, when the plane said no. This is the sentence an
+    /// operator acts on, and the same one the error frame carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The organization's impact level, which is where the grace comes from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub impact_level: Option<String>,
+    /// When the plane last confirmed the standing, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<String>,
+    /// How long that confirmation may be spent without the plane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grace_secs: Option<u64>,
+    /// When it stops being spendable, RFC 3339. Absent for a refusal, which
+    /// has no grace, and for a daemon that has never had an answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grace_until: Option<String>,
+    /// When the monitor will look again, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_check_at: Option<String>,
+    /// How often it looks.
+    pub check_interval_secs: u64,
+    /// How many times the plane has answered since this daemon started.
+    ///
+    /// Zero with a cached standing present means this process is running on
+    /// what the last one learned, which is a different statement from having
+    /// confirmed anything itself.
+    #[serde(default)]
+    pub checks: u64,
+    /// What the last check failed with, when it failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 /// What the daemon's credential holder reports about reaching the plane.

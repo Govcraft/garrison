@@ -128,3 +128,20 @@ auto_approve = ["read_file", "glob", "grep", "list_directory", "calculate", "get
 # consulted once, at first enrollment: the install binds to the operator's
 # row, so a later rename in the directory does not affect an enrolled install.
 # operator_upn = "dev@agency.gov"
+#
+# How often the daemon reconfirms that it still holds a seat. Default 60
+# seconds, clamped to 15..900. One check is three reads through the same
+# bearer every other subsystem spends: this install's row, its operator's
+# seats, and the organization. A turn is gated on the answer already in hand,
+# so this is what decides how quickly a revocation reaches a running daemon,
+# not what a prompt waits on.
+# seat_check_secs = 60
+#
+# A ceiling on how long a confirmed seat may be spent while the plane cannot
+# be reached. The window itself comes from the organization's impact_level and
+# the seat's tier (72h down to zero; see docs/control-plane.md, "Seat
+# entitlement"). This setting may only shorten that window and can never
+# lengthen it: a deployment may be stricter than its impact level requires,
+# never more generous. A revoked seat gets no window at all, whatever this
+# says, because a refusal is an answer rather than an outage.
+# offline_grace_secs = 3600

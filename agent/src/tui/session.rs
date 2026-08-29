@@ -187,6 +187,7 @@ pub fn describe_status(status: &acp::GarrisonStatus) -> Vec<Line<'static>> {
             status.sessions, status.policy.approval_timeout_secs
         )),
         notice_line(approvals),
+        notice_line(describe_entitlement(status.entitlement.as_ref())),
         notice_line(if status.audit.enabled {
             status.audit.chain_head.as_ref().map_or_else(
                 || "audit: recording".to_string(),
@@ -197,6 +198,31 @@ pub fn describe_status(status: &acp::GarrisonStatus) -> Vec<Line<'static>> {
         }),
         notice_line(describe_sandbox(&status.sandbox)),
     ]
+}
+
+/// One line on whether a seat entitles this install to run at all.
+///
+/// Pure. A standalone agent says so rather than being silent about it: an
+/// operator reading `/status` in a governed deployment and seeing nothing
+/// about seats would reasonably conclude the check was passing.
+fn describe_entitlement(status: Option<&acp::EntitlementStatus>) -> String {
+    let Some(status) = status else {
+        return "seat: standalone, this agent answers to no control plane".to_string();
+    };
+
+    match status.reason.as_deref() {
+        Some(reason) => format!("seat: {} - {reason}", status.state),
+        None => {
+            let mut line = format!("seat: {}", status.state);
+            if let Some(tier) = status.tier.as_deref() {
+                line.push_str(&format!(" ({tier})"));
+            }
+            if let Some(checked) = status.checked_at.as_deref() {
+                line.push_str(&format!(", confirmed {checked}"));
+            }
+            line
+        }
+    }
 }
 
 /// One line on what stands between a tool call and the host.
@@ -738,6 +764,7 @@ mod tests {
             },
             threads: None,
             plane: None,
+            entitlement: None,
         };
 
         let rendered: String = describe_status(&status)

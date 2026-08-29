@@ -61,6 +61,14 @@ described below is direction, not checkout.
   and a retired install are each their own refusal, and a refusal is never
   reported as an outage. See
   [docs/control-plane.md](docs/control-plane.md).
+- Seat entitlement the daemon enforces: an enrolled install runs only while
+  the plane says it holds a live seat. Every turn passes a gate that spends
+  the seat, a seat revoked mid-turn ends the turn it is running rather than
+  letting it finish, and a plane that cannot be reached buys a window set by
+  the organization's impact level rather than an indefinite one. "Your seat
+  was revoked" and "your plane is unreachable" are two different refusals with
+  two different codes, each explained in prose. See
+  [docs/control-plane.md](docs/control-plane.md#seat-entitlement-from-the-agents-side--agentsrcentitlement).
 - acton-ai policy, accounting, audit, planning, context, MCP, and tool-loop
   primitives where enabled by configuration.
 

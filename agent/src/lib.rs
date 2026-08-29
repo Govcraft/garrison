@@ -10,6 +10,7 @@ pub mod config;
 pub mod daemon;
 pub mod duplex;
 pub mod enrollment;
+pub mod entitlement;
 pub mod error;
 pub mod launch;
 pub mod lsp;
