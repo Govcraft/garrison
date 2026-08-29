@@ -257,6 +257,24 @@ impl Daemon {
     }
 }
 
+/// Kills a daemon nobody stopped.
+///
+/// `std::process::Command` has no `kill_on_drop`, and both `start` and `stop`
+/// assert. Without this, any panic between the spawn and the stop leaves a
+/// `garrison-agent serve` running for the rest of the machine's uptime,
+/// holding its temp fixture open. `try_wait` reports the cached status for a
+/// child that was already reaped, so a daemon stopped properly is left alone
+/// rather than having its pid signalled a second time after the kernel is free
+/// to hand that number to somebody else.
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
 /// Sends one signal to a child process.
 ///
 /// Through `kill(1)` rather than through `libc`, deliberately: this is the
