@@ -429,6 +429,13 @@ as an observation, and it is the field a reviewer will ask about.
 `total_tokens` is `@compute("input_tokens + output_tokens")` — server-derived
 at write time, overwriting whatever a client sends.
 
+A session whose history was compacted reports more tokens, not fewer: each
+pass is a summarization request to the session's own provider, and its usage
+is part of the turn's. The compaction itself is not an audit entry, because no
+tool ran and nobody authorized anything; the chain an install reports is the
+same length either way. See "Compaction, persisted sessions, and audit
+evidence" in [garrison-agent-design.md](garrison-agent-design.md).
+
 ### Policy — `schemas/policy.schema`
 
 | Schema | What it answers |

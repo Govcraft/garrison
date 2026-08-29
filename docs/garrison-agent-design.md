@@ -124,20 +124,29 @@ already covers the skills half.
 - `get_context_remaining` is exposed *as a tool* so the model can see its own
   budget.
 
-→ **Available upstream, Garrison integration incomplete:** acton-ai 0.33.0 has
-context truncation, model-generated compaction, libSQL persistence,
+→ **Available upstream, compaction wired, persistence incomplete:** acton-ai
+0.35.0 has context truncation, model-generated compaction, libSQL persistence,
 fingerprinted checkpoint/resume, and the `get_context_remaining` builtin.
-Garrison enables the builtin but does not configure compaction or attach its
-ACP sessions and turns to acton-ai persistence/checkpoints.
+Garrison enables the builtin and exposes compaction as configuration
+(`[context] auto_compact` in `acton-ai.toml`): a pass is announced to the
+owning session as `_garrison/session/compacted`, summarized in the prompt
+response's `_meta`, counted at `_garrison/status`, and adopted into the
+session's stored history. Attaching ACP sessions and turns to acton-ai
+persistence and checkpoints remains to do. See section 6.
 
 ### 1.9 Plan tool
 `update_plan`: the model maintains a structured step list with states; the
 prompt tells it when planning is worth it ("skip for the easiest 25%; never
 single-step plans"). Cheap to build, large effect on multi-file task quality.
 
-→ **Available upstream, protocol integration planned:** acton-ai 0.33.0 ships
-the `update_plan` builtin and `PlanUpdated` turn events. Garrison enables the
-tool but does not yet translate structured plan events to ACP.
+→ **Implemented:** acton-ai 0.35.0 ships the `update_plan` builtin and
+`PlanUpdated` turn events. Garrison enables the tool, auto-approves it (it
+writes nothing and is declared idempotent upstream), and routes each broadcast
+plan through the turn router to the one session that owns the turn, as a
+spec-native ACP `plan` update with Garrison's correlation in `_meta`. The
+turn's final plan is repeated in the prompt response's `_meta`, so a client
+that missed an event still ends the turn agreeing with the agent about what
+the plan was.
 
 ### 1.10 Review mode
 Dedicated prompts (`review_request.rs`, `review_exit.rs`) and prompt rules:
@@ -167,8 +176,9 @@ renders the approve/deny UI), turn diffs as events.
 → **Implemented in part:** Garrison speaks ACP v1 as newline-delimited JSON-RPC
 over stdio and Unix-domain sockets. It implements initialize; session create,
 load, list, prompt, and cancel; token and tool events; approval round-trips;
-and a namespaced status method. Windows named pipes, turn diffs, plan events,
-and first VS Code and JetBrains clients now exercise that protocol.
+a namespaced status method; and plan and compaction events. Windows named
+pipes, turn diffs, and first VS Code and JetBrains clients now exercise that
+protocol.
 
 ## 2. What acton-ai already provides (don't rebuild)
 
@@ -194,7 +204,7 @@ means every §1 item has a socket to plug into.
 | apply_patch | **garrison-agent** (`agent/`) — implemented | Coding-domain structural editing and root-aware safety |
 | ACP server, sessions, approval round-trip, LSP tools | **garrison-agent** (`agent/`) — implemented | Editor-facing product protocol and code intelligence |
 | execpolicy, git-utils, AGENTS.md, PTY sessions, turn diff, review mode, coding prompts, Bitbucket DC | **garrison-agent** (`agent/`) — planned | Coding-domain; acton-ai stays a general framework |
-| Compaction, checkpoint/resume, `get_context_remaining`, plan tool/events | **acton-ai upstream** — implemented in 0.33.0 | Garrison still needs to enable or expose the relevant pieces |
+| Compaction, checkpoint/resume, `get_context_remaining`, plan tool/events | **acton-ai upstream** — implemented in 0.35.0 | Garrison exposes compaction and plan events; checkpoint/resume is still to wire |
 | Central policy pull, audit push | **garrison-agent ↔ control plane** | Product glue over acton-ai's policy/audit APIs |
 
 ## 4. Actor topology (garrison-agent)
@@ -230,10 +240,59 @@ client identity.
    "enterprise policy-control functionality, and agentic capability scope")
 5. **Turn diff tracker + repo context** (Tier B review gate artifact)
 6. **Coding system prompt + AGENTS.md discovery**
-7. **Integrate acton-ai capabilities:** persistent ACP sessions/checkpoints,
-   compaction configuration, and ACP plan events
+7. **Integrate acton-ai capabilities:** persistent ACP sessions/checkpoints
+   (~~compaction configuration and ACP plan events~~: implemented, see
+   section 6)
 8. **Review mode + PTY unified exec**
 9. **Bitbucket DC PR review** (review mode over REST API)
 
 Items 3–6 are the current agent-critical path. Control-plane, extension, and
 compliance work is tracked separately from this agent implementation plan.
+
+## 6. Compaction, persisted sessions, and audit evidence
+
+Compaction rewrites what the model is told. Three readers care about a
+session's history for different reasons, and the rules below are what keep
+them from disagreeing about what happened.
+
+**Plans are audit evidence; compaction is not.** A plan reaches a client
+because the model called `update_plan`, and that call passes the policy gate
+and the audit actor like any other tool call. The plan the client renders and
+the plan in the audit trail are one event seen twice. Compaction is not a tool
+call: nothing an operator authorized happened, so nothing is appended to the
+chain.
+
+**The chain never shortens.** Compaction elides messages, not entries. A
+compacted session's audit chain is the chain the same session would have had
+without compaction, so `chain_head` at `_garrison/status` stays meaningful
+across a long conversation. What a compacted turn does cost is tokens: the
+summary is a paid request to the turn's own provider, and it lands in the same
+usage the turn reports.
+
+**A persisted session stores the adopted history, not the original.** The
+prompt loop compacts its own copy of the messages and hands back one
+`CompactionRecord` per pass. Garrison replays those records onto the session's
+history with `CompactionRecord::adopt` before it appends the answer, so the
+session actor holds exactly what the next turn will send. Keeping the
+pre-compaction history alongside the records would leave two sources of truth,
+one of them stale, and a `session/load` would replay messages the model can no
+longer see. A record's `elided_prefix_len` can name more messages than the
+session owns, because the loop's copy also carried this turn's tool rounds;
+adoption clamps rather than eating into the answer.
+
+**A summary is labelled, not disguised.** The adopted summary is a user
+message whose text opens with acton-ai's compaction notice, which is how the
+model, a stored session, and a replay all tell it apart from something the
+operator said. On `session/load` Garrison replays it as an agent thought
+rather than as user text, so nobody reads the framework's words as the
+operator's.
+
+**Compaction is off unless the operator turns it on.** `[context]
+auto_compact` in `acton-ai.toml` is the only switch, and Garrison sets no
+default in code. The resolved policy and the number of passes are readable at
+`_garrison/status` under `context`; each pass is announced to the owning
+session as `_garrison/session/compacted`; every pass of a turn is summarized
+in the prompt response's `_meta.garrison.compactions`, counts only, never the
+summary text. A summarization request that fails or is refused changes
+nothing: the turn proceeds with its full history and takes its chances at the
+provider.
