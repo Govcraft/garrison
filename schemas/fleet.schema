@@ -51,6 +51,11 @@ schema AgentInstall {
     enrolled_at:       datetime @default("now")
     last_heartbeat:    datetime
 
+    // How this machine got into the fleet, and every key it has held since.
+    // The credential rotation chain hangs off the newest of these.
+    enrolled_via:      -> EnrollmentToken
+    credentials:       -> InstallCredential[]
+
     sessions:          -> AgentSession[]
 }
 

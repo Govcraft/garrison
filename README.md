@@ -33,10 +33,11 @@ the federal product described below is direction, not checkout.
   `edit_file` run in a re-exec'd child with resource limits and, on Linux,
   landlock and seccomp hardening, confined to the session's root.
 - Provider login/logout helpers and a `ping` smoke client.
-- The control plane's administrative entity model: 13 SchemaForge schemas
-  covering tenancy, operators and seats, the install fleet, policy bundles and
-  command rules, approved model endpoints, and audit-chain aggregation —
-  lowering into a 137-policy, strict-mode-validated Cedar bundle. See
+- The control plane's administrative entity model: 15 SchemaForge schemas
+  covering tenancy, operators and seats, machine identity for the daemons, the
+  install fleet, policy bundles and command rules, approved model endpoints,
+  and audit-chain aggregation — lowering into a 156-policy, strict-mode-
+  validated Cedar bundle. See
   [docs/control-plane.md](docs/control-plane.md).
 - acton-ai policy, accounting, audit, planning, context, MCP, and tool-loop
   primitives where enabled by configuration.

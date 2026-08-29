@@ -20,11 +20,14 @@ the two gates that run without a database:
 task plane:check      # parse the schemas, then strict-mode validate the Cedar bundle
 ```
 
-13 schemas lower into 129 generated Cedar policies; 8 hand-written policies in
-`policies/custom/` bring the bundle to 137, all strict-mode validated. The model
-has also been applied end to end against a throwaway PostgreSQL 17 instance: 22
-migration steps, 13 tables, every `unique` constraint and every CEL rule
-type-checked at apply time. That database was discarded.
+15 schemas lower into 146 generated Cedar policies; 10 hand-written policies in
+`policies/custom/` bring the bundle to 156, all strict-mode validated. The model
+has also been applied end to end against a throwaway PostgreSQL 17 instance: 26
+migration steps, 15 tables, every `unique` constraint and every CEL rule
+type-checked at apply time. The server was then run against it and the
+authorization and write-time rules exercised over HTTP — hidden-field
+rejection, both delete `forbid`s, and every `@require` on both its passing and
+its failing branch. That database was discarded.
 
 Tooling: `schemaforge` 0.37.2, PostgreSQL flavor.
 
@@ -52,7 +55,7 @@ the agent needs a console account.
 
 ## The model
 
-Five files, thirteen schemas, one tenancy root.
+Six files, fifteen schemas, one tenancy root.
 
 ### Tenancy — `schemas/organization.schema`
 
@@ -77,12 +80,65 @@ agent presents and can change. `Seat` carries the offboarding lever, and a
 `@require` rule makes revocation state what it is for — a revoked seat with no
 recorded reason is rejected at write time, in-process, before any hook.
 
+### Machine identity — `schemas/credential.schema`
+
+| Schema | What it answers |
+|---|---|
+| `EnrollmentToken` | Who authorized this machine to join, and is that grant spent |
+| `InstallCredential` | What key does this daemon sign with, and is it still good |
+
+An `Operator` is a human with an Entra token. A daemon heartbeats at 03:00 with
+nobody logged in, so it cannot borrow that token and needs an identity of its
+own. The split is along the only line that matters: what is secret and what is
+not.
+
+`InstallCredential` stores **public verification material only** — a base64
+SPKI public key, and for the mTLS variant the certificate fingerprint
+acton-service pins against. The daemon generates its keypair at enrollment and
+never transmits the private half. A shared bearer secret was considered and
+rejected: it would put a replayable credential in the database, on the wire at
+every heartbeat, and in a file on every workstation, which is three copies of
+something that only needs to exist in one place.
+
+`EnrollmentToken` is the one unavoidable secret, and it is spent once.
+`secret_hash` is `@hidden`, which means more than "not serialized": SchemaForge
+rejects any request body that so much as names a hidden field. Combined with
+`required`, that makes an enrollment token **impossible to mint through the
+generic CRUD API by anyone, including `platform_admin`** — verified, not
+assumed:
+
+```
+POST /api/v1/forge/schemas/EnrollmentToken/entities   (secret_hash in body)
+  422  fields cannot be set via the API (marked @hidden): secret_hash
+POST /api/v1/forge/schemas/EnrollmentToken/entities   (secret_hash omitted)
+  422  required field 'secret_hash' is missing
+```
+
+Minting is therefore a server-side route writing through the storage layer.
+That is a constraint, not an oversight: a provisioning credential you can POST
+into existence is one an over-broad token can POST into existence.
+
+Neither schema is deletable. `policies/custom/credential-lifecycle.cedar`
+carries a `forbid` on both delete actions for the same reason the audit trail
+has one — the record that a key existed, was used from these addresses, and was
+revoked on this date for this reason is the only evidence the revocation
+happened. Rotation does not need deletion: a superseded credential moves to
+`rotating` then `revoked`, and the self-referencing `supersedes` field keeps the
+chain walkable back to enrollment.
+
+`InstallCredential.status` carries a cross-entity `@require` — a retired install
+cannot hold an active credential — resolved through the `related.install.status`
+single-hop read, with the caller's tenant scope applied.
+
 ### Fleet — `schemas/fleet.schema`
 
 | Schema | What it answers |
 |---|---|
 | `AgentInstall` | Which daemons exist, on what, running which version |
 | `AgentSession` | What one ACP conversation cost and how it ended |
+
+`AgentInstall.enrolled_via` and `credentials` are the provenance chain: which
+provisioning token admitted this machine, and every key it has held since.
 
 `AgentInstall.sandbox_hardening` and `isolation_active` are reported by the
 install's own `_garrison/status`, not asserted by the console. That is the
@@ -256,8 +312,11 @@ are failures the runtime would otherwise refuse to hot-swap after merge.
 
 ## Known gaps
 
-- **No ingest.** `PlaneSync` in the agent's actor topology is unbuilt; nothing
-  pushes audit or pulls bundles yet.
+- **No daemon-side client.** The agent has never spoken to the plane. There is
+  no enrollment, no heartbeat, no bundle pull, no audit shipping, and no
+  `[control_plane]` section in `GarrisonConfig` — its only outbound network
+  auth is to model providers. `schemas/credential.schema` describes the
+  identity a daemon would present; nothing generates or presents one yet.
 - **Schemas are unsigned.** Every command prints `schema signature
   verification is disabled (signing.mode = off)`. SchemaForge can require
   ed25519, SSH allowed-signers, or cosign-keyless signatures over `schemas/`
