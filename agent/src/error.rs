@@ -50,6 +50,18 @@ pub enum GarrisonErrorKind {
         /// What the plane said, or what stopped it being asked.
         reason: String,
     },
+    /// The session store could not answer.
+    ///
+    /// Its own kind because a store that cannot be reached is not a
+    /// configuration mistake and not a failed turn: it is the persistence a
+    /// session's survival depends on being unavailable right now, and every
+    /// caller of it has to fail closed rather than carry on unrecorded.
+    Store {
+        /// What was being attempted, e.g. `resolve` or `append`.
+        operation: String,
+        /// Why it could not be done.
+        reason: String,
+    },
     /// A turn could not be run to completion.
     TurnFailed {
         /// Why it failed.
@@ -145,6 +157,15 @@ impl GarrisonError {
     #[must_use]
     pub fn enrollment(reason: impl Into<String>) -> Self {
         Self::new(GarrisonErrorKind::Enrollment {
+            reason: reason.into(),
+        })
+    }
+
+    /// The session store could not answer.
+    #[must_use]
+    pub fn store(operation: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::new(GarrisonErrorKind::Store {
+            operation: operation.into(),
             reason: reason.into(),
         })
     }
@@ -260,6 +281,9 @@ impl fmt::Display for GarrisonError {
             }
             GarrisonErrorKind::UnknownThread { thread_id } => {
                 write!(f, "no such thread: {thread_id}")
+            }
+            GarrisonErrorKind::Store { operation, reason } => {
+                write!(f, "the session store could not {operation}: {reason}")
             }
             GarrisonErrorKind::TurnFailed { reason } => write!(f, "turn failed: {reason}"),
             GarrisonErrorKind::PatchParse { line, reason } => {

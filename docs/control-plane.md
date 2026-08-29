@@ -835,6 +835,187 @@ either direction. This rule lives in exactly one function,
 `GarrisonConfig::audit_required`, because more than one subsystem asks it and
 they must get the same answer.
 
+## Sessions that outlive the process
+
+A daemon restarts: it is upgraded, a supervisor bounces it, the machine
+reboots. Without persistence every conversation an operator was having ends at
+that moment, and the trail above acquires a gap exactly where a reader most
+wants continuity. This section, like the audit one, is the agent's, and **the
+plane is not on this path either**: persistence is local, and no turn is ever
+refused because a control plane was unreachable.
+
+### What is stored, and who owns it
+
+acton-ai's `MemoryStore` owns a libSQL database, armed by `[checkpoint]` in
+`acton-ai.toml`. Garrison writes four things into it and reimplements none of
+them.
+
+| Row | What it holds | Written |
+|---|---|---|
+| session | Keyed by the ACP session id itself, so a client's `sessionId` *is* the lookup key | on `session/new` |
+| conversation | The message history the next turn sends | after every turn; rewritten in place when compaction elides a prefix, so the record follows the pointer |
+| metadata | The canonical root, the client kind, the install/tenant/operator the session is attributed to, turn and token counts, and the turn that was open when it was last written | on create, when a turn opens, and when a turn settles |
+| turn checkpoint | acton-ai's own record of a turn in progress, one per provider round | by the prompt loop |
+
+The session row is written **before `session/new` answers**. A client holding
+an id the store has never heard of is a session that vanishes at the next
+restart with nothing to say about why, so the write is what the id is issued
+against; a store that will not take it is `-32018` and no session at all.
+
+Attribution is filled from the enrollment record when there is one, so a
+governed install's sessions already carry the install and tenant an
+`AgentSession` row wants. Shipping them to the fleet view is an addition
+rather than a redesign.
+
+### Two fail-closed rules
+
+Both live in one pure function, `session::keeper::gate_decision`, and reach
+the turn path through the same admission seam the seat, policy and audit gates
+use.
+
+| Condition | Code | Consequence |
+|---|---|---|
+| The store cannot be reached, or answered with an error | `-32018` `STORE_UNAVAILABLE` | Every turn is refused. "I cannot find out whether this will be saved" and "this will not be saved" have the same consequence for the record |
+| The session's own record names a turn that is still open | `-32019` `TURN_INTERRUPTED` | That session refuses *new* prompts until an operator resumes or abandons the old one |
+
+The second is deliberately automatic in neither direction. Silently restarting
+the turn would re-run tools that have already run and be paid for twice;
+silently dropping it would throw away work the operator asked for. This is
+also why `[checkpoint] policy` must be `resume_on_request`: **`resume_auto` is
+refused at startup** (exit 2), because a turn resumed in the background would
+settle its pending tool calls with no client connected to approve them, which
+is the one thing a governed agent may never do.
+
+A session created before the store came up has no stored record at all. That
+is not an interrupted turn, and it is admitted: it runs in memory alone, as
+every session did before this existed.
+
+### Reopening a session
+
+`session/load` is the one call that reaches a session this connection never
+opened — which, after a restart, is every session there is. When the
+supervisor holds no live actor for the id, the daemon reads the record back,
+**re-checks the stored root against the approved roots** (an administrator may
+have narrowed them since, and a stored record is not a way around the
+boundary), rebuilds the session, and replays its history as `session/update`
+events before the response, which is the ordering ACP asks for.
+
+A stored session whose root is no longer approved is `-32020`
+`SESSION_ROOT_UNAPPROVED` rather than a generic bad-parameters refusal, and
+the record is left alone: the session is not deleted, it is simply not opened,
+and re-approving the tree brings it back.
+
+If that session was holding an interrupted turn, the response says so:
+
+```json
+{
+  "_meta": {
+    "garrison": {
+      "interruptedTurn": {
+        "turnId": "turn_01m17…",
+        "startedAt": "2026-08-29T14:02:11Z",
+        "prompt": "refactor the parser",
+        "roundsCompleted": 3,
+        "resumable": true
+      }
+    }
+  }
+}
+```
+
+`roundsCompleted` and `resumable` come from the checkpoint. A checkpoint that
+cannot be read makes the turn *unresumable* rather than unreportable: the
+operator still needs to know the session is blocked, and abandoning it is
+still open to them.
+
+Two extension methods settle it. Both take `{"sessionId": …}`, and both answer
+`-32021` `NO_INTERRUPTED_TURN` when there is nothing to settle — never a
+silently restarted turn, and never a pretended one.
+
+| Method | Answers | Shape |
+|---|---|---|
+| `_garrison/session/resume` | deferred, resolved when the turn ends | Exactly like `session/prompt`, because it *is* the same turn: same identifier, carrying on from the round its checkpoint stopped at. The prompt replayed comes from the record, so a client that never saw the original still sees what was asked |
+| `_garrison/session/abandon` | `{"turnId": "turn_…"}` | Immediate. The record is cleared and the checkpoint marked abandoned, and the session is promptable again |
+
+Abandon is what keeps fail-closed from meaning stuck. Both of its halves are
+best effort and neither is retried: the operator has said the work is not
+wanted, and the metadata write is the one the gate reads.
+
+`session/list` merges the live sessions this connection holds with the stored
+ones it does not, filtered by the requested `cwd`, so an editor reopening a
+project is offered the conversations belonging to it. A stored name that is
+not one of Garrison's identities belongs to some other writer of that database
+and is never offered.
+
+### Retention
+
+Persistence without retention is a growing disk and a growing disclosure:
+every prompt an operator ever typed, kept forever, on a machine an agency has
+to be able to say something definite about. `garrison.toml`'s `[sessions]`
+owns the window. The sweep runs at startup — a daemon that has been down for a
+month should not carry that month's expired sessions until tomorrow — and
+every `sweep_interval_hours` after, and its plan is a pure function,
+`session::plan_retention`.
+
+```toml
+[sessions]
+required = true            # inferred: required exactly when [plane] is present
+retain_days = 30
+sweep_interval_hours = 24  # zero is read as one, in both keys
+```
+
+Three of the sweep's four rules are refusals to delete:
+
+- a session touched inside the window stays;
+- a session whose last-active date this daemon cannot parse stays, because a
+  date it cannot read is not evidence that the session is stale;
+- **a session holding an interrupted turn stays at any age**, because the
+  operator has not said whether to resume it and sweeping it would make that
+  decision for them.
+
+The fourth deletes a checkpoint in a terminal state whatever its age: a
+completed turn is already committed to the session's history, and an abandoned
+one was abandoned on purpose. In-progress and failed records are precisely
+what a resume needs, so they leave only when their session does.
+
+### When a store is required
+
+The same rule as the trail, for the same reason. **A `[plane]` section present
+while `acton-ai.toml` arms no `[checkpoint]` is a refusal to start** (exit 2):
+an operator whose work vanishes on every upgrade has not been given a governed
+agent, only an unreliable one. A standalone install with no `[plane]` starts
+without a store, with a warning, so first-run in an editor works. `[sessions]
+required = true|false` overrides the inference in either direction, and the
+rule lives in exactly one function, `GarrisonConfig::sessions_required`.
+
+`db_path` must be an **absolute per-user path**. It is resolved against the
+daemon's working directory and is not tilde-expanded, and that directory is
+`$HOME` under systemd and under relay autostart. Omitting the key is worse
+than getting it wrong: acton-ai then defaults to `acton-ai-checkpoints.db`
+beside wherever the daemon happened to start, so an operator would get a
+different set of sessions per directory. Same rule, and same reason, as the
+trail's `path`.
+
+### What `_garrison/status` reports
+
+```json
+"sessionStore": {
+  "healthy": true,
+  "sessions": 12,
+  "interrupted": 1,
+  "lastCheckpoint": "ckpt_01m17…",
+  "retainDays": 30,
+  "lastSwept": "2026-08-29T03:00:00Z"
+}
+```
+
+`healthy: false` is the refusing state: turns are being turned away until the
+store answers again, and `lastError` says what it last failed at. `interrupted`
+counts the sessions that will refuse a prompt until somebody decides about
+them. The whole field is absent on an install that persists nothing, which is
+the standalone case saying so plainly rather than reporting a healthy store
+that does not exist.
+
 ## Write-time rules: `@default` is what binds a value for `@require`
 
 A `@require` predicate is evaluated against the in-flight write. A field the

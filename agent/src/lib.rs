@@ -17,6 +17,7 @@ pub mod patch;
 pub mod plane;
 pub mod protocol;
 pub mod router;
+pub mod session;
 pub mod thread;
 pub mod tui;
 pub mod types;

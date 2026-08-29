@@ -237,7 +237,9 @@ pub async fn build_setup(
     let supervisor = spawn_supervisor(&mut runtime).await;
     let lsp = spawn_lsp(&mut runtime, config, &project_root).await;
     let plane = spawn_plane(&mut runtime, config.plane.as_ref(), enrollment.clone()).await?;
+    let attribution = attribution(enrollment.as_ref());
     let audit = spawn_audit(&mut runtime, ai, config, enrollment).await?;
+    let sessions = spawn_sessions(&mut runtime, ai, config).await?;
 
     // Ordered lists, because order is the contract: gates are asked first to
     // last and the first refusal wins; describers fill the status in sequence.
@@ -248,12 +250,17 @@ pub async fn build_setup(
         gates.push(keeper.clone());
         describers.push(keeper);
     }
+    let store = sessions.map(|(keeper, store)| {
+        gates.push(keeper.clone());
+        describers.push(keeper);
+        store
+    });
 
     Ok(ServerSetup {
         supervisor,
         runtime: ai.clone(),
         router,
-        defaults: thread_defaults(config, project_root, lsp, gates),
+        defaults: thread_defaults(config, project_root, lsp, gates, store, attribution),
         capabilities: capabilities(),
         audited: ai.is_audited(),
         sandbox,
@@ -352,6 +359,19 @@ async fn spawn_audit(
     crate::audit::spawn(runtime, ai, config, install).await
 }
 
+/// Session persistence, or a refusal to start without it.
+///
+/// Returns the keeper — which is both a turn gate and a status describer — and
+/// the store handle every session is written through. `None` on an install
+/// that arms no `[checkpoint]` database and does not require one.
+async fn spawn_sessions(
+    runtime: &mut ActorRuntime,
+    ai: &ActonAI,
+    config: &GarrisonConfig,
+) -> Result<Option<(ActorHandle, crate::session::SessionStore)>, GarrisonError> {
+    crate::session::spawn(runtime, ai, config).await
+}
+
 /// The configured language servers.
 ///
 /// Eager, so rust-analyzer indexes while the first prompt is still being
@@ -391,6 +411,8 @@ fn thread_defaults(
     project_root: PathBuf,
     lsp: crate::lsp::LspRegistry,
     gates: Vec<ActorHandle>,
+    store: Option<crate::session::SessionStore>,
+    attribution: crate::session::Attribution,
 ) -> ThreadDefaults {
     let mut roots = vec![project_root.clone()];
     roots.extend(config.threads.workspace_roots.iter().cloned());
@@ -403,6 +425,23 @@ fn thread_defaults(
         auto_approve: Arc::new(config.approval.auto_approve.clone()),
         lsp: Arc::new(lsp),
         gates,
+        store,
+        attribution,
+    }
+}
+
+/// Who the sessions this daemon opens belong to.
+///
+/// Pure. An unenrolled install has nothing to say here, and its sessions are
+/// stored unattributed on purpose: there is no tenant to attribute them to.
+/// The operator is not yet named because enrollment identifies the machine
+/// rather than the person at it; the field exists so directory identity has
+/// somewhere to land without a second migration.
+fn attribution(enrolled: Option<&crate::enrollment::Record>) -> crate::session::Attribution {
+    crate::session::Attribution {
+        install: enrolled.map(|record| record.install.clone()),
+        organization: enrolled.map(|record| record.organization.clone()),
+        operator_upn: None,
     }
 }
 
