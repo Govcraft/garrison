@@ -212,7 +212,7 @@ jobs:
           stage="garrison-$VERSION-$TARGET"
           mkdir -p "$stage/docs"
           cp "target/$TARGET/release/garrison-agent" "$stage/"
-          cp README.md "$stage/"
+          cp README.md LICENSE "$stage/"
           cp docs/compatibility.md docs/control-plane.md "$stage/docs/"
 
           if [ "$HOOKS" = "true" ]; then
