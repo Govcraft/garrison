@@ -864,8 +864,9 @@ struct TurnJob {
 }
 
 /// Discovers this turn's `AGENTS.md` project instructions, gated by whatever
-/// governs this install, and returns the fragment to append to the system
-/// prompt. `None` when discovery is disabled, found nothing, or failed.
+/// governs this install. Returns the fragment to append to the system prompt
+/// together with the fingerprints the turn's audit entry seals, or `None` when
+/// discovery is disabled, found nothing, or failed.
 ///
 /// # Fail-closed, and one deliberate exception
 ///
@@ -882,7 +883,7 @@ struct TurnJob {
 /// swallowed rather than failing the turn: a turn that could not read
 /// `AGENTS.md` should still run, the same way a turn missing its optional
 /// system prompt still runs.
-async fn discovered_agents_md(setup: &ThreadSetup) -> Option<String> {
+async fn discovered_agents_md(setup: &ThreadSetup) -> Option<crate::instructions::Discovered> {
     let policy = match &setup.policy {
         Some(handle) => match handle
             .ask(crate::policy::agent::CurrentAgentsMdPolicy)
@@ -915,19 +916,21 @@ async fn discovered_agents_md(setup: &ThreadSetup) -> Option<String> {
     ) {
         Ok(discovered) if discovered.is_empty() => None,
         Ok(discovered) => {
-            for layer in &discovered.layers {
-                // Interim, non-chained: the sealed audit chain has no field
-                // for this yet. See Govcraft/acton-ai#18 and
-                // Govcraft/garrison#29.
+            for source in &discovered.layers {
+                // Operational visibility, not the record: these same
+                // fingerprints are sealed into the turn's audit entry, which
+                // is what an auditor reads. This is here so an operator
+                // tailing logs can see what steered a turn without opening
+                // the trail.
                 tracing::info!(
                     thread_id = %setup.thread_id,
-                    scope = layer.scope,
-                    path = %layer.path.display(),
-                    blake3 = %layer.blake3,
+                    scope = ?source.scope,
+                    path = %source.path.display(),
+                    content_hash = %source.content_hash,
                     "AGENTS.md instructions loaded for this turn",
                 );
             }
-            Some(discovered.context_fragment)
+            Some(discovered)
         }
         Err(error) => {
             tracing::warn!(
@@ -1091,7 +1094,11 @@ async fn drive_turn(
     // call rather than two: a second call here would silently discard
     // whichever call ran first.
     let agents_md = discovered_agents_md(setup).await;
-    let system = match (&setup.system_prompt, agents_md) {
+    let (fragment, context_sources) = match agents_md {
+        Some(discovered) => (Some(discovered.context_fragment), discovered.layers),
+        None => (None, Vec::new()),
+    };
+    let system = match (&setup.system_prompt, fragment) {
         (Some(configured), Some(fragment)) => Some(format!("{configured}\n\n{fragment}")),
         (Some(configured), None) => Some(configured.clone()),
         (None, Some(fragment)) => Some(fragment),
@@ -1100,6 +1107,13 @@ async fn drive_turn(
     if let Some(system) = system {
         builder = builder.system(system);
     }
+    // Seals which project instructions steered this turn into its own audit
+    // entry: scope, path, and content hash, never the content. Set
+    // unconditionally — an empty list is the honest record for a turn no
+    // `AGENTS.md` reached, and acton-ai skips the field entirely when empty,
+    // so a turn without instructions hashes over exactly the bytes it did
+    // before this existed.
+    builder = builder.context_sources(context_sources);
     // Named so the checkpoint carries the identity the client was told, and
     // pointed at the conversation the metadata names rather than the one the
     // store minted; compaction moves that pointer, and the record follows it.

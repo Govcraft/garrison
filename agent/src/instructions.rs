@@ -25,7 +25,14 @@
 //! - **Labeled.** The rendered fragment says, in the model's own context, that
 //!   what follows is project content and not an instruction from whoever is
 //!   running this session — defense in depth, not the boundary itself.
+//! - **Sealed.** Every layer that survives the gate is named in the turn's own
+//!   audit entry as an [`acton_ai::audit::ContextSource`] — scope, path, and a
+//!   BLAKE3 of the content, never the content — so the answer to "what steered
+//!   this turn" is hash-chained alongside the answer to "what did this turn
+//!   do", rather than sitting in a side-channel log that can be edited or
+//!   dropped without detection.
 
+use acton_ai::audit::ContextSource;
 use acton_ai::instructions::{AgentInstructions, InstructionLayer, InstructionScope};
 use garrison_policy::AgentsMdDiscovery;
 use std::path::{Path, PathBuf};
@@ -38,8 +45,17 @@ pub struct Discovered {
     /// The untrusted-content block to append to the turn's system prompt.
     /// Empty when nothing was found or discovery is disabled.
     pub context_fragment: String,
-    /// One row per layer actually injected, in the order injected.
-    pub layers: Vec<LoadedLayer>,
+    /// One fingerprint per layer actually injected, in the order injected,
+    /// ready to hand to `PromptBuilder::context_sources` so the turn's audit
+    /// entry seals them.
+    ///
+    /// Deliberately built from the layers that survived [`filter_layers`],
+    /// never from [`AgentInstructions::context_sources`]: that convenience
+    /// fingerprints every layer acton-ai discovered, including the ones a
+    /// `restricted` bundle just refused to load, and an audit entry claiming
+    /// a turn was steered by a file the gate withheld is worse than no entry
+    /// at all.
+    pub layers: Vec<ContextSource>,
 }
 
 impl Discovered {
@@ -48,19 +64,6 @@ impl Discovered {
     pub fn is_empty(&self) -> bool {
         self.layers.is_empty()
     }
-}
-
-/// One injected layer, named without its content: what the interim audit log
-/// records until Govcraft/acton-ai#18 gives this a home in the sealed chain.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LoadedLayer {
-    /// `"project"` or `"user"`.
-    pub scope: &'static str,
-    /// The absolute path it was read from.
-    pub path: PathBuf,
-    /// BLAKE3 of the layer's content, lowercase hex — the content itself is
-    /// deliberately not carried here; see the module docs.
-    pub blake3: String,
 }
 
 /// Discovers `AGENTS.md` instructions under `project_root`, filtered by
@@ -171,23 +174,12 @@ fn render(layers: &[&InstructionLayer]) -> Discovered {
         fragment.push_str(&layer.path.display().to_string());
         fragment.push_str("\n\n");
         fragment.push_str(layer.content.trim());
-        loaded.push(LoadedLayer {
-            scope: scope_name(layer.scope),
-            path: layer.path.clone(),
-            blake3: blake3::hash(layer.content.as_bytes()).to_hex().to_string(),
-        });
+        loaded.push(ContextSource::from_instruction_layer(layer));
     }
 
     Discovered {
         context_fragment: fragment,
         layers: loaded,
-    }
-}
-
-const fn scope_name(scope: InstructionScope) -> &'static str {
-    match scope {
-        InstructionScope::Project => "project",
-        InstructionScope::User => "user",
     }
 }
 
@@ -339,12 +331,12 @@ mod tests {
         assert!(discovered.context_fragment.contains("/root/AGENTS.md"));
         assert!(discovered.context_fragment.contains("root rule"));
         assert_eq!(discovered.layers.len(), 1);
-        assert_eq!(discovered.layers[0].scope, "project");
+        assert_eq!(discovered.layers[0].scope, InstructionScope::Project);
         assert_eq!(discovered.layers[0].path, Path::new("/root/AGENTS.md"));
     }
 
     #[test]
-    fn the_audit_row_carries_a_hash_and_never_the_content() {
+    fn the_sealed_row_carries_a_hash_and_never_the_content() {
         let root = layer(
             InstructionScope::Project,
             "/root/AGENTS.md",
@@ -353,11 +345,13 @@ mod tests {
         let discovered = render(&[&root]);
 
         let row = &discovered.layers[0];
-        assert_eq!(row.blake3.len(), 64);
-        assert!(row.blake3.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(row.content_hash.len(), 64);
+        assert!(row.content_hash.chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(
-            row.blake3,
-            blake3::hash(b"secret rule text").to_hex().to_string()
+            row.content_hash,
+            blake3::hash(b"secret rule text").to_hex().to_string(),
+            "the digest an auditor recomputes from the file must be the one \
+             the chain sealed",
         );
     }
 
@@ -369,8 +363,53 @@ mod tests {
 
         let discovered = render(&[&a, &b, &c]);
 
-        assert_eq!(discovered.layers[0].blake3, discovered.layers[1].blake3);
-        assert_ne!(discovered.layers[0].blake3, discovered.layers[2].blake3);
+        assert_eq!(
+            discovered.layers[0].content_hash,
+            discovered.layers[1].content_hash
+        );
+        assert_ne!(
+            discovered.layers[0].content_hash,
+            discovered.layers[2].content_hash
+        );
+    }
+
+    #[test]
+    fn a_layer_the_gate_withheld_is_never_named_in_the_sealed_entry() {
+        // The bug this pins: fingerprinting via
+        // `AgentInstructions::context_sources()` would name every layer
+        // acton-ai discovered, so a `restricted` bundle would seal an entry
+        // claiming the turn was steered by a file it deliberately refused to
+        // load. The fingerprints must come from the kept layers only.
+        let layers = vec![
+            layer(InstructionScope::Project, "/root/AGENTS.md", "root"),
+            layer(
+                InstructionScope::Project,
+                "/root/packages/api/AGENTS.md",
+                "api",
+            ),
+        ];
+        let allowed = vec!["packages/api".to_string()];
+
+        let kept = filter_layers(
+            &layers,
+            Path::new("/root"),
+            AgentsMdDiscovery::Restricted,
+            &allowed,
+        );
+        let discovered = render(&kept);
+
+        assert_eq!(discovered.layers.len(), 1);
+        assert_eq!(
+            discovered.layers[0].path,
+            Path::new("/root/packages/api/AGENTS.md")
+        );
+        assert!(
+            !discovered
+                .layers
+                .iter()
+                .any(|source| source.path == Path::new("/root/AGENTS.md")),
+            "the withheld root layer must not appear in the audit entry",
+        );
     }
 
     #[test]
@@ -401,7 +440,7 @@ mod tests {
             .expect("discovery over a real tree succeeds");
 
         assert_eq!(discovered.layers.len(), 1);
-        assert_eq!(discovered.layers[0].scope, "project");
+        assert_eq!(discovered.layers[0].scope, InstructionScope::Project);
         assert!(discovered.context_fragment.contains("cargo test"));
     }
 
