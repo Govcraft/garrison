@@ -209,7 +209,14 @@ pub fn parse_instant(text: &str) -> Option<DateTime<Utc>> {
 mod tests {
     use super::*;
 
-    const ISSUER: &str = "garrison-enrollment";
+    /// The issuer these tests configure the plane with.
+    ///
+    /// Deliberately not `garrison-control-plane`. The real deployments all use
+    /// that one on both sides, so a test that used it could not tell an
+    /// agreeing pair from a comparison that never ran. A fictional name here
+    /// keeps the mismatch case honest, and keeps this constant from being read
+    /// as a second issuer the plane accepts. It does not.
+    const ISSUER: &str = "test-issuer-not-a-real-one";
 
     fn now() -> DateTime<Utc> {
         parse_instant("2026-08-29T00:00:00Z").expect("fixture instant parses")
@@ -267,11 +274,11 @@ mod tests {
     }
 
     #[test]
-    fn a_token_minted_for_another_purpose_is_refused() {
+    fn a_row_whose_issuer_disagrees_with_the_configuration_is_refused() {
         let mut row = token();
-        row.issuer = "garrison-control-plane".into();
+        row.issuer = "some-other-issuer".into();
         let verdict = adjudicate(&row, ISSUER, now());
-        assert!(verdict.reason().contains("garrison-control-plane"));
+        assert!(verdict.reason().contains("some-other-issuer"));
     }
 
     #[test]

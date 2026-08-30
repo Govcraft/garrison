@@ -100,8 +100,17 @@ const fn default_sweep() -> u64 {
     300
 }
 
+/// The plane's own issuer, which is the only one it validates bearers against.
+///
+/// Not a placeholder: acton-service checks `iss` on every bearer against the
+/// single value in its `[token]` section, so an enrollment artifact minted
+/// under anything else is refused before this service sees it. A deployment
+/// that omits `garrison.issuer` therefore wants this, and a default that
+/// named a second issuer would let such a deployment boot clean and then
+/// refuse every enrollment with a message naming the wrong side of the
+/// mismatch.
 fn default_issuer() -> String {
-    "garrison-enrollment".to_string()
+    "garrison-control-plane".to_string()
 }
 
 const fn default_lifetime() -> u64 {
@@ -184,7 +193,12 @@ mod tests {
         "#;
         let parsed: HooksConfig = toml::from_str(toml).expect("section parses");
         assert_eq!(parsed.garrison.url, "https://plane.gov");
-        assert_eq!(parsed.garrison.issuer, "garrison-enrollment");
+        assert_eq!(
+            parsed.garrison.issuer, "garrison-control-plane",
+            "a deployment that omits the issuer gets the only one the plane \
+             validates against, rather than one that boots clean and then \
+             refuses every enrollment"
+        );
         assert_eq!(
             parsed.garrison.lifetime, 900,
             "an unstated bearer lifetime is fifteen minutes"
