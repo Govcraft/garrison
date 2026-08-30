@@ -43,7 +43,68 @@ system_prompt = "You are Garrison, a governed coding agent. Work inside the proj
 timeout_secs = 300
 # Read-only tools skip the permission round-trip; anything that can change
 # state still reaches the operator.
+#
+# This list is read only on a standalone install. The moment a [plane] section
+# is present and a policy bundle is in force, it is not consulted at all: a
+# file on this machine must not be able to widen a policy the organization
+# published. `garrison-agent ping` says so when that is happening.
 auto_approve = ["read_file", "glob", "grep", "list_directory", "calculate", "get_context_remaining", "update_plan", "lsp_diagnostics", "lsp_hover", "lsp_definition", "lsp_references"]
+
+# [policy]
+# How this install pulls and enforces the policy bundle the control plane
+# assigned it. Ignored entirely without a [plane] section: there is nothing to
+# pull from.
+#
+# Nothing in this section can name a bundle, edit a rule, or turn enforcement
+# off. Every key can only make this machine stricter or make it ask sooner. A
+# machine that could opt out of its policy from a local file would not be
+# centrally governed, whatever the console showed.
+#
+# THE RULE, in full:
+#
+# 1. A daemon without [plane] governs itself from this file. That is the only
+#    case in which [approval].auto_approve is read.
+# 2. A daemon with [plane] runs turns only under a bundle the plane assigned
+#    to it. It checks that the bundle is published, that its content hashes to
+#    the checksum the plane recorded, and that every command rule matches its
+#    own examples. It then writes the bundle id and checksum to its
+#    AgentInstall row, which is what promotes the install from `enrolled` to
+#    `active`.
+# 3. If the plane cannot be reached, the daemon keeps running on the last
+#    bundle it verified, for at most offline_grace_secs after that bundle was
+#    fetched. `_garrison/status` reports source = "cache" for the whole time.
+# 4. If the plane answers and the answer is anything other than a verified
+#    bundle (no assignment, unpublished, checksum mismatch, a rule that fails
+#    its own examples, an install quarantined or retired, a credential
+#    refused), or the grace runs out, the daemon starts, answers status with
+#    the reason, and refuses every turn. It never falls back to this file.
+# 5. Local edits here cannot widen a governed daemon: while governed, the
+#    auto-approve list above is not consulted, and `bash` is decided only by
+#    the bundle's command rules.
+#
+# NOT ENFORCED in this release: a bundle's `network_egress` and
+# `allow_unsandboxed_escalation` are pulled, checksummed, and reported, and
+# nothing acts on them. `garrison-agent ping` prints that so an author cannot
+# come to believe otherwise.
+#
+# How often to re-ask the plane. This is not a latency knob: nothing on the
+# turn path waits for the network. It bounds how long this machine keeps
+# enforcing a bundle that has since been republished or unassigned.
+# refresh_secs = 300
+#
+# How long a verified bundle may still be enforced after the plane stops
+# answering. Measured from when the plane last handed it over, not from when
+# this process started, so restarting the daemon does not buy another window.
+# Set 0 to forbid running on a cached bundle at all.
+#
+# A CAP, NOT A GRANT: when the control plane supplies a bound of its own for
+# the organization's impact level, the shorter of the two applies. This file
+# may shorten how long a machine runs offline and may never lengthen it.
+# offline_grace_secs = 86400
+#
+# Where the verified bundle is cached. Defaults to bundle.json in the Garrison
+# config directory, at mode 0600, beside this install's identity.
+# cache_path = "/home/dev/.config/garrison/bundle.json"
 
 # Language servers, routed by file extension. Deliberately none by default.
 #

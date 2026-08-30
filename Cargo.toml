@@ -9,8 +9,8 @@
 #
 # `site/` is pnpm and unaffected by any of this.
 [workspace]
-members = ["agent", "hooks-service", "wire"]
-default-members = ["agent", "hooks-service", "wire"]
+members = ["agent", "hooks-service", "policy", "wire"]
+default-members = ["agent", "hooks-service", "policy", "wire"]
 resolver = "2"
 
 [workspace.package]

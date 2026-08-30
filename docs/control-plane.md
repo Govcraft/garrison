@@ -700,9 +700,14 @@ cannot launder a decision, and `match_examples` / `not_match_examples` are unit
 tests the agent runs when it loads a bundle — a rule that does not match its own
 examples refuses to load.
 
-`PolicyBundle.checksum` is a `@require`d BLAKE3 digest once a bundle is
-published. An install reports the checksum it loaded; a mismatch is drift, and
-drift is visible rather than deniable.
+`PolicyBundle.checksum` is the BLAKE3 digest of the bundle as distributed. An
+install reports the checksum it loaded; a mismatch is drift, and drift is
+visible rather than deniable. The field carries no `@require`: the plane
+evaluates `@require` ahead of `before_validate`, so a rule demanding 64
+characters would be a rule the hook that produces them runs too late to
+satisfy, and the only way through it would be a caller typing a hash the hook
+then discards. What guarantees the field is the binding below, which is
+`required = true`.
 
 Publishing is gated by a `before_validate` hook on `PolicyBundle`, bound in
 `config.toml` with `required = true`. When a bundle moves to `published`, the
@@ -713,11 +718,96 @@ onto the row before it persists. The hook reads those rows with the hook
 service's own bearer, which is why `enrollment_service` appears in the read
 lists of `PolicyBundle`, `CommandRule`, `ToolRule`, and `ModelEndpoint`. It
 holds no write grant on any of them: the checksum lands through the hook
-response, not a PATCH. Until the gate is implemented, the hook refuses every
-publish and passes drafting and retiring through untouched.
+response, not a PATCH. Publishing a bundle by *creating* it already published
+is refused: the rules point at the bundle by id, and a row being created does
+not have one yet, so a bundle is published by updating a draft.
+
+Both ends of that comparison run the same code. `garrison-policy` is a
+workspace crate with no IO, compiled by the hook service and by the daemon,
+and it defines the canonical form the checksum is taken over. The canonical
+form covers the bundle's name and version, its default approval mode, the two
+recorded-but-unenforced fields, and every **enabled** rule's matching terms and
+verdict, with rules sorted so the order two queries happened to return them in
+is not part of the answer. It deliberately excludes row ids, timestamps, the
+organization, the checksum itself, and justifications: rewording "because it
+deletes files" must not invalidate every install's cache mid-shift. A pinned
+fixture test in `policy/src/checksum.rs` makes a change to that form a
+deliberate break rather than an accidental fleet-wide cache invalidation.
 
 `ModelEndpoint` records authorization state (`pilot`, `interim_ato`, `ato`,
 `denied`) alongside hosting, and an ATO endpoint must name who authorized it.
+
+#### The rule, from the daemon's side
+
+`agent/src/policy/` holds the daemon half: `pull.rs` walks
+`AgentInstall` → `Operator` → `PolicyAssignment` → `PolicyBundle` → rules and
+endpoints with the install's own bearer, `cache.rs` keeps the last verified
+bundle at mode 0600, and `agent.rs` is the actor that holds the result. It is
+registered as a turn gate through `agent/src/admission.rs` and as a
+`_garrison/status` describer, so nothing on the turn path waits for the
+network: a turn asks the actor, which answers from what it already holds.
+
+The whole rule, and it is also in `garrison.toml`'s `[policy]` comments so an
+operator finds it where they are configuring it:
+
+1. A daemon without `[plane]` governs itself from `garrison.toml`. That is the
+   only case in which `[approval].auto_approve` is read.
+2. A daemon with `[plane]` runs turns only under a bundle the plane assigned to
+   it. It checks that the bundle is published, that its content hashes to the
+   checksum the plane recorded, and that every command rule matches its own
+   examples. It then writes the bundle id and checksum to its `AgentInstall`
+   row, which is what promotes the install from `enrolled` to `active`.
+3. If the plane cannot be reached, the daemon keeps running on the last bundle
+   it verified, for at most `offline_grace_secs` after that bundle was fetched
+   (default 24 h; set 0 to forbid it). `_garrison/status` reports
+   `source = "cache"` for the whole time. The window is measured from when the
+   plane last spoke, so restarting the daemon does not buy another one.
+4. If the plane answers and the answer is anything other than a verified bundle
+   (no assignment, unpublished, checksum mismatch, a rule that fails its own
+   examples, an install quarantined or retired, a credential refused), or the
+   grace runs out, the daemon starts, answers status with the reason, and
+   refuses every turn. It never falls back to `garrison.toml`.
+5. Local edits to `garrison.toml` cannot widen a governed daemon: while
+   governed, the local auto-approve list is not consulted, and `bash` is
+   decided only by the bundle's command rules. `_garrison/status` and
+   `garrison-agent ping` say so when a local list is being ignored.
+
+`[policy] offline_grace_secs` is a **cap, not a grant**. When the control plane
+supplies a bound of its own for the organization's impact level, the shorter of
+the two applies: a local file may shorten how long a machine runs offline and
+may never lengthen it.
+
+The scope resolution in rule 2 is narrowest-first: an `operator`-scoped
+assignment beats a `team`-scoped one, which beats `organization`. Among equally
+narrow assignments the most recently effective wins. A team-scoped assignment
+does not apply when the daemon could not read its operator's `Operator` row: a
+permission failure must not widen or narrow policy by accident.
+
+#### What a bundle says and what this release acts on
+
+`network_egress` and `allow_unsandboxed_escalation` are pulled, covered by the
+checksum, and reported in `_garrison/status` — and **nothing enforces them**.
+They are part of the checksum deliberately: an author who changes them has
+changed the published policy, and a fleet should see that. But a bundle author
+could reasonably believe the daemon acts on them, so `garrison-agent ping`
+prints them under "recorded in the bundle and NOT enforced by this release",
+and `_garrison/status` carries the same list in `policy.governance.notEnforced`.
+
+`ToolRule.sandbox_required` *is* enforced, against what the kernel actually
+granted rather than what was configured: a rule that requires a sandbox denies
+the call on a host where the sandbox degraded.
+
+#### What the cache does and does not buy
+
+The cache at `~/.config/garrison/bundle.json` is 0600 and re-verified against
+its own checksum on every read, so a bundle edited under the daemon is refused
+rather than enforced. Someone holding the daemon's uid can rewrite the content
+*and* the checksum consistently, and this check would accept it — but that same
+uid could edit `garrison.toml` or run a different binary, so it is not a hole
+the file format can close. What closes it is the write-back: the install
+records the checksum it is running on its `AgentInstall` row, and a row whose
+checksum is not the bundle the plane assigned is drift somebody can see. The
+cache buys availability, not integrity.
 
 ### Audit — `schemas/audit.schema`
 
@@ -1167,6 +1257,21 @@ The rule when adding a `@require`: list every field the expression names, and
 confirm each is `required` or carries `@default`. Then test the create that
 omits the optional fields, not just the one that violates the rule.
 
+### And a hook cannot satisfy a `@require`
+
+The same phase order puts `before_validate` *after* the rule phases, on create,
+update, and patch alike. So a `@require` on a field a hook produces is a rule
+nothing can satisfy: the write is rejected before the hook that would fill the
+field is ever called. `PolicyBundle.checksum` was written that way first, and
+every publish failed with `a published bundle must carry its BLAKE3 checksum`
+while the gate that computes the checksum sat there having answered the create
+and never the publish.
+
+The fix is not a placeholder the caller types. A rule satisfied by 64 zeroes
+guarantees nothing, and the hook discards the value anyway. It is to state the
+requirement where it can be enforced: the hook binding, with `required = true`,
+which fails the write when the gate cannot answer.
+
 ## Directory
 
 The directory sync lives in `hooks-service/` as a supervised actor
@@ -1391,12 +1496,16 @@ exactly one install identity: a fleet of editor windows is one
 
 ## Known gaps
 
-- **The daemon does not heartbeat, and does not pull policy.** It enrolls
+- **The daemon has no audit shipping.** It enrolls
   (`agent/src/enrollment/`), it exchanges its install key for a bearer
-  (`agent/src/plane/`), and it checks its seat on a timer
-  (`agent/src/entitlement/`). `AgentInstall.last_heartbeat` is never written,
-  and no bundle is pulled, so a console cannot yet tell a daemon that is
-  quietly wedged from one that was shut down cleanly.
+  (`agent/src/plane/`), it checks its seat on a timer
+  (`agent/src/entitlement/`), and it pulls and enforces its policy bundle,
+  writing back the bundle and checksum it is running (which doubles as its
+  only heartbeat: the write-back stamps `last_heartbeat` on each refresh).
+  Nothing ships the audit trail to the plane yet.
+- **A bundle's `network_egress` and `allow_unsandboxed_escalation` are
+  recorded and not enforced.** They are part of the checksum and reported in
+  `_garrison/status`; no code acts on them. `ping` says so out loud.
 - **Schemas are unsigned.** Every command prints `schema signature
   verification is disabled (signing.mode = off)`. SchemaForge can require
   ed25519, SSH allowed-signers, or cosign-keyless signatures over `schemas/`

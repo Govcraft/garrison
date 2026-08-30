@@ -212,6 +212,7 @@ fn api_key_preflight(config: &acton_ai::config::ActonAIConfig) -> Result<(), Gar
 pub async fn build_setup(
     ai: &ActonAI,
     config: &GarrisonConfig,
+    acton_config: Option<&Path>,
 ) -> Result<ServerSetup, GarrisonError> {
     // A clone of the runtime handle reaches the same system and the same
     // broker. `runtime_mut()` would instead demand the only `ActonAI` handle
@@ -239,6 +240,7 @@ pub async fn build_setup(
     let plane = spawn_plane(&mut runtime, config.plane.as_ref(), enrollment.clone()).await?;
     let attribution = attribution(enrollment.as_ref());
     let entitlement = spawn_entitlement(&mut runtime, config, plane.as_ref()).await;
+    let policy = spawn_policy(&mut runtime, config, acton_config, plane.clone(), &sandbox).await;
     let audit = spawn_audit(&mut runtime, ai, config, enrollment).await?;
     let sessions = spawn_sessions(&mut runtime, ai, config).await?;
 
@@ -248,6 +250,10 @@ pub async fn build_setup(
     // Entitlement is asked first. An install that holds no seat is not
     // entitled to the answer any other gate would give, and "you have no
     // seat" is the more actionable of two simultaneous refusals.
+    //
+    // The trail is asked before the bundle. A refusal is only worth anything
+    // if it was written down, so a daemon that cannot append has nothing to
+    // gain by working out what policy would have said.
     let mut gates: Vec<ActorHandle> = Vec::new();
     let mut describers: Vec<ActorHandle> = vec![supervisor.clone(), router.clone()];
     describers.extend(plane.clone());
@@ -259,6 +265,8 @@ pub async fn build_setup(
         gates.push(keeper.clone());
         describers.push(keeper);
     }
+    gates.push(policy.clone());
+    describers.push(policy.clone());
     let store = sessions.map(|(keeper, store)| {
         gates.push(keeper.clone());
         describers.push(keeper);
@@ -269,7 +277,7 @@ pub async fn build_setup(
         supervisor,
         runtime: ai.clone(),
         router,
-        defaults: thread_defaults(config, project_root, lsp, gates, store, attribution),
+        defaults: thread_defaults(config, project_root, lsp, gates, store, attribution, policy),
         capabilities: capabilities(),
         audited: ai.is_audited(),
         sandbox,
@@ -369,6 +377,81 @@ async fn spawn_entitlement(
     crate::entitlement::spawn(runtime, config.plane.as_ref(), plane).await
 }
 
+/// The policy agent: the gate that decides whether a bundle governs this
+/// machine, and the decider every tool call is put to.
+///
+/// Always spawned, on a governed install and a standalone one alike. A
+/// standalone agent gets one in [`PolicyState::Standalone`](crate::policy::PolicyState::Standalone),
+/// which admits every turn and reads `garrison.toml`'s auto-approve list, so
+/// the approval path has exactly one shape rather than two.
+///
+/// The providers come from acton-ai's own config file rather than from the
+/// facade, because approving an endpoint is a decision about a *place to send
+/// code* — a provider type, a model, and a base URL — and the running runtime
+/// exposes only names and models.
+async fn spawn_policy(
+    runtime: &mut ActorRuntime,
+    config: &GarrisonConfig,
+    acton_config: Option<&Path>,
+    plane: Option<ActorHandle>,
+    sandbox: &SandboxStatus,
+) -> ActorHandle {
+    let file_config = match acton_config {
+        Some(path) => acton_ai::config::from_path(path).ok(),
+        None => acton_ai::config::load().ok(),
+    };
+
+    let settings = crate::policy::Settings {
+        plane,
+        cache_path: config.policy.cache_path(&crate::enrollment::config_dir()),
+        refresh: config.policy.refresh(),
+        // No plane-supplied bound yet; the local value is the whole window
+        // until the entitlement work lands one, and it may only shorten it.
+        grace: config.policy.offline_grace(None),
+        sandbox_active: sandbox.enabled,
+        providers: Arc::new(configured_providers(file_config.as_ref())),
+        default_provider: file_config.as_ref().and_then(default_provider_name),
+        auto_approve: Arc::new(config.approval.auto_approve.clone()),
+    };
+
+    crate::policy::PolicyAgent::spawn(runtime, settings).await
+}
+
+/// acton-ai's configured providers, as endpoint approval sees them. Pure.
+fn configured_providers(
+    config: Option<&acton_ai::config::ActonAIConfig>,
+) -> Vec<garrison_policy::ConfiguredProvider> {
+    let Some(config) = config else {
+        return Vec::new();
+    };
+    let mut providers: Vec<garrison_policy::ConfiguredProvider> = config
+        .providers
+        .iter()
+        .map(|(name, provider)| garrison_policy::ConfiguredProvider {
+            name: name.clone(),
+            provider_type: provider.provider_type.to_lowercase(),
+            model: provider.model.clone(),
+            base_url: provider.base_url.clone(),
+        })
+        .collect();
+    // A HashMap has no order, and the status surface lists these; sorting
+    // keeps two consecutive `_garrison/status` calls from disagreeing.
+    providers.sort_by(|a, b| a.name.cmp(&b.name));
+    providers
+}
+
+/// The provider a turn uses when nothing names one. Pure.
+///
+/// The same cascade [`api_key_preflight`] applies: an explicit
+/// `default_provider`, or the sole configured one when there is exactly one.
+fn default_provider_name(config: &acton_ai::config::ActonAIConfig) -> Option<String> {
+    match &config.default_provider {
+        Some(name) => Some(name.clone()),
+        None if config.providers.len() == 1 => config.providers.keys().next().cloned(),
+        None => None,
+    }
+}
+
 /// The audit anchor keeper, which is also a turn gate.
 ///
 /// Refuses to start when a required trail is not armed, or when the trail and
@@ -437,6 +520,7 @@ fn thread_defaults(
     gates: Vec<ActorHandle>,
     store: Option<crate::session::SessionStore>,
     attribution: crate::session::Attribution,
+    policy: ActorHandle,
 ) -> ThreadDefaults {
     let mut roots = vec![project_root.clone()];
     roots.extend(config.threads.workspace_roots.iter().cloned());
@@ -451,6 +535,7 @@ fn thread_defaults(
         gates,
         store,
         attribution,
+        policy: Some(policy),
     }
 }
 
@@ -505,8 +590,9 @@ pub async fn start(
     ai: &ActonAI,
     config: &GarrisonConfig,
     listener: Box<dyn Listener>,
+    acton_config: Option<&Path>,
 ) -> Result<ActorHandle, GarrisonError> {
-    let setup = build_setup(ai, config).await?;
+    let setup = build_setup(ai, config, acton_config).await?;
     let mut runtime = ai.runtime().clone();
     server::serve(&mut runtime, listener, setup).await
 }
@@ -529,7 +615,7 @@ pub async fn launch(
     let listener = UnixListener::bind(&path)?;
     let endpoint = listener.endpoint();
 
-    let server = start(&ai, config, Box::new(listener)).await?;
+    let server = start(&ai, config, Box::new(listener), acton_config).await?;
     let runtime = ai.runtime().clone();
 
     Ok(Garrison {

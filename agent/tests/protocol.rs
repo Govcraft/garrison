@@ -219,7 +219,7 @@ async fn connect_with(
         .expect("the test runtime must launch");
 
     // One runtime, acton-ai's own: the router lives on its broker.
-    let setup = launch::build_setup(&ai, config)
+    let setup = launch::build_setup(&ai, config, None)
         .await
         .expect("the test setup must build");
     let supervisor = setup.supervisor.clone();

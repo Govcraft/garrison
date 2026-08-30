@@ -326,6 +326,11 @@ pub struct ThreadSetup {
     /// then lives in this actor alone and dies with the process, which is
     /// what a standalone developer install does and always did.
     pub store: Option<SessionStore>,
+    /// The policy agent every tool call in this session is put to.
+    ///
+    /// `None` leaves the local auto-approve list as the whole policy, which
+    /// is what a stack brought up without a policy agent gets.
+    pub policy: Option<ActorHandle>,
 }
 
 /// What the store holds for this session, as this actor last left it.
@@ -917,6 +922,7 @@ async fn drive_turn(
         conn: setup.conn.clone(),
         timeout: setup.approval_timeout,
         auto_approve: Arc::clone(&setup.auto_approve),
+        policy: setup.policy.clone(),
     };
 
     let sink = setup.sink.clone();

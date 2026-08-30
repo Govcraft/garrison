@@ -415,7 +415,104 @@ pub struct PolicyStatus {
     /// How long a permission request waits before it is denied.
     pub approval_timeout_secs: u64,
     /// Tool-name patterns that never reach the client.
+    ///
+    /// The local list from `garrison.toml`. It is reported even while it is
+    /// being ignored, alongside
+    /// [`GovernanceStatus::local_auto_approve_ignored`], because an operator
+    /// whose list stopped working needs to see both facts in one place.
     pub auto_approve: Vec<String>,
+    /// What the control plane says governs this install.
+    ///
+    /// Absent when the policy agent could not be asked, exactly as
+    /// [`GarrisonStatus::threads`] is. Present with `state = "standalone"` on
+    /// a daemon that answers to nobody.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governance: Option<GovernanceStatus>,
+}
+
+/// What the centrally managed policy is, and whether it is in force.
+///
+/// The first field an operator reads when a governed machine is refusing
+/// turns, and the answer an auditor is shown when they ask whether policy is
+/// managed centrally: a bundle name, a version, a checksum, and where the
+/// daemon got it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct GovernanceStatus {
+    /// `standalone`, `governed`, or `ungoverned`.
+    ///
+    /// `standalone` means there is no control plane and `garrison.toml`
+    /// governs. `governed` means a verified bundle is in force. `ungoverned`
+    /// means nothing is, and every turn is refused.
+    pub state: String,
+    /// The bundle in force, when one is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<BundleStatus>,
+    /// Why there is no policy, or what the last refresh ran into.
+    ///
+    /// Present on an ungoverned install as the reason turns are refused, and
+    /// on a governed one riding out an outage as the outage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The configured providers this bundle's approved endpoints cover.
+    ///
+    /// Empty on a bundle that names no endpoints, which is not the same as a
+    /// bundle that approves nothing: an organization that has recorded no
+    /// endpoints has not made a decision about them.
+    #[serde(default)]
+    pub approved_providers: Vec<String>,
+    /// The provider a turn uses when nothing names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_provider: Option<String>,
+    /// Bundle fields this release records and does not enforce.
+    ///
+    /// Stated rather than omitted: they are part of the checksum, so an
+    /// author who sets them has changed the published policy and could
+    /// reasonably believe the daemon is acting on them. It is not.
+    #[serde(default)]
+    pub not_enforced: Vec<String>,
+    /// Whether `[approval] auto_approve` in `garrison.toml` is being ignored.
+    ///
+    /// True only when this install is governed *and* the local list is
+    /// non-empty, which is exactly the case where somebody is likely to be
+    /// confused about why their setting is not working.
+    pub local_auto_approve_ignored: bool,
+    /// How long a bundle may be enforced after the plane stops answering.
+    pub offline_grace_secs: u64,
+    /// How often the daemon re-asks the plane.
+    pub refresh_secs: u64,
+    /// When the last refresh finished, whatever it concluded, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_refresh_at: Option<String>,
+}
+
+/// The bundle a governed install is enforcing.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct BundleStatus {
+    /// Its row id in the control plane.
+    pub id: String,
+    /// Its name, as a security officer wrote it.
+    pub name: String,
+    /// Its version.
+    pub version: u64,
+    /// The BLAKE3 this daemon computed over what it pulled.
+    ///
+    /// The same number the plane recorded at publish, because a bundle whose
+    /// content did not hash to that number was never put in force.
+    pub checksum: String,
+    /// `plane` or `cache`.
+    pub source: String,
+    /// When the plane last handed this bundle over, RFC 3339.
+    pub fetched_at: String,
+    /// Whether it is past the window it may be enforced offline for.
+    ///
+    /// Always false on a bundle actually in force: a stale one ungoverns the
+    /// install. It is reported so a status captured mid-transition still says
+    /// something true.
+    pub stale: bool,
 }
 
 /// What isolation stands between a tool call and the host.
@@ -650,6 +747,24 @@ pub struct PlanMeta {
     pub completed: usize,
     /// How many steps there are.
     pub total: usize,
+}
+
+/// Why the policy in force wants a human to look at this call, in `_meta`.
+///
+/// Carried on a `session/request_permission` so a client's dialog can show
+/// the reason a security officer wrote when they added the rule. It is the
+/// difference between a prompt an operator clicks through and one they read:
+/// the justification is required on every rule in the schema precisely so
+/// that this field is never empty when a rule decided the call.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ApprovalMeta {
+    /// The stated reason, verbatim from the bundle.
+    pub justification: String,
+    /// Which rule said so, by name, when one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
 }
 
 /// What one compaction did, in `_meta`.

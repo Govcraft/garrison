@@ -472,6 +472,58 @@ fn kind_of(value: &Value) -> &'static str {
     }
 }
 
+// =============================================================================
+// Policy bundles — read by the publish gate, and nothing here writes them
+// =============================================================================
+//
+// A second `impl` block rather than four more methods in the first, so this
+// file grows by appending. The row types are `garrison_policy`'s own: the
+// crate that computes the checksum defines what it is computing over, and the
+// daemon that verifies the answer deserializes the identical structs.
+
+impl Plane {
+    /// Every `CommandRule` belonging to one bundle, disabled ones included.
+    ///
+    /// Disabled rules are fetched rather than filtered out here because what
+    /// makes them not count is the canonical form, and that decision belongs
+    /// in one place: `garrison_policy::checksum`.
+    pub async fn command_rules_of(
+        &self,
+        bundle: &str,
+    ) -> Result<Vec<garrison_policy::CommandRule>, PlaneError> {
+        self.list_all("CommandRule", Some(("bundle", bundle))).await
+    }
+
+    /// Every `ToolRule` belonging to one bundle.
+    pub async fn tool_rules_of(
+        &self,
+        bundle: &str,
+    ) -> Result<Vec<garrison_policy::ToolRule>, PlaneError> {
+        self.list_all("ToolRule", Some(("bundle", bundle))).await
+    }
+
+    /// The endpoints a bundle cites, by row id.
+    ///
+    /// One GET each rather than one `in` query. A bundle cites a handful of
+    /// endpoints and this runs only on publish, so the round trips are free;
+    /// what they buy is not depending on a query operator whose behaviour on
+    /// a relation column would have to be probed first. An id the bearer
+    /// cannot see is skipped rather than failing the publish, and its absence
+    /// changes the checksum, which is the visible outcome.
+    pub async fn model_endpoints(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<garrison_policy::ModelEndpoint>, PlaneError> {
+        let mut endpoints = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(endpoint) = self.get("ModelEndpoint", id).await? {
+                endpoints.push(endpoint);
+            }
+        }
+        Ok(endpoints)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

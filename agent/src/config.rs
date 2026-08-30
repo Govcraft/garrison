@@ -50,6 +50,102 @@ pub struct GarrisonConfig {
     pub sessions: SessionConfig,
     /// Language servers to run, keyed by a name of the operator's choosing.
     pub lsp_servers: std::collections::HashMap<String, LspServerConfig>,
+    /// How this install pulls and enforces the policy the plane assigned it.
+    ///
+    /// The section is about *distribution*, not about what the policy says:
+    /// the rules themselves live in the control plane, and nothing in this
+    /// file can widen them. See [`PolicyConfig`].
+    pub policy: PolicyConfig,
+}
+
+/// How the centrally managed policy bundle is pulled and how long it lasts.
+///
+/// Every key here can only make this install stricter or ask more often.
+/// There is deliberately no key that names a bundle, edits a rule, or turns
+/// the enforcement off: a machine that could opt out of its policy from a
+/// local file would not be centrally governed, whatever the console showed.
+///
+/// Ignored entirely on a daemon with no `[plane]` section. Nothing is pulled
+/// because there is nothing to pull from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PolicyConfig {
+    /// How often to re-ask the control plane, in seconds.
+    ///
+    /// The refresh runs off the turn path, so this is not a latency knob: it
+    /// bounds how long a machine keeps enforcing a bundle that has since been
+    /// republished or unassigned. Five minutes by default.
+    pub refresh_secs: u64,
+
+    /// How long a verified bundle may still be enforced after the control
+    /// plane stops answering, in seconds.
+    ///
+    /// Measured from when the plane last handed the bundle over, not from
+    /// when this process started, so restarting the daemon does not buy
+    /// another window. Twenty-four hours by default. Zero forbids running on
+    /// a cached bundle at all, which grounds a machine the moment it loses
+    /// the plane.
+    ///
+    /// This is a **cap, not a grant**. When the control plane supplies a
+    /// bound of its own for the organization's impact level, the shorter of
+    /// the two applies: a local file may shorten how long a machine runs
+    /// offline and may never lengthen it.
+    pub offline_grace_secs: u64,
+
+    /// Where the verified bundle is cached.
+    ///
+    /// `None` puts it beside the install key in the Garrison config
+    /// directory, which is where an operator already looks for this install's
+    /// identity. Set it when that directory is not writable by the daemon's
+    /// user.
+    pub cache_path: Option<PathBuf>,
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            refresh_secs: 300,
+            offline_grace_secs: 86_400,
+            cache_path: None,
+        }
+    }
+}
+
+impl PolicyConfig {
+    /// How often to re-ask the plane.
+    ///
+    /// A zero refresh would be a busy loop against the control plane, so it
+    /// reads as the default rather than as an instruction. Pure.
+    #[must_use]
+    pub fn refresh(&self) -> Duration {
+        match self.refresh_secs {
+            0 => Duration::from_secs(300),
+            secs => Duration::from_secs(secs),
+        }
+    }
+
+    /// How long a cached bundle may be enforced, honouring a bound the plane
+    /// supplied.
+    ///
+    /// Pure, and the one place the cap rule is spelled: the shorter of the
+    /// two wins, and a local file therefore cannot lengthen the window an
+    /// organization allows.
+    #[must_use]
+    pub fn offline_grace(&self, plane_bound: Option<Duration>) -> Duration {
+        let local = Duration::from_secs(self.offline_grace_secs);
+        match plane_bound {
+            Some(bound) => local.min(bound),
+            None => local,
+        }
+    }
+
+    /// Where the bundle is cached for this install.
+    #[must_use]
+    pub fn cache_path(&self, config_dir: &Path) -> PathBuf {
+        self.cache_path
+            .clone()
+            .unwrap_or_else(|| crate::policy::cache::path(config_dir))
+    }
 }
 
 /// What Garrison requires of the sessions acton-ai stores.
@@ -877,5 +973,98 @@ auto_start = false
 
         assert!(error.is_configuration());
         assert!(error.to_string().contains("/nonexistent/garrison.toml"));
+    }
+
+    #[test]
+    fn a_file_with_no_policy_section_refreshes_every_five_minutes_and_caches_for_a_day() {
+        let config = GarrisonConfig::from_toml("").unwrap();
+
+        assert_eq!(config.policy.refresh(), Duration::from_secs(300));
+        assert_eq!(
+            config.policy.offline_grace(None),
+            Duration::from_secs(86_400)
+        );
+    }
+
+    #[test]
+    fn a_zero_offline_grace_forbids_running_on_a_cached_bundle() {
+        let config = GarrisonConfig::from_toml("[policy]\noffline_grace_secs = 0\n").unwrap();
+
+        assert_eq!(config.policy.offline_grace(None), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_local_grace_may_shorten_the_planes_bound_and_may_never_lengthen_it() {
+        let generous = GarrisonConfig::from_toml("[policy]\noffline_grace_secs = 604800\n")
+            .unwrap()
+            .policy;
+        let strict = GarrisonConfig::from_toml("[policy]\noffline_grace_secs = 3600\n")
+            .unwrap()
+            .policy;
+        let bound = Duration::from_secs(86_400);
+
+        assert_eq!(
+            generous.offline_grace(Some(bound)),
+            bound,
+            "a file must not buy a machine a week when the organization allows a day",
+        );
+        assert_eq!(
+            strict.offline_grace(Some(bound)),
+            Duration::from_secs(3600),
+            "a file that asks for less than the organization allows gets less",
+        );
+    }
+
+    #[test]
+    fn a_zero_refresh_reads_as_the_default_rather_than_a_spin_loop() {
+        let config = GarrisonConfig::from_toml("[policy]\nrefresh_secs = 0\n").unwrap();
+
+        assert_eq!(config.policy.refresh(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn the_bundle_is_cached_beside_this_installs_identity_unless_told_otherwise() {
+        let default = GarrisonConfig::from_toml("").unwrap();
+        assert_eq!(
+            default.policy.cache_path(Path::new("/etc/garrison")),
+            PathBuf::from("/etc/garrison/bundle.json")
+        );
+
+        let moved =
+            GarrisonConfig::from_toml("[policy]\ncache_path = \"/var/lib/g/b.json\"\n").unwrap();
+        assert_eq!(
+            moved.policy.cache_path(Path::new("/etc/garrison")),
+            PathBuf::from("/var/lib/g/b.json")
+        );
+    }
+
+    #[test]
+    fn a_misspelled_policy_key_is_refused_rather_than_ignored() {
+        let error = GarrisonConfig::from_toml("[policy]\nrefresh_sec = 60\n").unwrap_err();
+
+        assert!(error.to_string().contains("refresh_sec"));
+    }
+
+    #[test]
+    fn there_is_no_key_that_names_a_bundle_or_turns_enforcement_off() {
+        for attempt in [
+            "[policy]\nbundle = \"policybundle_01\"\n",
+            "[policy]\nenabled = false\n",
+            "[policy]\nenforce = false\n",
+        ] {
+            assert!(
+                GarrisonConfig::from_toml(attempt).is_err(),
+                "a local file must not be able to opt out of central policy: {attempt}",
+            );
+        }
+    }
+
+    #[test]
+    fn the_shipped_config_parses_with_its_policy_section_documented() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../garrison.toml");
+        let config = GarrisonConfig::from_file(Path::new(path))
+            .expect("the shipped garrison.toml must parse");
+
+        assert_eq!(config.policy.refresh(), Duration::from_secs(300));
     }
 }

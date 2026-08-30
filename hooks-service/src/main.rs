@@ -171,12 +171,13 @@ async fn main() -> Result<()> {
         )
         .add_service(
             pb::redemption::redemption_hooks_server::RedemptionHooksServer::new(
-                hooks::redemption::Service::new(plane, garrison.issuer).with_directory(gate),
+                hooks::redemption::Service::new(plane.clone(), garrison.issuer)
+                    .with_directory(gate),
             ),
         )
         .add_service(
             pb::policy_bundle::policy_bundle_hooks_server::PolicyBundleHooksServer::new(
-                hooks::policy_bundle::Service,
+                hooks::policy_bundle::Service::new(plane),
             ),
         )
         // SCHEMAFORGE_HOOKS_SERVICES_END
