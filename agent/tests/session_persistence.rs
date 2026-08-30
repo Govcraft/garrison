@@ -46,27 +46,61 @@ use support::mock_llm::{MockServer, Round};
 /// Config, database, trail, anchor, socket and workspace all live here, so the
 /// second daemon inherits the first one's state by reading the same paths and
 /// nothing leaks into the developer's own `~/.config/garrison`.
+///
+/// # Why the name is so terse
+///
+/// A Unix-domain socket path is not a path like the others: it has to fit in
+/// `sockaddr_un.sun_path`, which is 104 bytes on macOS and 108 on Linux, and
+/// the socket lives inside this directory. macOS spends 57 of those bytes
+/// before the fixture names anything, because `TMPDIR` there is a per-user
+/// `/private/var/folders/<two>/<thirty>/T/` rather than `/tmp`. A friendlier
+/// directory name cost more than the budget allows and the daemon refused to
+/// start with "path must be shorter than SUN_LEN", which reads like a Garrison
+/// bug and is not one.
 struct Fixture {
     root: PathBuf,
 }
 
+/// What the socket path may not exceed, the smaller of the two platforms.
+///
+/// Checked rather than assumed: the failure it prevents is a daemon that
+/// exits before it listens, which is indistinguishable at the call site from
+/// the daemon being broken.
+const SUN_PATH_LIMIT: usize = 104;
+
 impl Fixture {
     fn new(name: &str) -> Self {
+        // Short on purpose; see the note on `Fixture`. The pid alone is unique
+        // — nextest gives each test its own process — and the clock's low
+        // digits only guard against a reused pid meeting a leftover directory.
         let root = std::env::temp_dir().join(format!(
-            "garrison-sessions-{name}-{}-{}",
+            "grsn-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|since| since.as_nanos())
+                .map(|since| since.as_nanos() % 100_000)
                 .unwrap_or_default()
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("workspace")).expect("the fixture must be creatable");
         std::fs::create_dir_all(root.join("config")).expect("the config dir must be creatable");
 
-        Self {
+        let fixture = Self {
             root: root.canonicalize().expect("the fixture must resolve"),
-        }
+        };
+
+        // After canonicalising, because that is what the daemon binds and on
+        // macOS it is longer than what we built: `/var/...` resolves through
+        // to `/private/var/...`.
+        let socket = fixture.socket();
+        assert!(
+            socket.as_os_str().len() <= SUN_PATH_LIMIT,
+            "the fixture's socket path is {} bytes and must be at most \
+             {SUN_PATH_LIMIT}: {}",
+            socket.as_os_str().len(),
+            socket.display()
+        );
+        fixture
     }
 
     fn workspace(&self) -> PathBuf {
