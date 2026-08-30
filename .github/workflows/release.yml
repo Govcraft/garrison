@@ -102,9 +102,35 @@ jobs:
           fi
           echo "garrison-agent $crate"
 
+  # Advisory, license, and source policy from `deny.toml` — the same gate
+  # `ci.yml` runs on every push, run again here against whatever
+  # `Cargo.lock` the tagged commit actually carries. A tag can point to a
+  # commit whose CI run predates an advisory that has since been published,
+  # so re-checking at release time is not redundant with CI: it is the
+  # "and release" half of #43's "every push and release."
+  supply-chain:
+    name: Dependency advisories
+    needs: plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.tag }}
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
+
+      - name: cargo deny check
+        # `--locked` is a `cargo-deny` flag, not a `check` flag: it must
+        # come before the subcommand.
+        run: cargo deny --locked check
+
   build:
     name: ${{ matrix.name }}
-    needs: plan
+    needs: [plan, supply-chain]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     strategy:
@@ -176,6 +202,9 @@ jobs:
           go-version: '1.24'
           cache: false
 
+      - name: Install cargo-cyclonedx
+        uses: taiki-e/install-action@cargo-cyclonedx
+
       # Deliberately not cached. A release artifact is worth the twenty
       # minutes it takes to build AWS-LC from source on a clean runner, and a
       # restored cache is one more thing an auditor would have to trust.
@@ -205,6 +234,19 @@ jobs:
           "$bin" --version
           echo "the FIPS provider installed; this binary is FIPS-enabled"
 
+      # One CycloneDX SBOM per binary this workspace ships, resolved for
+      # this leg's target so a cross-target-only dependency doesn't show up
+      # in a platform that never builds it. Run against the whole workspace
+      # rather than a single crate: cargo-cyclonedx has no per-package
+      # filter, so both `garrison-agent_bin.cdx.json` and
+      # `garrison-hooks_bin.cdx.json` are produced on every leg regardless
+      # of `matrix.hooks`, and the archive step below copies in only the
+      # one(s) it actually ships — the same guard the binary itself gets.
+      - name: Generate the SBOM
+        run: |
+          cargo cyclonedx --describe binaries --format json \
+            --spec-version 1.5 --target ${{ matrix.target }} -q
+
       - name: Assemble the archive
         id: archive
         env:
@@ -216,9 +258,10 @@ jobs:
         run: |
           set -euo pipefail
           stage="garrison-$VERSION-$TARGET"
-          mkdir -p "$stage/docs"
+          mkdir -p "$stage/docs" "$stage/sbom"
           cp "target/$TARGET/release/garrison-agent" "$stage/"
           cp README.md LICENSE "$stage/"
+          cp agent/garrison-agent_bin.cdx.json "$stage/sbom/"
 
           # On Apple the validated module is a dylib rather than something
           # linked into the binary, so it is part of the artefact: the binary
@@ -231,6 +274,7 @@ jobs:
             # Regenerated into the project root by hooks-service/build.rs, and
             # the plane's `[[schema_forge.hooks.bindings]]` entry needs it.
             cp hooks-service/hooks_descriptor.bin "$stage/"
+            cp hooks-service/garrison-hooks_bin.cdx.json "$stage/sbom/"
             mkdir -p "$stage/systemd"
             cp packaging/systemd/garrison-agent.service "$stage/systemd/"
             cp packaging/README.md "$stage/systemd/"
@@ -281,6 +325,15 @@ jobs:
     name: Publish
     needs: [plan, build]
     runs-on: ubuntu-latest
+    # Job-level permissions replace the workflow-level block above rather
+    # than adding to it, so `contents: write` (the draft release, the
+    # upload) is repeated here alongside the one permission this job adds:
+    # `id-token: write`, which is what lets cosign mint a short-lived
+    # Sigstore certificate from this job's own OIDC identity instead of a
+    # long-lived signing key this repository would otherwise have to store.
+    permissions:
+      contents: write
+      id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -299,6 +352,24 @@ jobs:
           rm -f ./*.tar.gz.sha256
           shasum -a 256 -c SHA256SUMS
           ls -l
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      # Keyless: the certificate binds this signature to "the release.yml
+      # workflow, running as a push of this tag, in this repository" — not
+      # to a private key that would need generating, rotating, and keeping
+      # secret. Signing SHA256SUMS rather than every archive individually
+      # means one signature covers every artifact in the release, since
+      # each artifact's own hash is already a line in that file.
+      - name: Sign the checksums
+        working-directory: artifacts
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes \
+            --output-signature SHA256SUMS.sig \
+            --output-certificate SHA256SUMS.pem \
+            SHA256SUMS
 
       # Left as a draft on purpose: publishing is a person's decision, and the
       # draft is where they check the artifact list before an agency does.
@@ -324,7 +395,21 @@ jobs:
           itself: keep it beside the binary, which is where the binary looks
           for it.
 
-          Verify a download against `SHA256SUMS`:
+          Each archive also carries a `sbom/` directory: one CycloneDX 1.5
+          SBOM per binary it ships, generated for that archive's own target
+          triple from this repository's `Cargo.lock`.
+
+          `SHA256SUMS` is signed keylessly with `cosign`, against this
+          workflow's own GitHub Actions OIDC identity rather than a stored
+          private key. Verify the signature, then the archive against the
+          now-trusted checksums:
+
+              cosign verify-blob \
+                --certificate SHA256SUMS.pem \
+                --signature SHA256SUMS.sig \
+                --certificate-identity-regexp '^https://github\.com/Govcraft/garrison/\.github/workflows/release\.yml@.*$' \
+                --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+                SHA256SUMS
 
               shasum -a 256 -c SHA256SUMS --ignore-missing
           NOTES
@@ -334,4 +419,5 @@ jobs:
             flags+=(--prerelease)
           fi
           gh release create "$TAG" "${flags[@]}" \
-            artifacts/SHA256SUMS artifacts/*.tar.gz
+            artifacts/SHA256SUMS artifacts/SHA256SUMS.sig artifacts/SHA256SUMS.pem \
+            artifacts/*.tar.gz

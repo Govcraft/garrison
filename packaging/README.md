@@ -44,6 +44,28 @@ reports stopping before it tears its actors down.
 | Chat log | `$XDG_STATE_HOME/garrison/chat.log` |
 | Install identity and key (enrolled installs) | `~/.config/garrison/install.json`, `install-key.pem` |
 
+## Verifying a release
+
+Each release archive carries an `sbom/` directory (one CycloneDX SBOM per
+binary it ships) and, alongside the archive, a `SHA256SUMS` file covering
+every archive in the release, signed keylessly with `cosign`. Verify the
+signature before trusting the checksums, and the checksums before trusting
+the archive:
+
+```sh
+cosign verify-blob \
+  --certificate SHA256SUMS.pem \
+  --signature SHA256SUMS.sig \
+  --certificate-identity-regexp '^https://github\.com/Govcraft/garrison/\.github/workflows/release\.yml@.*$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  SHA256SUMS
+
+shasum -a 256 -c SHA256SUMS --ignore-missing
+```
+
+See `docs/supply-chain-policy.md` for what signs the release, what the SBOM
+covers, and how dependency advisories are tracked.
+
 ## Without systemd
 
 When no unit is loaded, the relay spawns `garrison-agent serve` itself as a

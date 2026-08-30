@@ -32,6 +32,30 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # Advisory, license, and source policy from `deny.toml` — see
+  # docs/supply-chain-policy.md. Split from `clippy-and-test` because it
+  # needs none of that job's FIPS build tooling: `cargo deny` reads
+  # `Cargo.lock` and crate metadata, it never compiles anything, so this
+  # finishes in seconds rather than the FIPS module's twenty-plus minutes.
+  # A crate landing on RUSTSEC with no matching `deny.toml` entry fails this
+  # job, on every push and every pull request.
+  advisories:
+    name: Dependency advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
+
+      - name: cargo deny check
+        # `--locked` is a `cargo-deny` flag, not a `check` flag: it must
+        # come before the subcommand.
+        run: cargo deny --locked check
+
   clippy-and-test:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
