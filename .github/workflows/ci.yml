@@ -104,6 +104,16 @@ jobs:
       - name: Clippy
         run: cargo clippy --release --locked ${{ matrix.packages }} --all-targets -- -D warnings
 
+      # Split from the run below so the FIPS module can be placed between the
+      # two. On Apple the module is a dylib, and the sandbox tests re-exec
+      # `garrison-agent` with a scrubbed environment, so the copy has to be in
+      # place before a test runs rather than found through `DYLD_*`.
+      - name: Build the test binaries
+        run: cargo nextest run --release --locked ${{ matrix.packages }} --no-run
+
+      - name: Put the FIPS module beside the binaries
+        run: ./packaging/place-fips-module.sh target/release
+
       # Tests that want a container runtime or `schemaforge` on PATH report
       # themselves skipped rather than failing, so this is the same command a
       # developer runs.

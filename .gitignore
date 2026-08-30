@@ -1,6 +1,8 @@
 # Hidden files and directories (except .gitignore)
 .*
 !.gitignore
+!.cargo/
+!.cargo/**
 !.github/
 !.github/**
 !extensions/vscode/.vscode/

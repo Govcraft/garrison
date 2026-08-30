@@ -187,6 +187,12 @@ jobs:
         if: matrix.hooks
         run: cargo build --release --locked --target ${{ matrix.target }} -p garrison-hooks
 
+      # Before the proof, because on Apple the module is a dylib the binary
+      # finds through `@loader_path` and the proof runs the binary straight
+      # from a shell, with none of the `DYLD_*` help a cargo test run gets.
+      - name: Put the FIPS module beside the binaries
+        run: ./packaging/place-fips-module.sh target/${{ matrix.target }}/release
+
       # The whole reason this release exists. `main` installs the FIPS
       # provider before clap sees argv and returns a configuration error if
       # `provider.fips()` is false, so a binary that reaches `--version` has
@@ -213,6 +219,11 @@ jobs:
           mkdir -p "$stage/docs"
           cp "target/$TARGET/release/garrison-agent" "$stage/"
           cp README.md LICENSE "$stage/"
+
+          # On Apple the validated module is a dylib rather than something
+          # linked into the binary, so it is part of the artefact: the binary
+          # looks for it at `@loader_path`, which is this directory.
+          ./packaging/place-fips-module.sh "target/$TARGET/release" "$stage"
           cp docs/compatibility.md docs/control-plane.md "$stage/docs/"
 
           if [ "$HOOKS" = "true" ]; then
@@ -308,7 +319,10 @@ jobs:
 
           `garrison-agent` is the daemon. The Linux archives also carry
           `garrison-hooks`, the control plane's `before_validate` hook
-          service, and the systemd user unit.
+          service, and the systemd user unit. The macOS archives carry
+          `libaws_lc_fips_*_crypto.dylib`, which is the validated module
+          itself: keep it beside the binary, which is where the binary looks
+          for it.
 
           Verify a download against `SHA256SUMS`:
 

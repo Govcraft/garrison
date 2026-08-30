@@ -1,0 +1,29 @@
+# Apple targets need to be told where the FIPS module is.
+#
+# `aws-lc-fips-sys` links the validated AWS-LC module statically on Linux and
+# BSD, and dynamically everywhere else — its build script picks by platform,
+# and Apple is not on the static list. The dylib's install name is
+# `@rpath/libaws_lc_fips_<version>_crypto.dylib`, so a binary that links it
+# needs an `LC_RPATH` saying where to look, and cargo does not add one.
+#
+# Without this, `garrison-agent` builds on macOS and then dies at startup with
+# "Library not loaded: @rpath/libaws_lc_fips_0_14_1_crypto.dylib ... no
+# LC_RPATH's found". It is not only the shipped binary that suffers: the
+# sandbox re-execs `garrison-agent` as a child with a scrubbed environment, so
+# the `DYLD_FALLBACK_LIBRARY_PATH` cargo sets for a test run does not reach it.
+#
+# `@loader_path` means "beside whatever loaded me", so the rule is simply that
+# the module travels with the binary — in `target/<profile>/` for a build, and
+# in the archive for a release. That is also the shape a validated module
+# wants: a discrete artefact with its own identity, rather than something
+# melted into an executable.
+#
+# Left off Linux deliberately. The module is static there, `@loader_path` is
+# Apple-only syntax, and this file must not override a developer's own
+# `[target.x86_64-unknown-linux-gnu]` rustflags.
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-Wl,-rpath,@loader_path"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-Wl,-rpath,@loader_path"]
