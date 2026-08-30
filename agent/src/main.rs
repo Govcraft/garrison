@@ -290,6 +290,22 @@ fn destination(cli: &Cli) -> Logs {
 /// runtime panics, so the check has to run before any runtime exists — which
 /// means before the attribute macro would have started one.
 fn main() -> ExitCode {
+    // A build that claims FIPS-validated cryptography puts the validated
+    // module in place as the process-wide rustls provider before anything can
+    // open a connection, and refuses to start if the module reports it is not
+    // operating in FIPS mode. This runs ahead of the sandbox re-exec check so
+    // the sandbox child gets the same provider the parent does. On a non-FIPS
+    // build the call is a no-op, so the call site needs no `cfg` of its own.
+    //
+    // It is not the only caller. Every place this crate builds a `reqwest`
+    // client installs the provider too, because a FIPS build asks reqwest not
+    // to install one of its own and `build()` panics rather than erroring when
+    // it finds none. See [`garrison_agent::crypto`]. This one stays because it
+    // is the earliest point at which the refusal can still be an exit code.
+    if let Err(error) = garrison_agent::crypto::ensure_provider() {
+        eprintln!("garrison-agent: {error}");
+        return ExitCode::from(daemon::exit_code(&error));
+    }
     acton_ai::tools::sandbox::process::runner::run_if_sandbox_child();
     serve_command_line()
 }

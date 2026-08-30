@@ -8,6 +8,7 @@ pub mod boundary;
 pub mod client;
 pub mod completion;
 pub mod config;
+pub mod crypto;
 pub mod daemon;
 pub mod duplex;
 pub mod enrollment;
