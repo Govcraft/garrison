@@ -27,9 +27,9 @@ steps, 18 tables, every `unique` constraint and every CEL rule type-checked at
 apply time, and the three hook bindings validated against the generated
 descriptor at startup. The server was then run against it and the
 authorization and write-time rules exercised over HTTP — both delete
-`forbid`s against a control case that succeeds, issuer separation between
-enrollment artifacts and console bearers, and every `@require` on both its
-passing and its failing branch. That database was discarded.
+`forbid`s against a control case that succeeds, the `enrollee` role's
+one-action allowlist against a console bearer on the same route, and every
+`@require` on both its passing and its failing branch. That database was discarded.
 
 Tooling: `schemaforge` 0.37.2, PostgreSQL flavor.
 
@@ -164,35 +164,46 @@ the token id as `sub` and the grant as claims:
 
 ```sh
 schemaforge token generate --sub tok_7f3a --lifetime 172800 \
-  --issuer garrison-enrollment --roles '' \
-  --custom-claim-string org=$ORG --custom-claim-string scope=organization \
+  --issuer garrison-control-plane --roles enrollee \
+  --tenant-chain "[{\"schema\":\"Organization\",\"entity_id\":\"$ORG\"}]" \
+  --custom-claim-string scope=organization \
   --custom-claim-long max_uses=25
 
 schemaforge entity create EnrollmentToken \
-  --set token_id=tok_7f3a --set issuer=garrison-enrollment \
+  --set token_id=tok_7f3a --set issuer=garrison-control-plane \
   --set organization=$ORG --set scope=organization --set max_uses=25 \
   --set issued_by=so@agency.gov --set expires_at=2026-08-31T04:00:00Z
 ```
+
+`--tenant-chain` is neither optional nor cosmetic. `_tenant` is injected from
+that claim alone, and a row written without it lands untenanted, where it is
+invisible to every tenant-scoped bearer, including the hooks service that has
+to read it. The symptom is "no enrollment token matches this artifact" for a
+row that plainly exists, which cost real time to diagnose once already.
 
 Authenticity comes from the signature; the row supplies what a signature
 cannot — revocation, use counting, and who issued it. The row is an ordinary
 entity, so provisioning is scriptable with the CLI like everything else.
 
-The two token families are kept apart structurally, not by convention. An
-enrollment artifact is minted under its own `issuer`, and acton-service
-validates `iss` on every bearer, so presenting one as a session token fails
-before authorization runs:
+The two token families are kept apart by their role set, not by their issuer.
+acton-service validates `iss` against exactly one configured issuer, so an
+artifact minted under a second one is a 401 at the plane's middleware and never
+reaches the redemption route at all. Both families are therefore minted under
+`garrison-control-plane`. What separates them is that an artifact carries the
+single role `enrollee`:
 
 ```
-GET /schemas/Organization/entities   (enrollment artifact as bearer)
-  401  Invalid PASETO token: the claim 'iss' failed validation
-GET /schemas/Organization/entities   (console bearer, same route)
+POST /schemas/Redemption/entities    (enrollment artifact as bearer)
+  201
+GET  /schemas/Organization/entities  (enrollment artifact as bearer)
+  403  the `enrollee` role grants write on Redemption and nothing else
+GET  /schemas/Organization/entities  (console bearer, same route)
   200
 ```
 
-The corollary is that the redemption route must verify the artifact itself,
-since the standard bearer middleware will refuse it. That is correct: a daemon
-redeeming a token has no other credential to present.
+That is an allowlist of exactly one action rather than a credential merely
+refused everywhere else, which is why the failure mode of getting it wrong is
+a daemon that cannot enroll rather than one that can do more than enroll.
 
 The trade to write down: a database compromise still yields nothing, but a
 compromise of the signing key lets an attacker mint enrollment tokens. That key
@@ -1657,6 +1668,18 @@ exactly one install identity: a fleet of editor windows is one
 
 ## Known gaps
 
+- **`EnrollmentToken.issuer` catches a typo, not a cross-purpose token.**
+  `adjudicate` compares the stored column against the plane's configured
+  issuer, and its doc comment reads as if that stopped a token minted for
+  some other purpose. It cannot: the plane validates `iss` against exactly
+  one issuer, every artifact is minted under it, and an attacker holding the
+  signing key mints under that same one. The check is worth keeping as a
+  provisioning guard, and the column is `required indexed` on a surface about
+  to freeze. Whether it should instead be re-founded on a custom claim
+  projected onto `Forge::Principal` and asserted in a `@require` depends on
+  whether SchemaForge can source a principal claim from a raw token claim
+  rather than only from `source = { user_field = ... }`. That is an open
+  question for 1.0, recorded here rather than answered.
 - **A bundle's `network_egress` and `allow_unsandboxed_escalation` are
   recorded and not enforced.** They are part of the checksum and reported in
   `_garrison/status`; no code acts on them. `ping` says so out loud.

@@ -50,12 +50,15 @@ tasks:
   test:
     desc: Run the Rust workspace test suite
     cmds:
-      - cargo test --workspace
+      # --locked: the committed lockfile is what a release is built from, and
+      # a test run that quietly resolved something else would not be testing
+      # the thing that ships.
+      - cargo nextest run --workspace --locked
 
   check:
     desc: Type-check the Rust workspace
     cmds:
-      - cargo check --workspace
+      - cargo check --workspace --locked
 
   fmt:
     desc: Check Rust formatting without changing files

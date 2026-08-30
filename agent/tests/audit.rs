@@ -687,3 +687,117 @@ async fn a_plane_without_a_trail_refuses_to_start() {
 
     ai.shutdown().await.expect("clean shutdown");
 }
+
+// =============================================================================
+// Regenerating the frozen 1.0 fixture
+// =============================================================================
+/// A client that refuses every permission request, and watches nothing.
+///
+/// The counterpart to [`Watched`], which panics on one. Used only by the
+/// fixture generator, whose script deliberately reaches the operator so the
+/// frozen trail carries a refused entry.
+struct Refusing;
+
+impl Interactions for Refusing {
+    fn permission(
+        &mut self,
+        _request: &acp::RequestPermissionRequest,
+    ) -> acp::RequestPermissionOutcome {
+        acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(
+            acp::OPTION_REJECT,
+        ))
+    }
+}
+
+/// Rewrites `tests/fixtures/audit-1.0/`, which `audit_fixture.rs` is pinned to.
+///
+/// It lives here rather than beside the assertions because this is where the
+/// machinery is: a fixture worth pinning is one the real writer produced
+/// through the real path, over a real socket, from a real turn. Sealing four
+/// records by hand would freeze what a test believes the format is rather than
+/// what the daemon actually writes.
+///
+/// Ignored, and refuses to run without `GARRISON_REGENERATE_AUDIT_FIXTURE=1`,
+/// so neither `--run-ignored all` nor a stray CI flag can quietly rewrite the
+/// thing the freeze is measured against. Run it only for a format break that
+/// has been decided on, then pin the values it prints.
+#[tokio::test]
+#[ignore = "rewrites the frozen 1.0 audit fixture; only for a decided format break"]
+async fn regenerate_the_frozen_audit_fixture() {
+    assert_eq!(
+        std::env::var("GARRISON_REGENERATE_AUDIT_FIXTURE")
+            .ok()
+            .as_deref(),
+        Some("1"),
+        "set GARRISON_REGENERATE_AUDIT_FIXTURE=1 to rewrite the frozen fixture",
+    );
+
+    let fixture = Fixture::new("regenerate");
+
+    // Four calls, chosen for the shapes they freeze rather than for what they
+    // do: two approved writes, an approved read, and a call to a tool nobody
+    // put on the auto-approve list, which the client below refuses. The
+    // refusal is the one that matters most — a denied entry carries a zero
+    // duration, no response size, and the `denied` outcome tag, and none of
+    // those appear in an approved one.
+    let listing = fixture.workspace();
+    let mut script = write_write_read(&fixture);
+    script.pop();
+    script.push(Round::tool_call(
+        "call-4",
+        "list_directory",
+        json!({ "path": listing }),
+    ));
+    script.push(Round::text("done"));
+
+    let server = MockServer::start(script).await;
+    let ai = ActonAI::builder()
+        .app_name("garrison-audit-test")
+        .with_builtin_tools(&["write_file", "read_file", "list_directory"])
+        .ollama_at(server.base_url(), "test-model")
+        .tool_policy(ToolPolicy::new().on_approval(approval::approval_hook))
+        .audit(AuditConfig::new(fixture.trail()).with_durability(AuditDurability::Strict))
+        .launch()
+        .await
+        .expect("the audited runtime must launch");
+
+    let (agent, mut client) =
+        connect(&ai, &config_for(&fixture, Some(AuditDurability::Strict))).await;
+    let session = open_session(&mut client, &fixture).await;
+
+    client
+        .prompt(
+            session,
+            "write two files, read one, and list the directory",
+            &mut Refusing,
+        )
+        .await
+        .expect("the turn must complete so the trail has entries");
+
+    // Anchoring flushes the writer and settles the head, so what is copied is
+    // a trail nothing is still appending to.
+    let anchored = agent.anchor_now().await;
+    agent.shutdown().await;
+    ai.shutdown().await.expect("clean shutdown");
+
+    let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/audit-1.0");
+    std::fs::create_dir_all(&target).expect("the fixture directory can be created");
+    std::fs::copy(fixture.trail(), target.join("audit.jsonl")).expect("the trail can be copied");
+
+    let sidecar = PathBuf::from(format!("{}.trail", fixture.trail().display()));
+    std::fs::copy(&sidecar, target.join("audit.jsonl.trail"))
+        .expect("the sidecar can be copied; a trail with an identity has one");
+
+    let contents = std::fs::read_to_string(target.join("audit.jsonl")).expect("the copy reads");
+    let entries = acton_ai::audit::parse_entries(&contents).expect("the copy parses");
+    let head = acton_ai::audit::verify_chain(&entries).expect("the copy verifies");
+
+    println!("wrote {} entries to {}", entries.len(), target.display());
+    println!("pin ENTRY_COUNT = {}", entries.len());
+    println!("pin HEAD_HASH = \"{}\"", head.hash);
+    println!(
+        "pin TRAIL_ID = \"{}\"",
+        head.trail_id.expect("the chain carries its identity"),
+    );
+    println!("anchored head: {anchored:?}");
+}
