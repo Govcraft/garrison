@@ -21,6 +21,7 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Map;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 final class GarrisonToolWindow implements Disposable, GarrisonConnection.Listener {
     private final Project project;
@@ -36,6 +37,7 @@ final class GarrisonToolWindow implements Disposable, GarrisonConnection.Listene
         return thread;
     });
     private final Map<String, JsonElement> pendingApprovals = new ConcurrentHashMap<>();
+    private final AtomicBoolean agentPrefixPending = new AtomicBoolean();
     private volatile boolean busy;
 
     GarrisonToolWindow(Project project) {
@@ -58,6 +60,9 @@ final class GarrisonToolWindow implements Disposable, GarrisonConnection.Listene
 
         var composer = new JPanel(new BorderLayout(0, 6));
         composer.setBorder(JBUI.Borders.empty(8));
+        var promptLabel = new JLabel("Message Garrison");
+        promptLabel.setLabelFor(input);
+        composer.add(promptLabel, BorderLayout.NORTH);
         composer.add(new JBScrollPane(input), BorderLayout.CENTER);
         composer.add(buttons, BorderLayout.SOUTH);
         root.add(scroll, BorderLayout.CENTER);
@@ -79,7 +84,8 @@ final class GarrisonToolWindow implements Disposable, GarrisonConnection.Listene
         String text = input.getText().trim();
         if (text.isEmpty() || busy) return;
         input.setText("");
-        append("You\n" + text + "\n\n", true);
+        append("You: " + text + "\n\n", true);
+        agentPrefixPending.set(true);
         announce("Garrison is responding.", false);
         setBusy(true);
         worker.submit(() -> {
@@ -107,6 +113,7 @@ final class GarrisonToolWindow implements Disposable, GarrisonConnection.Listene
         var update = frame.getAsJsonObject("params").getAsJsonObject("update");
         String kind = update.get("sessionUpdate").getAsString();
         if ("agent_message_chunk".equals(kind)) {
+            if (agentPrefixPending.getAndSet(false)) append("Garrison: ", true);
             append(update.getAsJsonObject("content").get("text").getAsString(), false);
         } else if ("tool_call".equals(kind)) {
             String title = update.get("title").getAsString();
