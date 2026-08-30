@@ -79,6 +79,7 @@ final class GarrisonToolWindow implements Disposable, GarrisonConnection.Listene
     }
 
     JComponent component() { return root; }
+    JComponent preferredFocusComponent() { return input; }
 
     void sendPrompt() {
         String text = input.getText().trim();
@@ -210,8 +211,9 @@ final class GarrisonToolWindow implements Disposable, GarrisonConnection.Listene
         busy = value;
         ApplicationManager.getApplication().invokeLater(() -> {
             send.setEnabled(!value);
-            input.setEnabled(!value);
+            input.setEditable(!value);
             cancel.setVisible(value);
+            if (!value) input.requestFocusInWindow();
         });
     }
 

@@ -13,6 +13,7 @@ public final class GarrisonToolWindowFactory implements ToolWindowFactory, DumbA
         var panel = new GarrisonToolWindow(project);
         GarrisonActions.register(project, panel);
         var content = ContentFactory.getInstance().createContent(panel.component(), "", false);
+        content.setPreferredFocusableComponent(panel.preferredFocusComponent());
         content.setDisposer(panel);
         toolWindow.getContentManager().addContent(content);
     }
