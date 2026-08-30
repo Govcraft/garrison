@@ -137,14 +137,15 @@ pub fn notice_line(text: String) -> Line<'static> {
 /// A line reporting a tool call that finished.
 #[must_use]
 pub fn tool_line(title: String, succeeded: bool) -> Line<'static> {
-    let (mark, color) = if succeeded {
-        ("✓ ", Color::LightGreen)
+    let (mark, status, color) = if succeeded {
+        ("✓ ", "ok: ", Color::LightGreen)
     } else {
-        ("✗ ", Color::LightRed)
+        ("✗ ", "failed: ", Color::LightRed)
     };
 
     Line::from(vec![
         Span::styled(mark.to_string(), Style::default().fg(color)),
+        Span::styled(status.to_string(), Style::default().fg(color)),
         Span::styled(title, Style::default().fg(Color::Gray)),
     ])
 }
@@ -281,8 +282,11 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_tool_is_marked_differently_from_one_that_worked() {
-        assert!(text(&tool_line("bash".to_string(), true)).starts_with('✓'));
-        assert!(text(&tool_line("bash".to_string(), false)).starts_with('✗'));
+    fn tool_results_state_their_outcome_in_words() {
+        assert_eq!(text(&tool_line("bash".to_string(), true)), "✓ ok: bash");
+        assert_eq!(
+            text(&tool_line("bash".to_string(), false)),
+            "✗ failed: bash"
+        );
     }
 }
