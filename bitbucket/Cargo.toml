@@ -1,0 +1,16 @@
+[package]
+name = "garrison-bitbucket"
+version = "1.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+base64 = "0.23.1"
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "query"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
+wiremock = "0.6.5"
