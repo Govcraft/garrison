@@ -87,6 +87,8 @@ pub struct Approval {
     transcript: Option<ActorHandle>,
     /// Who to tell when focus moves.
     router: Option<ActorHandle>,
+    /// Who changes the contextual key hint when focus moves.
+    status: Option<ActorHandle>,
     /// Who writes the answer on the wire.
     session: Option<ActorHandle>,
 }
@@ -245,6 +247,10 @@ pub fn prompt(
             secondary,
         )));
     }
+    lines.push(Line::from(Span::styled(
+        "  Esc or Ctrl+C refuses".to_string(),
+        secondary,
+    )));
 
     lines
 }
@@ -302,6 +308,7 @@ fn configure(builder: &mut ManagedActor<Idle, Approval>) {
         actor.model.compositor = Some(message.compositor.clone());
         actor.model.transcript = Some(message.transcript.clone());
         actor.model.router = Some(message.router.clone());
+        actor.model.status = Some(message.status.clone());
         actor.model.session = Some(message.session.clone());
         Reply::ready()
     });
@@ -365,6 +372,7 @@ fn open(actor: &mut ManagedActor<Started, Approval>, notice: Line<'static>) -> F
     let compositor = actor.model.compositor.clone();
     let transcript = actor.model.transcript.clone();
     let router = actor.model.router.clone();
+    let status = actor.model.status.clone();
 
     Reply::pending(async move {
         if let Some(transcript) = transcript {
@@ -376,6 +384,13 @@ fn open(actor: &mut ManagedActor<Started, Approval>, notice: Line<'static>) -> F
         }
         if let Some(router) = router {
             router
+                .send(FocusChanged {
+                    holder: Focus::Approval,
+                })
+                .await;
+        }
+        if let Some(status) = status {
+            status
                 .send(FocusChanged {
                     holder: Focus::Approval,
                 })
@@ -399,6 +414,7 @@ fn answer(
     let compositor = actor.model.compositor.clone();
     let transcript = actor.model.transcript.clone();
     let router = actor.model.router.clone();
+    let status = actor.model.status.clone();
     let session = actor.model.session.clone();
     let note = notice_line(format!("{}: {}", verdict(option), title));
 
@@ -412,6 +428,13 @@ fn answer(
         if !still_open {
             if let Some(router) = router {
                 router
+                    .send(FocusChanged {
+                        holder: Focus::Composer,
+                    })
+                    .await;
+            }
+            if let Some(status) = status {
+                status
                     .send(FocusChanged {
                         holder: Focus::Composer,
                     })
@@ -447,6 +470,7 @@ fn expire(
     let compositor = actor.model.compositor.clone();
     let transcript = actor.model.transcript.clone();
     let router = actor.model.router.clone();
+    let status = actor.model.status.clone();
     let notice = notice_line(format!("permission expired and was refused: {title}"));
 
     Reply::pending(async move {
@@ -460,6 +484,13 @@ fn expire(
         if was_front && !still_open {
             if let Some(router) = router {
                 router
+                    .send(FocusChanged {
+                        holder: Focus::Composer,
+                    })
+                    .await;
+            }
+            if let Some(status) = status {
+                status
                     .send(FocusChanged {
                         holder: Focus::Composer,
                     })
@@ -583,7 +614,7 @@ mod tests {
             1,
             Duration::from_secs(300),
         );
-        assert_eq!(lines.len(), 3 + CHOICES.len());
+        assert_eq!(lines.len(), 4 + CHOICES.len());
         assert!(text(&lines[4]).starts_with("  ›"));
         assert!(text(&lines[3]).starts_with("    "));
     }
@@ -608,7 +639,10 @@ mod tests {
     #[test]
     fn a_queue_deeper_than_one_says_how_many_are_waiting() {
         let lines = prompt("run bash", None, 0, 3, Duration::from_secs(300));
-        assert!(text(lines.last().expect("a tail row")).contains("2 more waiting"));
+        assert!(lines
+            .iter()
+            .map(text)
+            .any(|line| line.contains("2 more waiting")));
     }
 
     #[test]
@@ -616,6 +650,15 @@ mod tests {
         let lines = prompt("run bash", None, 0, 1, Duration::from_secs(300));
         assert_eq!(text(&lines[1]), "  expires in 5m00s");
         assert_eq!(lines[1].spans[0].style.fg, Some(Color::Gray));
+    }
+
+    #[test]
+    fn the_prompt_names_both_refusal_shortcuts() {
+        let lines = prompt("run bash", None, 0, 1, Duration::from_secs(300));
+        assert_eq!(
+            text(lines.last().expect("a key hint")),
+            "  Esc or Ctrl+C refuses"
+        );
     }
 
     #[test]

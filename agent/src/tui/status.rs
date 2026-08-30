@@ -5,7 +5,8 @@
 //! silent the moment one ends, so an idle interface costs no frames at all.
 
 use super::message::{
-    Region, RegionRendered, StatusTick, ToolEnded, ToolStarted, TurnEnded, TurnStarted, Wire,
+    Focus, FocusChanged, Region, RegionRendered, StatusTick, ToolEnded, ToolStarted, TurnEnded,
+    TurnStarted, Wire,
 };
 use acton_reactive::prelude::*;
 use ratatui::style::{Color, Modifier, Style};
@@ -40,6 +41,8 @@ pub struct Status {
     compositor: Option<ActorHandle>,
     /// Whether the activity glyph advances on the timer.
     animation: bool,
+    /// Whether a permission prompt currently owns the keyboard.
+    approval_open: bool,
 }
 
 impl Status {
@@ -68,6 +71,7 @@ impl Status {
                 },
                 started.elapsed(),
                 &self.tools,
+                self.approval_open,
             ),
         )
     }
@@ -81,6 +85,7 @@ pub fn summary(
     spinner: &str,
     elapsed: Duration,
     tools: &BTreeMap<String, String>,
+    approval_open: bool,
 ) -> Vec<Line<'static>> {
     let accent = Style::default().fg(Color::LightCyan);
     let secondary = Style::default().fg(Color::Gray);
@@ -89,7 +94,15 @@ pub fn summary(
         Span::styled(format!("{spinner} "), accent),
         Span::styled("Working".to_string(), accent.add_modifier(Modifier::BOLD)),
         Span::styled(
-            format!("  ({} · Esc to interrupt)", humanize(elapsed)),
+            format!(
+                "  ({} · {})",
+                humanize(elapsed),
+                if approval_open {
+                    "Esc/Ctrl+C refuse permission"
+                } else {
+                    "Esc to interrupt"
+                }
+            ),
             secondary,
         ),
     ])];
@@ -126,6 +139,11 @@ fn configure(builder: &mut ManagedActor<Idle, Status>) {
     builder.mutate_on::<Wire>(|actor, context| {
         actor.model.compositor = Some(context.message().compositor.clone());
         Reply::ready()
+    });
+
+    builder.mutate_on::<FocusChanged>(|actor, context| {
+        actor.model.approval_open = matches!(context.message().holder, Focus::Approval);
+        repaint(actor)
     });
 
     builder.mutate_on::<TurnStarted>(|actor, _| {
@@ -212,7 +230,7 @@ mod tests {
 
     #[test]
     fn the_headline_names_the_escape_key_so_interrupting_is_discoverable() {
-        let lines = summary("⠋", Duration::from_secs(3), &BTreeMap::new());
+        let lines = summary("⠋", Duration::from_secs(3), &BTreeMap::new(), false);
         assert_eq!(lines.len(), 1);
         assert!(text(&lines[0]).contains("Esc to interrupt"));
         assert!(text(&lines[0]).contains("3s"));
@@ -221,7 +239,12 @@ mod tests {
 
     #[test]
     fn each_running_tool_gets_its_own_row() {
-        let lines = summary("⠋", Duration::from_secs(1), &tools(&["bash", "read_file"]));
+        let lines = summary(
+            "⠋",
+            Duration::from_secs(1),
+            &tools(&["bash", "read_file"]),
+            false,
+        );
         assert_eq!(lines.len(), 3);
         assert!(text(&lines[1]).contains("bash"));
         assert!(text(&lines[2]).contains("read_file"));
@@ -233,6 +256,7 @@ mod tests {
             "⠋",
             Duration::from_secs(1),
             &tools(&["a", "b", "c", "d", "e"]),
+            false,
         );
         assert_eq!(lines.len(), 1 + MAX_DETAIL_ROWS + 1);
         assert!(text(lines.last().expect("a summary row")).contains("and 2 more"));
@@ -262,5 +286,13 @@ mod tests {
             ..Status::default()
         };
         assert!(text(&status.render().lines[0]).starts_with("• Working"));
+    }
+
+    #[test]
+    fn permission_focus_replaces_the_interrupt_hint() {
+        let lines = summary("⠋", Duration::from_secs(3), &BTreeMap::new(), true);
+        let headline = text(&lines[0]);
+        assert!(headline.contains("Esc/Ctrl+C refuse permission"));
+        assert!(!headline.contains("Esc to interrupt"));
     }
 }
