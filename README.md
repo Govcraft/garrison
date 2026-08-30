@@ -112,6 +112,10 @@ socket client ──────────────────────
 The intended control plane and IDE integrations are documented as roadmap
 architecture in [docs/garrison-agent-design.md](docs/garrison-agent-design.md).
 
+What 1.0 promises about the schemas, the enrollment protocol, the ACP surface,
+`garrison.toml`, and the audit trail on disk — and what it deliberately does
+not — is in [docs/compatibility.md](docs/compatibility.md).
+
 ## Process topology
 
 One daemon per user per machine. `garrison-agent serve` is the only process

@@ -165,7 +165,8 @@ the token id as `sub` and the grant as claims:
 ```sh
 schemaforge token generate --sub tok_7f3a --lifetime 172800 \
   --issuer garrison-control-plane --roles enrollee \
-  --custom-claim-string org=$ORG --custom-claim-string scope=organization \
+  --tenant-chain "[{\"schema\":\"Organization\",\"entity_id\":\"$ORG\"}]" \
+  --custom-claim-string scope=organization \
   --custom-claim-long max_uses=25
 
 schemaforge entity create EnrollmentToken \
@@ -173,6 +174,12 @@ schemaforge entity create EnrollmentToken \
   --set organization=$ORG --set scope=organization --set max_uses=25 \
   --set issued_by=so@agency.gov --set expires_at=2026-08-31T04:00:00Z
 ```
+
+`--tenant-chain` is neither optional nor cosmetic. `_tenant` is injected from
+that claim alone, and a row written without it lands untenanted, where it is
+invisible to every tenant-scoped bearer, including the hooks service that has
+to read it. The symptom is "no enrollment token matches this artifact" for a
+row that plainly exists, which cost real time to diagnose once already.
 
 Authenticity comes from the signature; the row supplies what a signature
 cannot — revocation, use counting, and who issued it. The row is an ordinary
