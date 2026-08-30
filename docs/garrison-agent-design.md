@@ -75,9 +75,9 @@ root, which travels with each call. `_garrison/status` reports whether
 isolation and hardening are in force. The escalation *flow* (sandboxed fail
 → approval round-trip → unsandboxed retry,
 recorded in the audit chain as an escalation) is new prompt-loop behavior.
-Approved-prefix caching lives in per-turn policy state. This maps 1:1 onto
-USAC Tier A/B/C: escalation is precisely a Tier B→C transition with a human
-gate — the audit chain makes it *evidence*.
+Approved-prefix caching lives in per-turn policy state. This maps 1:1 onto a
+tiered agentic-autonomy model: escalation is precisely a transition to the
+higher tier through a human gate — the audit chain makes it *evidence*.
 
 ### 1.4 Persistent PTY sessions: `unified_exec`
 One-shot bash is not how developers work. `unified_exec` maintains PTY-backed
@@ -96,8 +96,8 @@ fsmonitor baselines) — with a 100ms diff timeout falling back to coarse diff.
 The UI can always answer "what did the agent just do to my tree?"
 
 → **Planned:** `TurnDiff` actor fed by the audit pipeline (acton-ai
-broadcast every tool outcome). Per-turn diff is the artifact USAC Tier B
-review gates on: "explicit developer review and approval before merge" needs
+broadcast every tool outcome). Per-turn diff is the artifact a mandatory
+review gate operates on: "explicit developer review and approval before merge" needs
 a *thing to review*. This is a compliance feature wearing a UX costume.
 
 ### 1.6 Repo awareness: `git-utils`
@@ -158,8 +158,8 @@ findings" statement. Review is a *mode*, not a vibe.
 
 → **Implemented, experimental:** `garrison-agent review` fetches a pull
 request diff via Bitbucket DC REST, runs the review prompt, and posts findings
-as inline PR comments with a build status on the commit (RFQ §3.A.2,
-"pull-request-level AI review is strongly desired"). See
+as inline PR comments with a build status on the commit, the pull-request-level
+review an agency shop most often asks for first. See
 `docs/review-mode.md`.
 
 It ships in the binary and refuses to run until a deployment enables it
@@ -293,7 +293,7 @@ Approval round-trip: policy gate → callback → ProtocolServer → IDE dialog 
 decision → gate → audit entry with decider = `Callback` and the protocol
 client identity.
 
-## 5. Build order (RFQ-demo-first)
+## 5. Build order (demo-first)
 
 1. ~~**ACP server over stdio and Unix sockets**~~ — implemented; stdio is now
    a relay to the per-user daemon (README, "Process topology")
