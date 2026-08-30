@@ -863,6 +863,80 @@ struct TurnJob {
     opening: Option<SessionMeta>,
 }
 
+/// Discovers this turn's `AGENTS.md` project instructions, gated by whatever
+/// governs this install, and returns the fragment to append to the system
+/// prompt. `None` when discovery is disabled, found nothing, or failed.
+///
+/// # Fail-closed, and one deliberate exception
+///
+/// A policy actor that cannot be asked has not said "enabled", on the same
+/// reasoning [`admission::admit`] already applies to every other gate: this
+/// falls back to [`AgentsMdDiscovery::Disabled`] when `setup.policy` is
+/// `Some` but the ask errors. The exception is `setup.policy` being `None`
+/// outright — no governance subsystem participates in this stack at all, the
+/// same stack shape that leaves every tool call to the local auto-approve
+/// list — where discovery runs unrestricted rather than locking down alone
+/// while nothing else here is gated.
+///
+/// A discovery error (an unreadable file, an unresolvable path) is logged and
+/// swallowed rather than failing the turn: a turn that could not read
+/// `AGENTS.md` should still run, the same way a turn missing its optional
+/// system prompt still runs.
+async fn discovered_agents_md(setup: &ThreadSetup) -> Option<String> {
+    let policy = match &setup.policy {
+        Some(handle) => match handle.ask(crate::policy::agent::CurrentAgentsMdPolicy).await {
+            Ok(policy) => policy,
+            Err(error) => {
+                tracing::warn!(
+                    thread_id = %setup.thread_id,
+                    %error,
+                    "the AGENTS.md discovery policy could not be read; treating discovery as disabled",
+                );
+                crate::policy::agent::AgentsMdPolicy {
+                    discovery: garrison_policy::AgentsMdDiscovery::Disabled,
+                    allowed_paths: Vec::new(),
+                }
+            }
+        },
+        None => crate::policy::agent::AgentsMdPolicy {
+            discovery: garrison_policy::AgentsMdDiscovery::Enabled,
+            allowed_paths: Vec::new(),
+        },
+    };
+
+    match crate::instructions::discover(
+        setup.project_root.as_ref(),
+        setup.project_root.as_ref(),
+        policy.discovery,
+        &policy.allowed_paths,
+    ) {
+        Ok(discovered) if discovered.is_empty() => None,
+        Ok(discovered) => {
+            for layer in &discovered.layers {
+                // Interim, non-chained: the sealed audit chain has no field
+                // for this yet. See Govcraft/acton-ai#18 and
+                // Govcraft/garrison#29.
+                tracing::info!(
+                    thread_id = %setup.thread_id,
+                    scope = layer.scope,
+                    path = %layer.path.display(),
+                    blake3 = %layer.blake3,
+                    "AGENTS.md instructions loaded for this turn",
+                );
+            }
+            Some(discovered.context_fragment)
+        }
+        Err(error) => {
+            tracing::warn!(
+                thread_id = %setup.thread_id,
+                %error,
+                "AGENTS.md discovery failed; the turn runs without project instructions",
+            );
+            None
+        }
+    }
+}
+
 /// The turn itself, separated so `run_turn` is only about reporting.
 async fn drive_turn(
     setup: &ThreadSetup,
@@ -933,8 +1007,19 @@ async fn drive_turn(
             &acp::agent_chunk(&thread_id, text),
         );
     });
-    if let Some(system) = &setup.system_prompt {
-        builder = builder.system(system.clone());
+    // `.system()` overwrites rather than appends, so the operator's own
+    // prompt and the discovered `AGENTS.md` fragment are joined into one
+    // call rather than two: a second call here would silently discard
+    // whichever call ran first.
+    let agents_md = discovered_agents_md(setup).await;
+    let system = match (&setup.system_prompt, agents_md) {
+        (Some(configured), Some(fragment)) => Some(format!("{configured}\n\n{fragment}")),
+        (Some(configured), None) => Some(configured.clone()),
+        (None, Some(fragment)) => Some(fragment),
+        (None, None) => None,
+    };
+    if let Some(system) = system {
+        builder = builder.system(system);
     }
     // Named so the checkpoint carries the identity the client was told, and
     // pointed at the conversation the metadata names rather than the one the

@@ -129,6 +129,16 @@ pub struct BundleHeader {
     /// the outcome worth detecting.
     #[serde(default)]
     pub allowed_endpoints: Vec<String>,
+    /// Whether, and how far, the daemon may discover `AGENTS.md` project
+    /// instructions. Enforced, unlike [`Self::network_egress`]: garrison-agent
+    /// does have a gate to withhold here.
+    #[serde(default)]
+    pub agents_md_discovery: AgentsMdDiscovery,
+    /// Newline-separated paths, relative to the approved root, discovery may
+    /// read an `AGENTS.md` from when [`Self::agents_md_discovery`] is
+    /// [`AgentsMdDiscovery::Restricted`]. Meaningless otherwise.
+    #[serde(default)]
+    pub agents_md_allowed_paths: String,
 }
 
 impl BundleHeader {
@@ -136,6 +146,16 @@ impl BundleHeader {
     #[must_use]
     pub fn is_published(&self) -> bool {
         self.status == "published"
+    }
+
+    /// The paths [`Self::agents_md_allowed_paths`] names, one per line,
+    /// trimmed and with blank lines dropped. Meaningful only when
+    /// [`Self::agents_md_discovery`] is [`AgentsMdDiscovery::Restricted`].
+    pub fn agents_md_allowed_paths(&self) -> impl Iterator<Item = &str> {
+        self.agents_md_allowed_paths
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
     }
 }
 
@@ -182,6 +202,26 @@ pub enum NetworkEgress {
     ApprovedHosts,
     /// Any host.
     Allow,
+}
+
+/// Whether, and how far, `AGENTS.md` project-instruction discovery may reach.
+///
+/// Project instructions are untrusted content: loading one can shape what a
+/// turn sees and never what a bundle's rules, the approved root, the sandbox,
+/// or the approval gate allow. This field is the one knob a bundle author has
+/// over whether that content is loaded at all.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentsMdDiscovery {
+    /// Discover under the whole approved root: every `AGENTS.md` from the
+    /// root down to the session's working directory, plus the operator's own
+    /// `~/.agents/AGENTS.md`. The schema's default.
+    #[default]
+    Enabled,
+    /// Load no `AGENTS.md`, anywhere, including the operator's own.
+    Disabled,
+    /// Load only the paths named in `agents_md_allowed_paths`.
+    Restricted,
 }
 
 /// A rule about one program's canonicalized argv.
@@ -456,6 +496,39 @@ mod tests {
         assert_eq!(header.version, 1);
         assert_eq!(header.default_approval_mode, ApprovalMode::OnRequest);
         assert_eq!(header.network_egress, NetworkEgress::Deny);
+        assert_eq!(header.agents_md_discovery, AgentsMdDiscovery::Enabled);
         assert!(!header.is_published());
+    }
+
+    #[test]
+    fn a_row_that_omits_agents_md_discovery_reads_as_enabled() {
+        // The safe reading of a wire hiccup is "search the whole approved
+        // root", not "search nothing" — a transport quirk must not silently
+        // widen a `restricted` or `disabled` bundle into `enabled`, and it
+        // cannot: the schema's own default for a genuinely absent column
+        // *is* `enabled`, so this is the one case where "missing" and "wide
+        // open" already agree.
+        let header: BundleHeader =
+            serde_json::from_value(json!({ "id": "policybundle_01", "name": "Baseline" }))
+                .expect("a row parses");
+
+        assert_eq!(header.agents_md_discovery, AgentsMdDiscovery::Enabled);
+    }
+
+    #[test]
+    fn allowed_paths_are_split_trimmed_and_blank_lines_are_dropped() {
+        let header = BundleHeader {
+            agents_md_allowed_paths: "  packages/api\n\ndocs \n\tservices/web\t\n".into(),
+            ..BundleHeader::default()
+        };
+
+        let paths: Vec<&str> = header.agents_md_allowed_paths().collect();
+        assert_eq!(paths, ["packages/api", "docs", "services/web"]);
+    }
+
+    #[test]
+    fn an_empty_allowed_paths_string_names_no_paths() {
+        let header = BundleHeader::default();
+        assert_eq!(header.agents_md_allowed_paths().count(), 0);
     }
 }

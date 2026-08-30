@@ -111,13 +111,28 @@ Environment context (branch, dirty state, recent commits) injected as a
 context fragment at turn start.
 
 ### 1.7 Project instruction discovery: AGENTS.md
-`agents_md.rs` + `find_up`: walk up from cwd, load AGENTS.md hierarchy, layer
-user instructions over project instructions. This is the CLAUDE.md idea as a
-portable convention.
+`agent/src/instructions.rs`, over acton-ai's `AgentInstructions`
+(Govcraft/acton-ai#15): `AGENTS.md` only, no `GARRISON.md` — an
+administrator's instructions already have a trusted channel, the control-plane
+policy bundle, and a second markdown layer would duplicate it rather than add
+anything. Discovery is confined to `project_root`, the same boundary every
+other tool is held to, never acton-ai's own `.git`-based root-finding.
 
-→ **Planned:** support AGENTS.md (the emerging cross-vendor standard) and
-GARRISON.md, hierarchical, nearest-wins-per-key. acton-ai's SkillRegistry
-already covers the skills half.
+Project instructions are untrusted content: loading one can shape what a turn
+sees and never what the policy bundle, the approved root, the sandbox, or the
+approval gate decide — a structural property, since none of those read a
+turn's context, not a promise the wording of the injected fragment has to
+keep alone. `PolicyBundle.agents_md_discovery` is the bundle author's gate:
+`enabled` (the default) reads every layer from the approved root down to the
+session's working directory plus the operator's own `~/.agents/AGENTS.md`;
+`restricted` reads only the project layers named in
+`agents_md_allowed_paths`; `disabled` reads none at all. A standalone install
+with no plane runs unrestricted, the same trust the local auto-approve list
+already gets.
+
+Loading is logged (which files, which BLAKE3, not their content) but not yet
+sealed into the tamper-evident audit chain — `TurnRecord` has no field for it
+in acton-ai 0.36.0. Tracked as Govcraft/acton-ai#18.
 
 ### 1.8 Context management: budget + compaction + rollouts
 - `compact.rs`: auto-summarization when the window fills, with pre/post-compact

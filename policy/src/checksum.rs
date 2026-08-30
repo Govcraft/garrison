@@ -14,8 +14,8 @@
 //! In: everything that changes a decision — the bundle's name and version,
 //! the default approval mode, the two recorded-but-unenforced fields (an
 //! author who changes them has changed the published policy, whether or not
-//! this release acts on them), and every **enabled** rule's matching terms
-//! and verdict.
+//! this release acts on them), the `AGENTS.md` discovery mode and its
+//! allowed paths, and every **enabled** rule's matching terms and verdict.
 //!
 //! Out: row ids, timestamps, the organization, the checksum itself, and
 //! justifications. Ids and timestamps differ between a bundle and its copy in
@@ -27,8 +27,8 @@
 //! not part of the answer.
 
 use crate::bundle::{
-    ApprovalMode, Bundle, CommandDecision, CommandRule, ModelEndpoint, NetworkEgress, ToolDecision,
-    ToolRule,
+    AgentsMdDiscovery, ApprovalMode, Bundle, CommandDecision, CommandRule, ModelEndpoint,
+    NetworkEgress, ToolDecision, ToolRule,
 };
 use serde::Serialize;
 
@@ -75,12 +75,20 @@ pub fn canonical_bytes(bundle: &Bundle) -> Vec<u8> {
         bundle.endpoints.iter().map(canonical_endpoint).collect();
     endpoints.sort_by(|a, b| a.name.cmp(b.name));
 
+    // Sorted for the same reason rules are: the list is an allow-set, not a
+    // sequence, so two authors who typed the same paths in a different order
+    // published the same policy.
+    let mut agents_md_allowed_paths: Vec<&str> = bundle.header.agents_md_allowed_paths().collect();
+    agents_md_allowed_paths.sort_unstable();
+
     let canonical = Canonical {
         name: &bundle.header.name,
         version: bundle.header.version,
         default_approval_mode: bundle.header.default_approval_mode,
         network_egress: bundle.header.network_egress,
         allow_unsandboxed_escalation: bundle.header.allow_unsandboxed_escalation,
+        agents_md_discovery: bundle.header.agents_md_discovery,
+        agents_md_allowed_paths,
         command_rules: commands,
         tool_rules: tools,
         endpoints,
@@ -133,6 +141,8 @@ struct Canonical<'a> {
     default_approval_mode: ApprovalMode,
     network_egress: NetworkEgress,
     allow_unsandboxed_escalation: bool,
+    agents_md_discovery: AgentsMdDiscovery,
+    agents_md_allowed_paths: Vec<&'a str>,
     command_rules: Vec<CanonicalCommand<'a>>,
     tool_rules: Vec<CanonicalTool<'a>>,
     endpoints: Vec<CanonicalEndpoint<'a>>,
@@ -214,6 +224,8 @@ mod tests {
                 allow_unsandboxed_escalation: false,
                 checksum: String::new(),
                 allowed_endpoints: vec!["modelendpoint_01".into()],
+                agents_md_discovery: crate::bundle::AgentsMdDiscovery::Enabled,
+                agents_md_allowed_paths: String::new(),
             },
             command_rules: vec![
                 CommandRule {
@@ -263,7 +275,7 @@ mod tests {
     /// cache invalidation and a checksum every published bundle has to be
     /// republished for, so it must never happen by accident.
     const FIXTURE_CHECKSUM: &str =
-        "24b9266bb79ccf964fdb2d4d00ae3cffb5a858f015b69615731d1dfe7ec9c731";
+        "3239033abda1a2268de1e7f66b27a487a7e4a1f487388dc81be355b09b5a9dff";
 
     #[test]
     fn the_canonical_form_is_pinned_so_a_drift_is_a_deliberate_break() {
@@ -318,6 +330,32 @@ mod tests {
         widened.header.allow_unsandboxed_escalation = true;
 
         assert_ne!(checksum(&widened), checksum(&fixture()));
+    }
+
+    #[test]
+    fn changing_agents_md_discovery_changes_the_checksum() {
+        let mut restricted = fixture();
+        restricted.header.agents_md_discovery = AgentsMdDiscovery::Restricted;
+
+        assert_ne!(checksum(&restricted), checksum(&fixture()));
+    }
+
+    #[test]
+    fn changing_the_allowed_paths_changes_the_checksum() {
+        let mut narrowed = fixture();
+        narrowed.header.agents_md_allowed_paths = "packages/api".into();
+
+        assert_ne!(checksum(&narrowed), checksum(&fixture()));
+    }
+
+    #[test]
+    fn allowed_paths_written_in_a_different_order_are_the_same_policy() {
+        let mut ordered = fixture();
+        ordered.header.agents_md_allowed_paths = "packages/api\ndocs".into();
+        let mut reordered = fixture();
+        reordered.header.agents_md_allowed_paths = "docs\npackages/api".into();
+
+        assert_eq!(checksum(&ordered), checksum(&reordered));
     }
 
     #[test]

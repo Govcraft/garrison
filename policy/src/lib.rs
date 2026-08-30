@@ -43,8 +43,8 @@ pub mod endpoints;
 
 pub use argv::{commands_of, ArgvError, Command};
 pub use bundle::{
-    ApprovalMode, Bundle, BundleHeader, CommandDecision, CommandRule, ModelEndpoint, NetworkEgress,
-    ToolDecision, ToolRule,
+    AgentsMdDiscovery, ApprovalMode, Bundle, BundleHeader, CommandDecision, CommandRule,
+    ModelEndpoint, NetworkEgress, ToolDecision, ToolRule,
 };
 pub use checksum::{canonical_bytes, checksum, normalize_base_url, verify, ChecksumMismatch};
 pub use decide::{

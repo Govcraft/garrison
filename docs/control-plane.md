@@ -874,6 +874,14 @@ and `_garrison/status` carries the same list in `policy.governance.notEnforced`.
 granted rather than what was configured: a rule that requires a sandbox denies
 the call on a host where the sandbox degraded.
 
+`agents_md_discovery` and `agents_md_allowed_paths` are also enforced, unlike
+`network_egress`: they gate whether and how far `garrison-agent` searches the
+approved root for `AGENTS.md` project instructions before a turn starts. See
+[garrison-agent-design.md §1.7](garrison-agent-design.md) for the trust model
+— project instructions are untrusted content that can shape a turn and never
+widen what this bundle, the approved root, the sandbox, or the approval gate
+allow.
+
 #### What the cache does and does not buy
 
 The cache at `~/.config/garrison/bundle.json` is 0600 and re-verified against
@@ -1778,6 +1786,12 @@ exactly one install identity: a fleet of editor windows is one
 - **A bundle's `network_egress` and `allow_unsandboxed_escalation` are
   recorded and not enforced.** They are part of the checksum and reported in
   `_garrison/status`; no code acts on them. `ping` says so out loud.
+- **Which `AGENTS.md` files steered a turn is logged, not sealed.** The
+  daemon records the loaded files and their BLAKE3 hashes via structured
+  tracing, but the acton-ai audit chain has no field for it yet, so that
+  record is not tamper-evident the way the rest of the trail is.
+  [Govcraft/acton-ai#18](https://github.com/Govcraft/acton-ai/issues/18)
+  tracks giving it one.
 - **Schemas are unsigned.** Every command prints `schema signature
   verification is disabled (signing.mode = off)`. SchemaForge can require
   ed25519, SSH allowed-signers, or cosign-keyless signatures over `schemas/`
