@@ -1,6 +1,6 @@
 [package]
 name = "garrison-agent"
-version = "1.0.0"
+version = "1.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -15,9 +15,9 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock", "s
 clap = { version = "4.6.6", features = ["derive"] }
 crossterm = { version = "0.29", features = ["bracketed-paste", "event-stream"] }
 ed25519-dalek = { version = "3.0.0", features = ["pkcs8", "pem"] }
-garrison-bitbucket = { version = "1.0.0", path = "../bitbucket" }
-garrison-policy = { version = "1.0.0", path = "../policy" }
-garrison-wire = { version = "1.0.0", path = "../wire" }
+garrison-bitbucket = { version = "1.1.0", path = "../bitbucket" }
+garrison-policy = { version = "1.1.0", path = "../policy" }
+garrison-wire = { version = "1.1.0", path = "../wire" }
 getrandom = "0.4.3"
 hostname = "0.4.2"
 lsp-types = "0.97.0"

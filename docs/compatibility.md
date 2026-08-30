@@ -8,6 +8,12 @@ what was broken while it was still free and what was deliberately left alone.
 A surface not listed here is not covered. That is the default, and it is meant
 to be: a promise nobody wrote down is one nobody can keep.
 
+Neither is a feature behind `[experimental]`. Unattended review mode ships off
+and refuses to start until a deployment enables it, and its behaviour, its
+output, and its exit codes may change in a minor release. That is what the
+switch is for: enabling one accepts a narrower promise than the rest of this
+binary makes, and nothing else loses its usual contract.
+
 ## The covered surfaces
 
 ### 1. The entity model in `schemas/`

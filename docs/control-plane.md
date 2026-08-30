@@ -1734,6 +1734,16 @@ exactly one install identity: a fleet of editor windows is one
 
 ## Known gaps
 
+- **Inline completion reaches no admission gate.** `_garrison/complete`
+  resolves the session that owns it, which is what holds the request inside
+  the workspace boundary, and then makes a paid model call without passing the
+  seat, policy, or audit gates every turn passes. An install refused from
+  running a turn can still spend on every typing pause, and the number of
+  completions in flight against the model is uncapped. Running it off the
+  session actor was a deliberate latency decision and is still the right one;
+  losing admission along with it was not a decision at all. Which gates a
+  completion should pass is
+  [#22](https://github.com/Govcraft/garrison/issues/22).
 - **A bundle's `network_egress` and `allow_unsandboxed_escalation` are
   recorded and not enforced.** They are part of the checksum and reported in
   `_garrison/status`; no code acts on them. `ping` says so out loud.
