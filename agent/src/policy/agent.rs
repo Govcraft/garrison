@@ -45,7 +45,7 @@ use crate::protocol::acp;
 use crate::protocol::conn::{Describe, StatusPart};
 use acton_reactive::prelude::*;
 use chrono::{DateTime, Utc};
-use garrison_policy::{Bundle, ConfiguredProvider, Context, Disposition};
+use garrison_policy::{AgentsMdDiscovery, Bundle, ConfiguredProvider, Context, Disposition};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -171,6 +171,25 @@ pub struct Decide {
 
 impl Request for Decide {
     type Response = Disposition;
+}
+
+/// Asks what governs `AGENTS.md` discovery for the next turn.
+#[acton_message]
+pub struct CurrentAgentsMdPolicy;
+
+impl Request for CurrentAgentsMdPolicy {
+    type Response = AgentsMdPolicy;
+}
+
+/// What a turn's `AGENTS.md` discovery may do, read off the state in force
+/// when it is asked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentsMdPolicy {
+    /// Whether, and how far, discovery may reach.
+    pub discovery: AgentsMdDiscovery,
+    /// The paths discovery is confined to when `discovery` is `restricted`.
+    /// Empty and unused otherwise.
+    pub allowed_paths: Vec<String>,
 }
 
 /// Go and ask the plane what governs this install.
@@ -373,6 +392,14 @@ fn configure(builder: &mut ManagedActor<Idle, PolicyAgent>) {
         })
     });
 
+    builder.mutate_on::<CurrentAgentsMdPolicy>(|actor, envelope| {
+        let reply = envelope.reply_envelope();
+        let policy = agents_md_policy(actor.model.state.as_ref());
+        Reply::pending(async move {
+            reply.send(policy).await;
+        })
+    });
+
     builder.mutate_on::<Describe>(|actor, envelope| {
         let reply = envelope.reply_envelope();
         let part = StatusPart::Governance(Box::new(describe(
@@ -393,6 +420,39 @@ fn bundle_of(state: &PolicyState) -> Option<Arc<Bundle>> {
     match state {
         PolicyState::Governed { bundle, .. } => Some(Arc::clone(bundle)),
         PolicyState::Standalone | PolicyState::Ungoverned { .. } => None,
+    }
+}
+
+/// What governs `AGENTS.md` discovery right now. Pure.
+///
+/// `Governed` reads the bundle's own fields, which is the entire point of
+/// this issue: a bundle author gets a real gate, not a recorded-but-unenforced
+/// one. `Standalone` has no bundle to read and discovery runs unrestricted, on
+/// the same reasoning the local auto-approve list is read only while
+/// standalone — a developer's laptop with no plane trusts itself.
+/// `Ungoverned` and the moment before the agent's first state write are not
+/// "no policy", they are "policy that failed to arrive", and every other gate
+/// in this daemon fails closed on that distinction; this one does too, even
+/// though no turn ever reaches far enough to ask, because an `Ungoverned`
+/// install refuses every turn before admission gets here.
+fn agents_md_policy(state: Option<&PolicyState>) -> AgentsMdPolicy {
+    match state {
+        Some(PolicyState::Governed { bundle, .. }) => AgentsMdPolicy {
+            discovery: bundle.header.agents_md_discovery,
+            allowed_paths: bundle
+                .header
+                .agents_md_allowed_paths()
+                .map(str::to_string)
+                .collect(),
+        },
+        Some(PolicyState::Standalone) => AgentsMdPolicy {
+            discovery: AgentsMdDiscovery::Enabled,
+            allowed_paths: Vec::new(),
+        },
+        Some(PolicyState::Ungoverned { .. }) | None => AgentsMdPolicy {
+            discovery: AgentsMdDiscovery::Disabled,
+            allowed_paths: Vec::new(),
+        },
     }
 }
 
@@ -1200,6 +1260,51 @@ mod tests {
             matches!(disposition, Disposition::Deny { .. }),
             "a local file must not widen a bundle that forbids the command: {disposition:?}",
         );
+    }
+
+    #[test]
+    fn a_governed_installs_agents_md_policy_comes_from_its_bundle() {
+        let now = Utc::now();
+        let mut restricted = bundle("Baseline");
+        restricted.header.agents_md_discovery = AgentsMdDiscovery::Restricted;
+        restricted.header.agents_md_allowed_paths = "packages/api\ndocs".into();
+        let state = PolicyState::Governed {
+            bundle: Arc::new(restricted),
+            source: Source::Plane,
+            fetched_at: now,
+            approved_providers: Arc::new(Vec::new()),
+        };
+
+        let policy = agents_md_policy(Some(&state));
+
+        assert_eq!(policy.discovery, AgentsMdDiscovery::Restricted);
+        assert_eq!(policy.allowed_paths, ["packages/api", "docs"]);
+    }
+
+    #[test]
+    fn a_standalone_install_has_no_bundle_to_restrict_it_so_discovery_runs() {
+        let policy = agents_md_policy(Some(&PolicyState::Standalone));
+
+        assert_eq!(policy.discovery, AgentsMdDiscovery::Enabled);
+        assert!(policy.allowed_paths.is_empty());
+    }
+
+    #[test]
+    fn an_ungoverned_install_fails_closed_on_agents_md_discovery_too() {
+        let state = PolicyState::Ungoverned {
+            reason: "no assignment".into(),
+        };
+
+        let policy = agents_md_policy(Some(&state));
+
+        assert_eq!(policy.discovery, AgentsMdDiscovery::Disabled);
+    }
+
+    #[test]
+    fn no_state_at_all_fails_closed_the_same_way_ungoverned_does() {
+        let policy = agents_md_policy(None);
+
+        assert_eq!(policy.discovery, AgentsMdDiscovery::Disabled);
     }
 
     #[test]

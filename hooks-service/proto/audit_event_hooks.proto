@@ -17,7 +17,7 @@ message AuditEventBeforeValidateRequest {
   string organization = 100;
   string trail = 101;
   optional string session = 102;
-  string operator = 103;
+  optional string operator = 103;
   string install = 104;
   int64 chain_seq = 105;
   string entry_hash = 106;

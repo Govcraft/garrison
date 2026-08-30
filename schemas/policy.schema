@@ -46,6 +46,24 @@ schema PolicyBundle {
     network_egress:        enum("deny", "approved_hosts", "allow") default("deny")
     allow_unsandboxed_escalation: boolean default(false)
 
+    // Whether the daemon may load `AGENTS.md` project instructions from the
+    // approved root, and how far that search may reach. Project instructions
+    // are untrusted content: loading one can shape what the model sees and
+    // never what this bundle's own rules, the approved root, the sandbox, or
+    // the approval gate decide. `restricted` limits discovery to
+    // `agents_md_allowed_paths`; `disabled` loads none at all, including the
+    // operator's own `~/.agents/AGENTS.md`.
+    agents_md_discovery:   enum("enabled", "disabled", "restricted")
+                           default("enabled")
+                           @enum_colors(enabled: "green", restricted: "amber", disabled: "gray")
+
+    // Newline-separated paths, relative to the approved root, discovery may
+    // read an `AGENTS.md` from when `agents_md_discovery` is `restricted`.
+    // Meaningless in every other mode; not required to be non-empty even then,
+    // since a `restricted` bundle with no paths listed is a deliberate way to
+    // say "discovery is nominally on, but nothing here is honored yet."
+    agents_md_allowed_paths: text(max: 4096) @default("''")
+
     // BLAKE3 of the serialized bundle as distributed. An install reports the
     // checksum it loaded; a mismatch is drift.
     //

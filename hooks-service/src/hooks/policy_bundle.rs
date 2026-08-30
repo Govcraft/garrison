@@ -46,7 +46,7 @@
 
 use std::sync::Arc;
 
-use garrison_policy::{Bundle, BundleHeader};
+use garrison_policy::{AgentsMdDiscovery, Bundle, BundleHeader};
 use tonic::{Request, Response, Status};
 
 use crate::pb::policy_bundle::policy_bundle_hooks_server::PolicyBundleHooks;
@@ -163,6 +163,8 @@ fn header_of(id: &str, request: &PolicyBundleBeforeValidateRequest) -> BundleHea
         default_approval_mode: parse_enum(request.default_approval_mode.as_deref()),
         network_egress: parse_enum(request.network_egress.as_deref()),
         allow_unsandboxed_escalation: request.allow_unsandboxed_escalation.unwrap_or(false),
+        agents_md_discovery: parse_agents_md_discovery(request.agents_md_discovery.as_deref()),
+        agents_md_allowed_paths: request.agents_md_allowed_paths.clone().unwrap_or_default(),
         checksum: String::new(),
         allowed_endpoints: request.allowed_endpoints.clone(),
     }
@@ -226,6 +228,29 @@ fn parse_enum<T: serde::de::DeserializeOwned + Default>(value: Option<&str>) -> 
     value
         .and_then(|value| serde_json::from_value(serde_json::Value::String(value.to_string())).ok())
         .unwrap_or_default()
+}
+
+/// `agents_md_discovery` cannot use [`parse_enum`]'s generic fallback.
+///
+/// For every other enum in this hook, "the submitter left it unset" and "the
+/// submitter sent a value this binary predates" collapse to the same safe
+/// answer, because their `Default` derive already sits at the strict end
+/// (`NetworkEgress::Deny`, `ApprovalMode::OnRequest`). `AgentsMdDiscovery`'s
+/// schema default is `Enabled`, chosen so a bundle nobody has touched keeps
+/// today's behavior — which makes it the *permissive* extreme, not the safe
+/// one. Collapsing both cases onto it would mean a future discovery mode this
+/// binary does not recognize silently decodes as unrestricted `AGENTS.md`
+/// loading. So the two cases are told apart: absent still means `Enabled`
+/// (backward compatible), but an unrecognized string fails closed to
+/// `Disabled` rather than guessing it means the permissive default.
+fn parse_agents_md_discovery(value: Option<&str>) -> AgentsMdDiscovery {
+    match value {
+        None => AgentsMdDiscovery::Enabled,
+        Some(value) => {
+            serde_json::from_value(serde_json::Value::String(value.to_string()))
+                .unwrap_or(AgentsMdDiscovery::Disabled)
+        }
+    }
 }
 
 /// Now, in the format the plane's `datetime` columns take.
@@ -306,6 +331,26 @@ mod tests {
     }
 
     #[test]
+    fn agents_md_fields_default_to_enabled_and_no_restriction_when_absent() {
+        let header = header_of("policybundle_01", &request("published"));
+
+        assert_eq!(header.agents_md_discovery, AgentsMdDiscovery::Enabled);
+        assert_eq!(header.agents_md_allowed_paths, "");
+    }
+
+    #[test]
+    fn agents_md_fields_carry_through_when_the_submitter_sets_them() {
+        let mut submitted = request("published");
+        submitted.agents_md_discovery = Some("restricted".into());
+        submitted.agents_md_allowed_paths = Some("docs\ntools".into());
+
+        let header = header_of("policybundle_01", &submitted);
+
+        assert_eq!(header.agents_md_discovery, AgentsMdDiscovery::Restricted);
+        assert_eq!(header.agents_md_allowed_paths, "docs\ntools");
+    }
+
+    #[test]
     fn whatever_checksum_the_submitter_sent_is_not_part_of_the_answer() {
         let mut submitted = request("published");
         submitted.checksum = Some("f".repeat(64));
@@ -326,6 +371,22 @@ mod tests {
 
         assert_eq!(header.default_approval_mode, ApprovalMode::OnRequest);
         assert_eq!(header.network_egress, NetworkEgress::Deny);
+    }
+
+    #[test]
+    fn an_agents_md_mode_this_binary_does_not_know_fails_closed_to_disabled() {
+        let mut ahead = request("published");
+        ahead.agents_md_discovery = Some("telepathic".into());
+
+        let header = header_of("policybundle_01", &ahead);
+
+        assert_eq!(
+            header.agents_md_discovery,
+            AgentsMdDiscovery::Disabled,
+            "unlike the other enums, this field's schema default is the \
+             permissive extreme, so an unrecognized value must not fall back \
+             to it"
+        );
     }
 
     #[test]
