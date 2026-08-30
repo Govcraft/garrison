@@ -1,0 +1,80 @@
+# Dependency-advisory, license, and source policy, enforced by `cargo deny
+# check` on every push, every pull request (`.github/workflows/ci.yml`), and
+# every release (`.github/workflows/release.yml`). See
+# `docs/supply-chain-policy.md` for what this file means and how the ignore
+# list below is reviewed.
+#
+# Regenerate the skeleton with `cargo deny init`; this file is hand-trimmed
+# from that template, keeping only the fields whose value differs from
+# cargo-deny's default.
+
+[graph]
+# `garrison-hooks` is Linux-only in practice (see ci.yml and release.yml),
+# but nothing here is gated on it: a license or advisory that only affects a
+# Windows-only dependency edge should still surface, since #43 is about
+# catching problems before they ship, not about what today's runners build.
+all-features = true
+
+# https://embarkstudios.github.io/cargo-deny/checks/advisories/cfg.html
+[advisories]
+# Every entry here is a known RUSTSEC advisory this workspace has decided
+# not to act on yet, with the reason recorded next to it. An advisory that
+# has no entry here fails the check — that is the point of this file.
+ignore = [
+    # All seven of the following are pulled in transitively by `libsql`,
+    # which `acton-ai` 0.35.0 depends on for its embedded-database feature.
+    # `acton-ai` is pinned to an exact version (see
+    # docs/supply-chain-policy.md), so none of these can be resolved away by
+    # `cargo update`; clearing them means moving that pin. Tracked in
+    # https://github.com/Govcraft/garrison/issues/47.
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.3.3 is unmaintained; pulled in by libsql via acton-ai 0.35.0, no safe upgrade exists on 1.x. Tracked in #47." },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile 2.2.0 is unmaintained; pulled in by libsql's hyper-rustls via acton-ai 0.35.0. Tracked in #47." },
+    { id = "RUSTSEC-2026-0049", reason = "rustls-webpki 0.102.8 CRL distribution-point matching bug; garrison does not consume CRLs. Pulled in by libsql via acton-ai 0.35.0. Tracked in #47." },
+    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.102.8 accepted URI name constraints it does not enforce; garrison asserts no URI names. Pulled in by libsql via acton-ai 0.35.0. Tracked in #47." },
+    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.102.8 accepted name constraints against wildcard names incorrectly; requires a misissued certificate to reach. Pulled in by libsql via acton-ai 0.35.0. Tracked in #47." },
+    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.102.8 reachable panic parsing a CRL; garrison does not parse CRLs. Pulled in by libsql via acton-ai 0.35.0. Tracked in #47." },
+    { id = "RUSTSEC-2026-0258", reason = "h2 0.3.27 unbounded empty DATA frames (low severity); garrison-agent is an outbound gRPC/HTTP client on this stack, not a server accepting attacker frames. Pulled in by libsql's tonic/hyper via acton-ai 0.35.0. Tracked in #47." },
+]
+
+# https://embarkstudios.github.io/cargo-deny/checks/licenses/cfg.html
+[licenses]
+# Every SPDX identifier that appears anywhere in the dependency graph today
+# (`cargo metadata --all-features`, deduplicated, OR-expressions reduced to
+# their members). A license expression is satisfied if any one member of an
+# OR is on this list; an AND requires every member to be. Adding a
+# dependency under a license not already covered here fails the check —
+# that is the review point docs/supply-chain-policy.md describes.
+allow = [
+    "AGPL-3.0-only",     # garrison's own crates
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "0BSD",
+    "BSL-1.0",
+    "CC0-1.0",
+    "MIT-0",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+    "Zlib",
+    "Unlicense",
+    "OpenSSL",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.8
+
+# https://embarkstudios.github.io/cargo-deny/checks/bans/cfg.html
+[bans]
+# Left at cargo-deny's defaults: duplicate versions warn rather than fail
+# (this workspace has several, none worth blocking a release over today),
+# and nothing is explicitly banned or allow-listed yet.
+multiple-versions = "warn"
+
+# https://embarkstudios.github.io/cargo-deny/checks/sources/cfg.html
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
