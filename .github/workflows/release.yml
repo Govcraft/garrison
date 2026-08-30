@@ -1,0 +1,323 @@
+# Builds a tagged release and attaches its artifacts.
+#
+# # There is no non-FIPS release
+#
+# Every binary this workflow publishes links the FIPS 140-3 validated AWS-LC
+# module, because `agent/Cargo.toml` builds acton-ai with its `fips` feature
+# unconditionally. There is no flag here to turn that off, and that is the
+# point: a build that claims FIPS-validated cryptography and quietly ships
+# something else is worse than no claim at all.
+#
+# The claim is also tested rather than asserted. `garrison-agent`'s `main`
+# installs the FIPS provider before it parses a command line and refuses to
+# start if the module reports it is not operating in FIPS mode, so the
+# "Prove the binary is FIPS" step below — which does nothing but run
+# `garrison-agent --version` — fails the release if the module is absent,
+# unvalidated, or not in FIPS mode. A leg that cannot prove it does not ship.
+#
+# Everything is built on a native runner for the same reason: a cross-compiled
+# binary cannot run its own power-on integrity test on the builder.
+#
+# # Release, not debug
+#
+# The FIPS module hashes its own loaded text segment at startup against a
+# constant baked in at build time. Debug relocations move that text and the
+# module aborts. `--release` is the only profile it starts under.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  # For re-cutting a release whose upload leg failed. The tag must already
+  # exist; this never creates one.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build, e.g. v1.0.0'
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: write
+
+jobs:
+  # Refuses the release before spending an hour of runner time on it if the
+  # tag and the crate version disagree. A tag is the only version an operator
+  # ever sees; a binary that reports a different one is a support incident.
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+    steps:
+      - name: Resolve the tag
+        id: resolve
+        env:
+          # Read through the environment rather than interpolated into the
+          # script: a tag name is attacker-controlled by anyone who can push
+          # one, and `${{ }}` inside `run:` is textual substitution.
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-$REF_TAG}"
+          case "$tag" in
+            v*) ;;
+            *) echo "::error::'$tag' is not a v-prefixed release tag"; exit 1 ;;
+          esac
+          version="${tag#v}"
+          # A tag carrying a pre-release identifier (v1.1.0-rc.1) is published
+          # as a pre-release so it never becomes anyone's "latest".
+          case "$version" in
+            *-*) prerelease=true ;;
+            *) prerelease=false ;;
+          esac
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "prerelease=$prerelease"
+          } >>"$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.resolve.outputs.tag }}
+
+      - name: The tag and the crate version must agree
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Read rather than resolved: `cargo metadata` would reach for the
+          # registry to answer a question the manifest already answers.
+          crate="$(python3 -c 'import tomllib; print(tomllib.load(open("agent/Cargo.toml","rb"))["package"]["version"])')"
+          if [ "$crate" != "$VERSION" ]; then
+            echo "::error::tag says $VERSION, agent/Cargo.toml says $crate"
+            exit 1
+          fi
+          echo "garrison-agent $crate"
+
+  build:
+    name: ${{ matrix.name }}
+    needs: plan
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The daemon ships everywhere an operator writes code. The control
+          # plane's hook service ships only on Linux, which is where a plane
+          # is deployed, so `hooks: true` is a Linux-only field.
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            hooks: true
+          - name: linux-aarch64
+            # Hosted arm64 Linux runners are billed on this repository because
+            # it is private. If the leg sits queued forever, that is the plan,
+            # not the workflow.
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            hooks: true
+          - name: macos-aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            hooks: false
+          - name: macos-x86_64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            hooks: false
+          # Windows is missing, and it is the one platform this workflow does
+          # not yet honour. `garrison-agent` reaches for Unix-domain sockets in
+          # about a dozen modules without a `cfg`, and acton-ai gates
+          # `acton-reactive` behind `cfg(unix)`, so there is no
+          # `x86_64-pc-windows-msvc` binary to sign, let alone a FIPS one.
+          # When that port lands, the leg is:
+          #   - name: windows-x86_64
+          #     os: windows-latest
+          #     target: x86_64-pc-windows-msvc
+          #     hooks: false
+          # and it additionally needs NASM on PATH: aws-lc-fips-sys ships no
+          # prebuilt NASM objects and no pregenerated Windows bindings, so that
+          # leg also needs LLVM for bindgen.
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.tag }}
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang libclang-dev protobuf-compiler
+
+      - name: Install build tools (macOS)
+        if: runner.os == 'macOS'
+        # No protoc: only hooks-service compiles protobufs, and that is the
+        # control plane, which is Linux-only.
+        run: brew install cmake ninja
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: false
+
+      # Deliberately not cached. A release artifact is worth the twenty
+      # minutes it takes to build AWS-LC from source on a clean runner, and a
+      # restored cache is one more thing an auditor would have to trust.
+
+      - name: Build the daemon
+        run: cargo build --release --locked --target ${{ matrix.target }} -p garrison-agent
+
+      - name: Build the control plane's hook service
+        if: matrix.hooks
+        run: cargo build --release --locked --target ${{ matrix.target }} -p garrison-hooks
+
+      # The whole reason this release exists. `main` installs the FIPS
+      # provider before clap sees argv and returns a configuration error if
+      # `provider.fips()` is false, so a binary that reaches `--version` has
+      # already proven the validated module is linked and in FIPS mode.
+      - name: Prove the binary is FIPS
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/garrison-agent"
+          echo "running $bin --version"
+          "$bin" --version
+          echo "the FIPS provider installed; this binary is FIPS-enabled"
+
+      - name: Assemble the archive
+        id: archive
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+          HOOKS: ${{ matrix.hooks }}
+          RUNNER_IMAGE: ${{ matrix.os }}
+        run: |
+          set -euo pipefail
+          stage="garrison-$VERSION-$TARGET"
+          mkdir -p "$stage/docs"
+          cp "target/$TARGET/release/garrison-agent" "$stage/"
+          cp README.md "$stage/"
+          cp docs/compatibility.md docs/control-plane.md "$stage/docs/"
+
+          if [ "$HOOKS" = "true" ]; then
+            cp "target/$TARGET/release/garrison-hooks" "$stage/"
+            # Regenerated into the project root by hooks-service/build.rs, and
+            # the plane's `[[schema_forge.hooks.bindings]]` entry needs it.
+            cp hooks-service/hooks_descriptor.bin "$stage/"
+            mkdir -p "$stage/systemd"
+            cp packaging/systemd/garrison-agent.service "$stage/systemd/"
+            cp packaging/README.md "$stage/systemd/"
+          fi
+
+          # What an auditor asks for when they ask "prove it": which validated
+          # module, built by which toolchain, from which commit.
+          fips_crate="$(cargo tree --locked --target "$TARGET" -p garrison-agent \
+            -i aws-lc-fips-sys --depth 0 2>/dev/null | head -n 1 || true)"
+          cat >"$stage/FIPS-PROVENANCE.txt" <<PROVENANCE
+          Garrison $VERSION ($TARGET)
+
+          Cryptography
+            provider          rustls default_fips_provider (AWS-LC)
+            module crate      ${fips_crate:-aws-lc-fips-sys (not resolved)}
+            acton-ai features fips, sandbox-hardening, derive, otel, ipc
+            enforcement       garrison-agent installs the FIPS provider before
+                              parsing argv and refuses to start when the module
+                              reports it is not operating in FIPS mode.
+            verified          "garrison-agent --version" ran on this runner and
+                              exited 0, on the native host for this target.
+
+          Build
+            commit            $(git rev-parse HEAD)
+            tag               $TAG
+            profile           release
+            rustc             $(rustc --version)
+            cargo             $(cargo --version)
+            runner            $RUNNER_IMAGE
+            built             $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          PROVENANCE
+
+          tar -czf "$stage.tar.gz" "$stage"
+          # `shasum` rather than `sha256sum`: the latter is not on macOS.
+          shasum -a 256 "$stage.tar.gz" >"$stage.tar.gz.sha256"
+          echo "stage=$stage" >>"$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.archive.outputs.stage }}
+          path: |
+            ${{ steps.archive.outputs.stage }}.tar.gz
+            ${{ steps.archive.outputs.stage }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.tag }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Collect the checksums
+        working-directory: artifacts
+        run: |
+          set -euo pipefail
+          cat ./*.tar.gz.sha256 >SHA256SUMS
+          rm -f ./*.tar.gz.sha256
+          shasum -a 256 -c SHA256SUMS
+          ls -l
+
+      # Left as a draft on purpose: publishing is a person's decision, and the
+      # draft is where they check the artifact list before an agency does.
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          PRERELEASE: ${{ needs.plan.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          notes="$(cat <<'NOTES'
+          Every binary in this release links the FIPS 140-3 validated AWS-LC
+          module. Each one was built on a native runner for its own target and
+          proved it: the release refuses to publish a binary that cannot start
+          with the validated module in FIPS mode. See `FIPS-PROVENANCE.txt`
+          inside each archive for the module, toolchain, and commit.
+
+          `garrison-agent` is the daemon. The Linux archives also carry
+          `garrison-hooks`, the control plane's `before_validate` hook
+          service, and the systemd user unit.
+
+          Verify a download against `SHA256SUMS`:
+
+              shasum -a 256 -c SHA256SUMS --ignore-missing
+          NOTES
+          )"
+          flags=(--draft --title "Garrison $VERSION" --notes "$notes")
+          if [ "$PRERELEASE" = "true" ]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$TAG" "${flags[@]}" \
+            artifacts/SHA256SUMS artifacts/*.tar.gz

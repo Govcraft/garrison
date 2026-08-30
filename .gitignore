@@ -1,6 +1,8 @@
 # Hidden files and directories (except .gitignore)
 .*
 !.gitignore
+!.github/
+!.github/**
 !extensions/vscode/.vscode/
 !extensions/vscode/.vscode/launch.json
 
