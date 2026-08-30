@@ -240,15 +240,19 @@ every other entity, and creating a `Redemption` is the act of enrolling.
 
 Two mechanisms carry the security, and neither is code:
 
-```
-token_id @require("has(principal.sub) && token_id == principal.sub")
-```
+**Which grant is being spent is not the client's to say.** `Redemption.token_id`
+is filled by the `before_validate` hook from the authenticated principal's
+subject claim, exactly as `organization` is, and the daemon has no field to put
+it in. A daemon holding `tok_A` cannot redeem `tok_B` because it cannot name
+`tok_B` at all. This replaced a `@require` comparing a submitted `token_id`
+against `principal.sub`, and it is the stronger of the two: a rule can only
+refuse a mismatch, while a client with no field cannot attempt one. What holds
+it closed is the binding's `required = true` — an unreachable hook fails the
+request rather than persisting a row with no grant named on it.
 
-binds the write to the caller's own artifact. A daemon holding `tok_A` cannot
-redeem `tok_B`; the rule runs in-process before any hook, and the mismatch is a
-422 naming the rule. The `enrollee` role is scoped to exactly one action — it
-holds no read grant on `Redemption` itself, so the create response is the only
-thing a daemon ever sees of this schema.
+**The `enrollee` role is scoped to exactly one action.** It holds no read grant
+on `Redemption` itself, so the create response is the only thing a daemon ever
+sees of this schema.
 
 Everything that has to look at another row happens in a `before_validate` hook,
 in `hooks-service/`:
@@ -332,19 +336,21 @@ Three files sit on disk, all under the Garrison config directory
 | `install-key.pem` | the daemon, at enrollment, mode 0600 | forever |
 | `install.json` | the daemon, on acceptance | forever |
 
-The packet carries two fields rather than one:
+The packet carries one field:
 
 ```toml
-token_id = "tok_7f3a"
 artifact = "v4.local...."
 ```
 
-The `token_id` is there because the artifact is a PASETO **v4.local** token,
-encrypted with the plane's own key. The daemon cannot read a single claim from
-it, which is the right design, but the redemption body must still name the
-`token_id` it is spending so the `@require` above has something to compare. So
-the id travels in the clear beside the artifact. The id is not a secret. The
-artifact is, which is why the packet is deleted the moment it has been spent.
+It carried the `token_id` beside it until 1.0, because the artifact is a PASETO
+**v4.local** token encrypted with the plane's own key: the daemon cannot read a
+single claim from it, so it had to be told which grant it was holding for the
+`@require` to have something to compare. Now the hook reads the subject off the
+authenticated principal instead, and the field is gone from both the packet and
+the request body. `Packet` carries `serde(deny_unknown_fields)`, so an unspent
+two-field packet written before 1.0 fails at read time naming the file, rather
+than being half-read. The artifact is the only secret here, which is why the
+packet is deleted the moment it has been spent.
 
 The install key is generated here and never transmitted. What crosses the wire
 is the public half in SPKI form. The alternative, a plane-issued shared secret,

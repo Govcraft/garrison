@@ -100,9 +100,9 @@ operator's laptop.
 
 ## The 1.0 break pass
 
-Five candidates were investigated against the code, each one then reviewed by a
-second pass whose brief was to refute it. What follows is the disposition of
-each.
+Every candidate was investigated against the code and then reviewed by a second
+pass whose brief was to refute it. What follows is the disposition of each: what
+was broken while it was still free, what was left alone, and why.
 
 ### Taken: acton-ai resolved from crates.io
 
@@ -139,6 +139,50 @@ match the only path that has ever worked — including `--tenant-chain`, without
 which `_tenant` is never injected and the resulting rows are invisible to the
 hooks service that has to adjudicate them.
 
+### Taken: the enrollment packet is one field, not two
+
+The packet carried `token_id` in the clear beside the artifact because a
+`v4.local` artifact is symmetric: the daemon cannot read its own `sub`, and the
+plane's `@require` compared the request body against it. Switching to
+`v4.public` was never Garrison's change to make.
+
+The route taken instead is this repository's own idiom. `Redemption.token_id`
+lost its `required` and its `@require`; the `before_validate` hook now fills it
+from the authenticated principal's subject claim, exactly as it already fills
+`organization` and as `AuditEvent.operator` is filled. `Packet` is the artifact
+and nothing else, and the redemption body no longer carries the field at all.
+
+This is stronger than what it replaced, not weaker. A rule comparing a
+submitted `token_id` against `principal.sub` can only refuse a mismatch; a
+client with no field to put a token id in cannot attempt one. What holds it
+closed is the binding's `required = true`: an unreachable hook fails the
+request rather than persisting a row that names no grant. Both refusal paths
+in the hook stamp the field too, so a persisted refusal still says which grant
+an unknown machine presented — the one fact that row exists to carry.
+
+The route's open question was settled empirically before it was taken. It
+depended on the hook's `user_id` being populated for an `enrollee` bearer,
+which has no console `User` row. It is: probing the hook during the live
+redemption in `hooks-service/tests/directory_sync.rs` — a real enrollee
+artifact, posted to a real plane in a container — yielded
+`user_id = Some("tok_alice_1")` against the `token_id` the `@require` was
+comparing. That test now posts a body with no `token_id` in it and asserts the
+hook filled the field on both the acceptance and the refusal.
+
+The second decision the route implied was taken with it.
+`policies/custom/credential-lifecycle.cedar` gained
+`garrison.redemption.append_only`, a `forbid` on `UpdateRedemption`. Without
+it the change would have removed a check on the update path without replacing
+one: `write` covers update, and the hook no-ops on anything but a create.
+Redemption rows are the evidence a security officer reads when an unknown
+machine presents a revoked grant, so they are append-only now, like the audit
+trail and the credential rows beside them.
+
+Taken now because it could only be taken now. `deny_unknown_fields` means a
+one-field daemon hard-fails on any unspent two-field packet, naming the file.
+That is the right failure and it is a fleet-wide one, which is why it belongs
+before the number lands rather than after.
+
 ### Declined: renaming `InstallCredential.kind`
 
 Already done, in commit `8f9535d`. The field is `credential_kind` on both
@@ -167,9 +211,9 @@ omitted `--tenant-chain`. That is fixed above.
 
 ## Open, and the owner's to settle
 
-Two candidates are genuinely decisions rather than findings. Both are recorded
-in `docs/control-plane.md` under "Known gaps" as well, so neither can be
-mistaken for a promise.
+One candidate is genuinely a decision rather than a finding. It is recorded in
+`docs/control-plane.md` under "Known gaps" as well, so it cannot be mistaken
+for a promise.
 
 ### `EnrollmentToken.issuer` is a typo check, not a security control
 
@@ -185,51 +229,3 @@ The alternative is to re-found it on a custom claim projected onto
 on a question outside this repository: can a `principal_claims` entry take its
 value from a raw token claim, or only from `source = { user_field = ... }`,
 which reads a console `User` row an enrollment artifact does not have?
-
-### The enrollment packet could be one field instead of two
-
-The packet carries `token_id` in the clear beside the artifact, because a
-`v4.local` artifact is symmetric: the daemon cannot read its own `sub`, and the
-plane's `@require` compares the request body against it. Switching to
-`v4.public` is not Garrison's change to make.
-
-There is a third route, and it is this repository's own idiom: drop `required`
-from `Redemption.token_id` and have the `before_validate` hook fill it from the
-authenticated principal, exactly as `Redemption.organization` and
-`AuditEvent.operator` are filled today. The hook already receives the subject
-claim and can already write the field back, and the binding is
-`required = true`, so an unreachable hook fails the request rather than
-persisting an unfilled row. The client would then be unable to express a
-`token_id` at all, which is a stronger anti-replay property than the `@require`.
-
-**The route's one open question has been settled empirically.** It depended on
-the hook's `user_id` being populated for an `enrollee` bearer, which has no
-console `User` row. It is: probing the hook during the live redemption in
-`hooks-service/tests/directory_sync.rs` — a real enrollee artifact, posted to a
-real plane in a container — yields `user_id = Some("tok_alice_1")` against
-`token_id = "tok_alice_1"`. The subject claim arrives, and it is exactly the
-value the `@require` compares against today.
-
-What remains is a decision rather than a finding, for two reasons:
-
-1. **On the update path the route removes a check without replacing one.**
-   `write` covers update, and the hook no-ops on anything but a create.
-   Redemption rows are the evidence a security officer reads when an unknown
-   machine presents a revoked grant. The route needs a `forbid
-   UpdateRedemption` beside the existing append-only policies in
-   `policies/custom/` to be safe. That is the right posture regardless, but it
-   is a second decision and it is not implied by the first.
-2. **It changes the on-disk packet**, which the issue singles out as the
-   surface provisioning tooling will hard-code. Whoever owns that tooling
-   should say when, not have it decided for them.
-
-If it is taken, it must be taken before 1.0. `deny_unknown_fields` means a
-one-field daemon would hard-fail on any unspent two-field packet afterwards,
-naming the file — the right failure, but a fleet-wide one.
-
-The mechanical cost, for sizing: drop `required` and the `@require` from
-`Redemption.token_id`; flip the field to `optional string` in
-`redemption_hooks.proto` and regenerate `hooks_descriptor.bin`; fill it from
-`user_id` in `provision`; drop the field from `Packet` and from the redemption
-body; add the `forbid`; migrate the column's nullability; update both documented
-mint recipes.

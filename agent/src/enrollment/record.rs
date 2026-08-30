@@ -1,19 +1,22 @@
 //! The two files enrollment reads and writes: the packet in, the record out.
 //!
-//! # Why the packet carries two fields
+//! # Why the packet carries one field
 //!
 //! The enrollment artifact is a PASETO **v4.local** token, which is symmetric:
 //! it is encrypted with the plane's own key, so the daemon holding it cannot
-//! read a single one of its claims. That is the right design — a machine has
-//! no business inspecting its own grant — but it has a consequence here. The
-//! redemption request must name the `token_id` it is spending, because the
-//! plane's `@require` rule checks that value against the artifact's own
-//! subject before anything else runs. The daemon cannot recover it from the
-//! artifact, so it has to be told.
+//! read a single one of its claims. A machine has no business inspecting its
+//! own grant, and it turns out it has no business naming it either.
 //!
-//! Hence a packet rather than a bare token file: the public id in the clear,
-//! the artifact beside it. The id is not a secret. The artifact is, which is
-//! why the packet is deleted the moment it has been spent.
+//! The packet used to carry the grant's public id beside the artifact, because
+//! the plane's rule compared a submitted `token_id` against the artifact's
+//! subject. It no longer does: the redemption hook takes the subject straight
+//! from the authenticated principal, so the field is one the daemon cannot
+//! express at all. That is the stronger property. A client that has no field
+//! to put a token id in cannot present one grant while spending another, and
+//! there is no mismatch left to refuse.
+//!
+//! What remains is the secret and nothing else, which is why the packet is
+//! deleted the moment it has been spent.
 
 use crate::error::GarrisonError;
 use serde::{Deserialize, Serialize};
@@ -23,9 +26,9 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Packet {
-    /// The grant's public identifier, e.g. `tok_7f3a`.
-    pub token_id: String,
-    /// The PASETO artifact proving the daemon holds that grant.
+    /// The PASETO artifact proving the daemon holds a grant.
+    ///
+    /// Which grant is the plane's to say, from the artifact's own subject.
     pub artifact: String,
 }
 
@@ -35,7 +38,7 @@ impl Packet {
     /// # Errors
     ///
     /// [`GarrisonErrorKind::Enrollment`](crate::error::GarrisonErrorKind::Enrollment)
-    /// when the file cannot be read, cannot be parsed, or leaves either field
+    /// when the file cannot be read, cannot be parsed, or leaves the artifact
     /// blank. A packet with an empty artifact would fail at the plane with a
     /// 401 that says nothing useful; failing here names the file.
     pub fn read(path: &Path) -> Result<Self, GarrisonError> {
@@ -56,13 +59,11 @@ impl Packet {
     }
 
     fn validate(&self, path: &Path) -> Result<(), GarrisonError> {
-        for (field, value) in [("token_id", &self.token_id), ("artifact", &self.artifact)] {
-            if value.trim().is_empty() {
-                return Err(GarrisonError::enrollment(format!(
-                    "enrollment packet '{}' leaves '{field}' empty",
-                    path.display()
-                )));
-            }
+        if self.artifact.trim().is_empty() {
+            return Err(GarrisonError::enrollment(format!(
+                "enrollment packet '{}' leaves 'artifact' empty",
+                path.display()
+            )));
         }
         Ok(())
     }
@@ -223,7 +224,19 @@ mod tests {
     }
 
     #[test]
-    fn a_packet_carries_the_id_alongside_the_artifact() {
+    fn a_packet_is_the_artifact_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = default_packet_path(dir.path());
+        std::fs::write(&path, "artifact = \"v4.local.abc\"\n").unwrap();
+
+        assert_eq!(Packet::read(&path).unwrap().artifact, "v4.local.abc");
+    }
+
+    #[test]
+    fn a_packet_naming_a_token_is_refused_rather_than_ignored() {
+        // `deny_unknown_fields` is what makes the format freeze mean anything.
+        // A two-field packet left over from before this change fails here,
+        // naming the file, rather than being silently half-read.
         let dir = tempfile::tempdir().unwrap();
         let path = default_packet_path(dir.path());
         std::fs::write(
@@ -232,16 +245,16 @@ mod tests {
         )
         .unwrap();
 
-        let packet = Packet::read(&path).unwrap();
-        assert_eq!(packet.token_id, "tok_7f3a");
-        assert_eq!(packet.artifact, "v4.local.abc");
+        let error = Packet::read(&path).unwrap_err().to_string();
+        assert!(error.contains("token_id"), "{error}");
+        assert!(error.contains("enrollment.toml"), "{error}");
     }
 
     #[test]
-    fn a_packet_missing_a_field_names_the_file_and_the_field() {
+    fn an_empty_artifact_names_the_file_and_the_field() {
         let dir = tempfile::tempdir().unwrap();
         let path = default_packet_path(dir.path());
-        std::fs::write(&path, "token_id = \"tok_7f3a\"\nartifact = \"\"\n").unwrap();
+        std::fs::write(&path, "artifact = \"\"\n").unwrap();
 
         let error = Packet::read(&path).unwrap_err();
         assert!(error.to_string().contains("'artifact' empty"));
@@ -249,22 +262,10 @@ mod tests {
     }
 
     #[test]
-    fn a_misspelled_packet_key_is_refused_rather_than_ignored() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = default_packet_path(dir.path());
-        std::fs::write(&path, "token = \"tok_7f3a\"\nartifact = \"v4.local.abc\"\n").unwrap();
-
-        assert!(Packet::read(&path)
-            .unwrap_err()
-            .to_string()
-            .contains("token"));
-    }
-
-    #[test]
     fn a_spent_packet_is_removed_and_removing_a_gone_one_is_quiet() {
         let dir = tempfile::tempdir().unwrap();
         let path = default_packet_path(dir.path());
-        std::fs::write(&path, "token_id = \"t\"\nartifact = \"a\"\n").unwrap();
+        std::fs::write(&path, "artifact = \"a\"\n").unwrap();
 
         Packet::discard(&path);
         assert!(!path.exists());

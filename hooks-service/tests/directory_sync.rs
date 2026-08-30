@@ -591,11 +591,12 @@ async fn provisioning_and_deprovisioning_flow_through_a_real_plane() {
     let seat_id = seat["id"].as_str().expect("seat id").to_string();
 
     // A machine enrols for her through the ordinary path.
-    let redemption = |token: &str, token_id: &str, install: &str| {
+    // No `token_id` in the body: the daemon has no field for it. The hook
+    // takes the grant from the bearer's subject claim.
+    let redemption = |token: &str, install: &str| {
         http.post(plane.url("schemas/Redemption/entities"))
             .bearer_auth(token)
             .json(&json!({ "fields": {
-                "token_id": token_id,
                 "install_id": install,
                 "hostname": "ws-alice",
                 "operator_upn": ALICE_UPN,
@@ -607,7 +608,7 @@ async fn provisioning_and_deprovisioning_flow_through_a_real_plane() {
             }}))
             .send()
     };
-    let accepted: Value = redemption(&enrollee_1, "tok_alice_1", "inst-alice-1")
+    let accepted: Value = redemption(&enrollee_1, "inst-alice-1")
         .await
         .expect("plane reachable")
         .json()
@@ -617,6 +618,11 @@ async fn provisioning_and_deprovisioning_flow_through_a_real_plane() {
         accepted["fields"]["outcome"],
         json!("accepted"),
         "enrollment: {accepted}"
+    );
+    assert_eq!(
+        accepted["fields"]["token_id"],
+        json!("tok_alice_1"),
+        "the hook names the grant the client never sent: {accepted}"
     );
     let install_id = accepted["fields"]["install"]
         .as_str()
@@ -685,7 +691,7 @@ async fn provisioning_and_deprovisioning_flow_through_a_real_plane() {
         org["fields"]["directory_sync_detail"]
     );
 
-    let refused: Value = redemption(&enrollee_2, "tok_alice_2", "inst-alice-2")
+    let refused: Value = redemption(&enrollee_2, "inst-alice-2")
         .await
         .expect("plane reachable")
         .json()
@@ -695,6 +701,11 @@ async fn provisioning_and_deprovisioning_flow_through_a_real_plane() {
     assert_eq!(
         refused["fields"]["refusal_reason"],
         json!("operator is not active (suspended)")
+    );
+    assert_eq!(
+        refused["fields"]["token_id"],
+        json!("tok_alice_2"),
+        "a persisted refusal still names the grant that was presented: {refused}"
     );
 
     // dev was never touched by any of this.

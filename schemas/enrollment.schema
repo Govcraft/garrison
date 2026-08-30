@@ -13,22 +13,25 @@
 // is a 403 on every route, so the failure mode of getting this wrong is a
 // daemon that cannot enroll, not one that can do more than enroll.
 //
-// Binding the request to the artifact is a @require on `principal.sub`, not
-// a Cedar policy, and that is a limitation worth stating rather than
-// discovering. On a create there is no entity yet, so the engine authorizes
-// against a placeholder resource whose attributes are type defaults
-// (schema-forge-acton, authz/adapters.rs). `resource.token_id` is therefore
-// "" no matter what the daemon sent, and no Cedar rule can compare the two.
-// Cedar decides who may redeem; CEL decides that they may only redeem the
-// token they are holding.
+// Binding the request to the artifact is not a Cedar policy, and that is a
+// limitation worth stating rather than discovering. On a create there is no
+// entity yet, so the engine authorizes against a placeholder resource whose
+// attributes are type defaults (schema-forge-acton, authz/adapters.rs).
+// `resource.token_id` is therefore "" no matter what the daemon sent, and no
+// Cedar rule can compare it against anything.
 //
-// Everything the plane must not take on faith is left for the hook, which
+// So everything the plane must not take on faith is left for the hook, which
 // runs before persistence-side validation and can therefore fill fields the
-// daemon never sends. `organization` is one of them: a v4.local artifact is
-// encrypted with the plane's own key, so a daemon cannot read its own claims
-// and has nothing truthful to assert about which tenant it belongs to. The
-// hook resolves it from the EnrollmentToken row instead. A field the client
-// cannot know is a field the client cannot lie about.
+// daemon never sends. Cedar decides who may redeem; the hook decides which
+// grant they are redeeming and on whose behalf.
+//
+// Both `token_id` and `organization` are filled that way. A v4.local artifact
+// is encrypted with the plane's own key, so a daemon cannot read its own
+// claims and has nothing truthful to assert about either. The hook takes the
+// first from the authenticated principal's subject and the second from the
+// EnrollmentToken row. A field the client cannot know is a field the client
+// cannot lie about, and a field the client cannot send is one it cannot
+// misuse.
 
 @version(1)
 @tenant(parent: "Organization")
@@ -40,15 +43,23 @@
 )
 @hook(before_validate) """Resolve the enrollment token, admit or refuse the install, and provision its credential"""
 schema Redemption {
-    // The artifact's `sub`. The @require is the whole anti-replay story: a
-    // holder may spend the token they carry and no other.
-    token_id:          text(max: 64)
-                       required
-                       indexed
-                       @require(
-                           "has(principal.sub) && token_id == principal.sub",
-                           "a redemption must be presented with its own enrollment token"
-                       )
+    // The artifact's `sub`, resolved by the hook from the authenticated
+    // principal and never sent by the daemon.
+    //
+    // This is the whole anti-replay story, and it is stronger than the
+    // `@require` it replaces. A rule comparing a submitted `token_id` against
+    // `principal.sub` can only refuse a mismatch; a client that cannot express
+    // the field at all cannot attempt one. It is the same shape as
+    // `organization` below and `AuditEvent.operator`: a field the client
+    // cannot know is a field the client cannot lie about.
+    //
+    // Not `required`, and that is not a softening. Required-field validation
+    // runs against the raw request body before `before_validate` is dialed, so
+    // a field the client is meant not to send cannot also be one the client
+    // must send. What holds it closed is the binding's `required = true` in
+    // config.toml: an unreachable hook fails the request rather than
+    // persisting an unfilled row.
+    token_id:          text(max: 64) indexed
 
     // Resolved by the hook, never sent by the daemon.
     organization:      -> Organization

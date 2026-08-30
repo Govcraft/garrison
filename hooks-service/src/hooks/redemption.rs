@@ -1,10 +1,16 @@
 //! `Redemption.before_validate`: admit a daemon to the fleet, or refuse it.
 //!
-//! SchemaForge has already done three things before this runs: Cedar checked
-//! that the caller holds `enrollee`, the `@require` on `token_id` checked that
-//! the caller is spending its own token and no other, and the write-time rules
-//! filled the defaults. What is left is everything that needs to look at other
-//! rows, which is what a hook is for.
+//! SchemaForge has already done two things before this runs: Cedar checked
+//! that the caller holds `enrollee`, and the write-time rules filled the
+//! defaults. What is left is everything that needs to look at other rows,
+//! which is what a hook is for.
+//!
+//! Which token is being spent is settled here rather than by the client. The
+//! daemon does not send `token_id`; the hook takes it from `user_id`, the
+//! subject claim of the artifact the caller authenticated with. That is a
+//! stronger anti-replay binding than the `@require` it replaces, which could
+//! only refuse a mismatch: a caller that cannot express the field cannot
+//! attempt one.
 //!
 //! It runs at `before_validate` rather than `before_change` for one reason:
 //! that phase is the last point at which a field the client never sent can
@@ -95,19 +101,36 @@ impl RedemptionHooks for Service {
         let req = request.into_inner();
 
         // Only a create provisions. An update to a decided redemption must not
-        // mint a second credential for the same install.
+        // mint a second credential for the same install. `Redemption` is also
+        // forbidden to update outright; see policies/custom/credential-lifecycle.cedar.
         if req.operation != "create" {
             return Ok(Response::new(RedemptionBeforeValidateResponse::default()));
         }
 
-        match self.provision(&req).await {
+        // The token being spent is the subject of the artifact that
+        // authenticated this call, and nothing else. An absent subject is not
+        // a refusal to record: there is no grant to record it against, and
+        // persisting a verdict with no subject would write a row no auditor
+        // could join to anything.
+        let Some(token_id) = req.user_id.clone().filter(|sub| !sub.is_empty()) else {
+            warn!(
+                install_id = %req.install_id,
+                "a redemption arrived with no subject claim; refusing to adjudicate it"
+            );
+            return Ok(Response::new(RedemptionBeforeValidateResponse {
+                abort_reason: Some("the presented credential carries no subject claim".to_string()),
+                ..Default::default()
+            }));
+        };
+
+        match self.provision(&req, &token_id).await {
             Ok(response) => Ok(Response::new(response)),
             // The plane being unreachable is not a refusal. Refusing would
             // write a permanent verdict on a transient fault. Abort instead,
             // so the daemon retries and nothing is recorded.
             Err(error) => {
                 warn!(
-                    token_id = %req.token_id,
+                    %token_id,
                     install_id = %req.install_id,
                     "enrollment could not be adjudicated: {error}"
                 );
@@ -124,22 +147,29 @@ impl Service {
     async fn provision(
         &self,
         req: &RedemptionBeforeValidateRequest,
+        token_id: &str,
     ) -> Result<RedemptionBeforeValidateResponse, PlaneError> {
         let now = Utc::now();
 
-        let Some(token) = self.plane.enrollment_token(&req.token_id).await? else {
-            // No such token. The @require proved the caller holds an artifact
-            // whose `sub` is this value, so a missing row means the row was
-            // deleted or never created: worth recording, not worth detail.
-            return Ok(refused(&now, "no enrollment token matches this artifact"));
+        let Some(token) = self.plane.enrollment_token(token_id).await? else {
+            // No such token. The caller authenticated with an artifact whose
+            // `sub` is this value, so a missing row means the row was deleted,
+            // never created, or is invisible to this bearer's tenant: worth
+            // recording, not worth detail.
+            return Ok(refused(
+                &now,
+                token_id,
+                "no enrollment token matches this artifact",
+            ));
         };
 
         let organization = match adjudicate(&token, &self.expected_issuer, now) {
             Verdict::Accept { organization } => organization,
             Verdict::Refuse(reason) => {
-                info!(token_id = %req.token_id, %reason, "enrollment refused");
+                info!(%token_id, %reason, "enrollment refused");
                 return Ok(refused_within(
                     &now,
+                    token_id,
                     &organization_of(&token),
                     &token.id,
                     &reason,
@@ -151,14 +181,14 @@ impl Service {
         let operator = match self.resolve_operator(&token, req).await? {
             Ok(row) => row,
             Err(reason) => {
-                info!(token_id = %req.token_id, %reason, "enrollment refused");
-                return Ok(refused_within(&now, &within, &token.id, &reason));
+                info!(%token_id, %reason, "enrollment refused");
+                return Ok(refused_within(&now, token_id, &within, &token.id, &reason));
             }
         };
 
         if let Err(reason) = operator_admissible(&operator, self.gate.enabled) {
-            info!(token_id = %req.token_id, operator = %operator.id, %reason, "enrollment refused");
-            return Ok(refused_within(&now, &within, &token.id, &reason));
+            info!(%token_id, operator = %operator.id, %reason, "enrollment refused");
+            return Ok(refused_within(&now, token_id, &within, &token.id, &reason));
         }
 
         if self.gate.enabled {
@@ -167,8 +197,8 @@ impl Service {
                 None => Err("organization is not visible to the enrollment service".into()),
             };
             if let Err(reason) = fresh {
-                info!(token_id = %req.token_id, %organization, %reason, "enrollment refused");
-                return Ok(refused_within(&now, &within, &token.id, &reason));
+                info!(%token_id, %organization, %reason, "enrollment refused");
+                return Ok(refused_within(&now, token_id, &within, &token.id, &reason));
             }
         }
 
@@ -184,7 +214,7 @@ impl Service {
             .plane
             .create(
                 "InstallCredential",
-                credential_fields(req, &organization, &install),
+                credential_fields(req, &organization, &install, token_id),
             )
             .await?;
 
@@ -201,7 +231,7 @@ impl Service {
             .await?;
 
         info!(
-            token_id = %req.token_id,
+            %token_id,
             install_id = %req.install_id,
             %install,
             %credential,
@@ -209,6 +239,7 @@ impl Service {
         );
 
         Ok(RedemptionBeforeValidateResponse {
+            token_id: Some(token_id.to_string()),
             organization: Some(organization),
             enrollment_token: Some(token.id),
             install: Some(install),
@@ -288,9 +319,10 @@ fn credential_fields(
     req: &RedemptionBeforeValidateRequest,
     organization: &str,
     install: &str,
+    token_id: &str,
 ) -> BTreeMap<String, Value> {
     let mut fields = BTreeMap::new();
-    fields.insert("credential_id".into(), json!(credential_id(req)));
+    fields.insert("credential_id".into(), json!(credential_id(req, token_id)));
     fields.insert("install".into(), json!(install));
     fields.insert("organization".into(), json!(organization));
     fields.insert("credential_kind".into(), json!(req.credential_kind));
@@ -308,12 +340,23 @@ fn credential_fields(
 /// generated, so a retried redemption of the same token by the same install
 /// collides on `credential_id`'s unique index instead of silently minting a
 /// second live credential.
-fn credential_id(req: &RedemptionBeforeValidateRequest) -> String {
-    format!("{}.{}", req.install_id, req.token_id)
+fn credential_id(req: &RedemptionBeforeValidateRequest, token_id: &str) -> String {
+    format!("{}.{}", req.install_id, token_id)
 }
 
-fn refused(now: &chrono::DateTime<Utc>, reason: &str) -> RedemptionBeforeValidateResponse {
+/// A persisted refusal.
+///
+/// `token_id` is stamped here rather than left to the client, which can no
+/// longer send it at all. Without it the row would record that *something* was
+/// refused without naming the grant it was refused against, which is the one
+/// fact the record exists to carry.
+fn refused(
+    now: &chrono::DateTime<Utc>,
+    token_id: &str,
+    reason: &str,
+) -> RedemptionBeforeValidateResponse {
     RedemptionBeforeValidateResponse {
+        token_id: Some(token_id.to_string()),
         outcome: Some("refused".into()),
         refusal_reason: Some(reason.to_string()),
         decided_at: Some(rfc3339(now)),
@@ -327,6 +370,7 @@ fn refused(now: &chrono::DateTime<Utc>, reason: &str) -> RedemptionBeforeValidat
 /// organization it concerns cannot read.
 fn refused_within(
     now: &chrono::DateTime<Utc>,
+    token_id: &str,
     organization: &Option<String>,
     enrollment_token: &str,
     reason: &str,
@@ -334,7 +378,7 @@ fn refused_within(
     RedemptionBeforeValidateResponse {
         organization: organization.clone(),
         enrollment_token: Some(enrollment_token.to_string()),
-        ..refused(now, reason)
+        ..refused(now, token_id, reason)
     }
 }
 
@@ -350,10 +394,17 @@ fn rfc3339(instant: &chrono::DateTime<Utc>) -> String {
 mod tests {
     use super::*;
 
+    /// The `sub` of the artifact a caller authenticated with, which is what
+    /// the hook uses in place of the field the client used to send.
+    const SUBJECT: &str = "tok_7f3a";
+
+    /// A request as the hook actually receives one: no `token_id`, because the
+    /// daemon has no field to put it in, and a `user_id` because the gateway
+    /// resolved the bearer's subject claim.
     fn request() -> RedemptionBeforeValidateRequest {
         RedemptionBeforeValidateRequest {
             operation: "create".into(),
-            token_id: "tok_7f3a".into(),
+            user_id: Some(SUBJECT.into()),
             install_id: "inst-a".into(),
             hostname: "ws-01".into(),
             platform: "linux".into(),
@@ -395,7 +446,7 @@ mod tests {
 
     #[test]
     fn a_credential_carries_only_public_material() {
-        let fields = credential_fields(&request(), "org_1", "install_1");
+        let fields = credential_fields(&request(), "org_1", "install_1", SUBJECT);
         assert_eq!(fields["public_key"], json!("BASE64SPKI"));
         assert_eq!(fields["status"], json!("active"));
         assert!(!fields.contains_key("cert_fingerprint"));
@@ -413,20 +464,23 @@ mod tests {
         req.credential_kind = "x509_mtls".into();
         req.cert_fingerprint = Some("a".repeat(64));
         assert_eq!(
-            credential_fields(&req, "o", "i")["cert_fingerprint"],
+            credential_fields(&req, "o", "i", SUBJECT)["cert_fingerprint"],
             json!("a".repeat(64))
         );
     }
 
     #[test]
     fn the_credential_id_is_stable_so_a_retry_collides_instead_of_duplicating() {
-        assert_eq!(credential_id(&request()), credential_id(&request()));
-        assert_eq!(credential_id(&request()), "inst-a.tok_7f3a");
+        assert_eq!(
+            credential_id(&request(), SUBJECT),
+            credential_id(&request(), SUBJECT)
+        );
+        assert_eq!(credential_id(&request(), SUBJECT), "inst-a.tok_7f3a");
     }
 
     #[test]
     fn a_refusal_records_the_reason_and_no_identity() {
-        let response = refused(&Utc::now(), "token expired");
+        let response = refused(&Utc::now(), SUBJECT, "token expired");
         assert_eq!(response.outcome, Some("refused".into()));
         assert_eq!(response.refusal_reason, Some("token expired".into()));
         assert!(response.install.is_none());
@@ -435,9 +489,32 @@ mod tests {
     }
 
     #[test]
+    fn a_refusal_still_names_the_grant_that_was_presented() {
+        // The client cannot send `token_id`, so if the hook does not stamp it
+        // the persisted row records that something was refused without saying
+        // which grant, which is the one fact the row exists to carry.
+        assert_eq!(
+            refused(&Utc::now(), SUBJECT, "token expired").token_id,
+            Some(SUBJECT.into())
+        );
+        assert_eq!(
+            refused_within(
+                &Utc::now(),
+                SUBJECT,
+                &Some("org_1".into()),
+                "tok_row",
+                "token has been revoked"
+            )
+            .token_id,
+            Some(SUBJECT.into())
+        );
+    }
+
+    #[test]
     fn a_tenant_scoped_refusal_keeps_the_organization() {
         let response = refused_within(
             &Utc::now(),
+            SUBJECT,
             &Some("org_1".into()),
             "tok_row",
             "token has been revoked",

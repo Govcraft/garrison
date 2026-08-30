@@ -14,7 +14,7 @@ message RedemptionBeforeValidateRequest {
   string operation = 1;
   optional string user_id = 2;
   optional string entity_id = 3;
-  string token_id = 100;
+  optional string token_id = 100;
   optional string organization = 101;
   optional string enrollment_token = 102;
   string install_id = 103;
