@@ -38,6 +38,12 @@ message AuditEventBeforeValidateRequest {
   optional string command_rule = 121;
   optional string tool_rule = 122;
   optional string detail = 123;
+  optional string provider = 124;
+  optional string model = 125;
+  optional int64 prompt_bytes = 126;
+  optional int64 response_bytes = 127;
+  optional int64 input_tokens = 128;
+  optional int64 output_tokens = 129;
 }
 
 message AuditEventBeforeValidateResponse {
@@ -66,5 +72,11 @@ message AuditEventBeforeValidateResponse {
   optional string command_rule = 121;
   optional string tool_rule = 122;
   optional string detail = 123;
+  optional string provider = 124;
+  optional string model = 125;
+  optional int64 prompt_bytes = 126;
+  optional int64 response_bytes = 127;
+  optional int64 input_tokens = 128;
+  optional int64 output_tokens = 129;
 }
 

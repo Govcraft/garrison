@@ -221,10 +221,20 @@ offline behavior, revocation, and audit recovery before enrolling developers.
 
 ## The audit record is evidence with explicit limits
 
-Every tool call is appended to a BLAKE3-chained JSONL trail. Strict durability
+Every attempted turn and every tool call is appended to a BLAKE3-chained JSONL
+trail. A turn is recorded whether or not it called anything, so a session where
+the model answered in text and used no tool still leaves a record. Turn entries
+carry metadata only — outcome, prompt and response byte counts, provider,
+model, token counts — and never the prompt or the answer. Strict durability
 waits for the append to reach disk and refuses further non-idempotent work after
 an audit failure. An anchor stored outside the trail detects deletion of its
 tail, which the chain alone cannot detect.
+
+One gap remains: a turn that Garrison's own admission gates refuse — a lapsed
+seat, an unreachable plane, a full shipping backlog — is turned away before the
+model loop is entered, and nothing appends it to the trail. Closing that gap
+needs a public append path on the audit writer, which the agent runtime does
+not expose yet.
 
 ```sh
 garrison-agent audit verify

@@ -891,7 +891,7 @@ cache buys availability, not integrity.
 | Schema | What it answers |
 |---|---|
 | `AuditTrail` | What the install says about its own trail: local head, shipped through |
-| `AuditEvent` | One entry from an install's BLAKE3 chain, the sealed line verbatim |
+| `AuditEvent` | One entry from an install's BLAKE3 chain — a turn or a tool call — the sealed line verbatim |
 | `AuditChain` | Where the plane has verified a trail's chain to, and whether it holds |
 
 The agent keeps a hash-chained JSONL trail locally; acton-ai seals every entry
@@ -917,6 +917,37 @@ proof. Every other column (`kind`, `decision`, `decider`, `outcome`,
 and may change; the verbatim entry may not. `session` is optional: a trail
 belongs to an install, and an entry can be sealed before any session is known
 to the plane. `trail` is required.
+
+`kind` says which of two things an entry is, and the distinction matters more
+than it looks. A `tool_call` row is one invocation: what ran, with what
+arguments, decided by which gate. A `turn` row is one attempted model turn,
+sealed whether or not that turn called anything. Without it the export answers
+"what did this install run" and never "what did this install ask" — a session
+where the model produced code and called no tool left no row at all, and a
+compliance regime that specifies audit logging as *user activity* would have
+been reading a trail that quietly only covered half of it.
+
+A `turn` row carries metadata and no content: `prompt_bytes`,
+`response_bytes`, `input_tokens`, `output_tokens`, `provider`, and `model`.
+The byte counts answer the user/timestamp/activity/response-length question
+without copying a prompt or an answer into a trail that leaves the workstation
+and lands in a SIEM. There is no column for prompt text; adding one would be a
+decision about retention rather than about auditing, and it is not made here.
+
+`decision` and `decider` mean the approval gate on a `tool_call` row and the
+*admission* gate on a `turn` row: a turn that ran was let through
+(`auto_approved` / `default`) and a turn that did not was refused
+(`forbidden` / `policy`), with the rendered reason in `justification`.
+Admission is a gate in exactly the sense approval is, so a turn fills the same
+columns rather than needing its own. A refused turn has no `outcome`, for the
+same reason a denied call has none: it never ran. `sandboxed` is written
+`false` on every turn row rather than inheriting the schema's `default(true)`,
+because a turn confines nothing.
+
+The ingest hook re-derives every one of those columns, turn columns included.
+An install that could set its own `kind` could file a turn as a tool call and
+vanish from a turn-level export; one that could set its own token counts could
+under-report what it spent.
 
 `AuditChain` is the plane's answer, one per trail rather than one per session.
 Only the `audit_service` role writes it. The `before_validate` hook on
