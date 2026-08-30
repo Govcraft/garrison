@@ -43,10 +43,6 @@ timeout_secs = 600
 max_tokens = 32768
 context_window_tokens = 1000000
 
-# The account's cumulative top-up ($20) puts it in Moonshot's Tier 2 (500 RPM,
-# 3M TPM). These are Tier 1's numbers, held one tier low so the local limiter
-# queues rather than discovering the ceiling as a 429 mid-turn. Raise them
-# after topping up further; see platform.kimi.ai/docs/pricing/limits.
 [providers.kimi.rate_limit]
 requests_per_minute = 200
 tokens_per_minute = 2000000

@@ -378,3 +378,21 @@ The one deployment fact worth stating next to the number: there is no
 provisioned database. The apply path has been exercised against throwaway
 containers, so a deployment starts with `task plane:apply` against a fresh
 database, a seeded organization, and a bootstrapped `platform_admin`.
+
+## License
+
+Copyright © 2026 Govcraft.
+
+Garrison is free and open-source software licensed under the
+[GNU Affero General Public License, version 3 only](LICENSE). If you modify
+Garrison and let users interact with the modified program over a network,
+section 13 of the AGPL requires you to offer those users the corresponding
+source code.
+
+Govcraft also offers commercial licenses for organizations that want to
+distribute or operate Garrison under terms other than the AGPL. See
+[LICENSING.md](LICENSING.md) for the licensing model and contact information.
+
+The Garrison and Govcraft names and logos are not licensed under the AGPL.
+See [TRADEMARKS.md](TRADEMARKS.md). Third-party notices remain in
+[NOTICE](NOTICE).
