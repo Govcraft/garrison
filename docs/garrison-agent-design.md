@@ -156,10 +156,21 @@ Dedicated prompts (`review_request.rs`, `review_exit.rs`) and prompt rules:
 findings first, ordered by severity, file:line references, explicit "no
 findings" statement. Review is a *mode*, not a vibe.
 
-→ **Implemented:** `garrison-agent review` fetches a pull request diff via
-Bitbucket DC REST, runs the review prompt, and posts findings as inline PR
-comments with a build status on the commit (RFQ §3.A.2, "pull-request-level AI
-review is strongly desired"). See `docs/review-mode.md`.
+→ **Implemented, experimental:** `garrison-agent review` fetches a pull
+request diff via Bitbucket DC REST, runs the review prompt, and posts findings
+as inline PR comments with a build status on the commit (RFQ §3.A.2,
+"pull-request-level AI review is strongly desired"). See
+`docs/review-mode.md`.
+
+It ships in the binary and refuses to run until a deployment enables it
+(`GARRISON_EXPERIMENTAL=review`, or `[experimental] review = true` in
+`garrison.toml`). A feature nobody can reach never stops being experimental,
+and a printed warning is filtered out of CI logs within a week, so neither
+alone would keep a pipeline from depending on exit codes that are still
+moving. A refusal is read every time until somebody decides, and the decision
+leaves a trace an auditor can find. The gate is `experimental.rs`, pure, and
+the promise it takes back is bounded: this subcommand may change its behaviour
+and its exit codes without a major version bump, and nothing else does.
 
 Three things make it a mode rather than a prompt, and all three are enforced
 rather than requested of the model. It writes nothing: every tool call is

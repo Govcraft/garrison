@@ -100,7 +100,11 @@ direction, not checkout.
   on a train is not a governance failure), a backlog past its bound does when
   `fail_closed`, and a halt always does, because a refused entry is a finding
   rather than an outage.
-- Unattended pull request review against Bitbucket Data Center.
+- Unattended pull request review against Bitbucket Data Center, **shipped
+  experimental and off**: `review` refuses to start until a deployment enables
+  it (`GARRISON_EXPERIMENTAL=review`, or `[experimental] review = true`),
+  because its exit codes may still change and a warning nobody reads would not
+  stop a pipeline depending on them.
   `garrison-agent review` fetches the diff, posts findings as inline comments
   at `file:line`, and sets a build status on the commit. It writes nothing:
   every tool call is refused, because a pipeline has nobody to answer a

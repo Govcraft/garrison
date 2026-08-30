@@ -4,9 +4,32 @@
 is wrong with it, and exits with a code a pipeline can branch on. It is the
 unattended half of Garrison: no terminal, no approvals, no writes.
 
+## It is experimental, and it refuses until you say so
+
+Review mode ships in the binary and is off. Asking for it without enabling it
+is a refusal to start (exit 2) naming both ways to switch it on:
+
+```sh
+export GARRISON_EXPERIMENTAL=review          # for one invocation, or
+# [experimental]
+# review = true                              # in garrison.toml
+```
+
+Enabling it accepts a narrower promise than the rest of the binary makes: its
+behaviour, its output, and the exit codes below may change without a major
+version bump. Everything else keeps its usual contract.
+
+The refusal is the point. A warning is read once and then filtered out of CI
+logs, so it would not stop a pipeline coming to depend on codes that are still
+moving. A refusal is read every time until somebody decides, and the decision
+leaves a trace an auditor can find: a line in `garrison.toml`, or a variable in
+the job definition. When it is on, every run prints a one-line notice to
+stderr.
+
 ## Invoking it
 
 ```sh
+export GARRISON_EXPERIMENTAL=review
 export GARRISON_BITBUCKET_TOKEN="$(cat /run/secrets/bitbucket)"
 
 garrison-agent review \
@@ -31,7 +54,7 @@ most CI logs.
 |------|---------|-----------------|
 | 0 | The review ran. Findings may have been posted; nothing blocked. | Nobody |
 | 1 | The review did not happen. The answer could not be read as a review. | An operator |
-| 2 | It refused to start: a malformed `--pull-request`, no credential. | Whoever wired the pipeline |
+| 2 | It refused to start: not enabled, a malformed `--pull-request`, no credential. | Whoever wired the pipeline |
 | 3 | `--enforce` was set and a blocker-severity finding was found. | A developer |
 | 5 | The review ran but its audit trail never reached the control plane. | An operator |
 
@@ -99,7 +122,10 @@ A Jenkins declarative stage, as an example:
 
 ```groovy
 stage('Garrison review') {
-  environment { GARRISON_BITBUCKET_TOKEN = credentials('bitbucket-review-token') }
+  environment {
+    GARRISON_EXPERIMENTAL = 'review'
+    GARRISON_BITBUCKET_TOKEN = credentials('bitbucket-review-token')
+  }
   steps {
     sh '''
       garrison-agent review \

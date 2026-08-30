@@ -13,6 +13,7 @@ pub mod duplex;
 pub mod enrollment;
 pub mod entitlement;
 pub mod error;
+pub mod experimental;
 pub mod launch;
 pub mod lsp;
 pub mod patch;

@@ -837,6 +837,8 @@ const STATUS_KEY: &str = "garrison-review";
 async fn review(run: ReviewRun) -> Result<(), GarrisonError> {
     use garrison_agent::review::{self, Blocking};
 
+    gate_experimental()?;
+
     let target = garrison_bitbucket::PullRequest::parse(&run.pull_request)
         .map_err(|reason| GarrisonError::configuration("--pull-request", reason))?;
 
@@ -1195,4 +1197,34 @@ async fn drain_audit(run: &ReviewRun) -> Evidence {
             }
         }
     }
+}
+
+/// Refuses unless review mode has been switched on deliberately.
+///
+/// Checked before the pull request reference, the credential, or anything
+/// else, so that "this is experimental" is the first thing an operator learns
+/// rather than the fourth. The config file is read directly rather than asked
+/// of the daemon: the gate has to answer even when no daemon is running, and a
+/// feature that could be enabled by whichever daemon happened to be up would
+/// not be a decision anyone made.
+fn gate_experimental() -> Result<(), GarrisonError> {
+    use garrison_agent::experimental::{self, Feature};
+
+    let config = GarrisonConfig::load()
+        .map(|config| config.experimental)
+        .unwrap_or_default();
+
+    let env = std::env::var(experimental::ENV_VAR).ok();
+
+    if experimental::enabled(config, env.as_deref(), Feature::Review) {
+        eprintln!("{}", experimental::notice(Feature::Review));
+        return Ok(());
+    }
+
+    // A refusal to start rather than a malfunction: nothing is broken, and a
+    // supervisor must not retry it.
+    Err(GarrisonError::configuration(
+        "experimental.review",
+        experimental::refusal(Feature::Review),
+    ))
 }

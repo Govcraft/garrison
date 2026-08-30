@@ -191,6 +191,26 @@ sweep_interval_hours = 24
 # Until one of those arrives the session refuses new prompts with JSON-RPC
 # code -32019, and a resume or abandon with nothing to act on is -32021.
 
+[experimental]
+# Features that ship in this binary and are off until asked for.
+#
+# Enabling one accepts a narrower promise than the rest of this binary makes:
+# its behaviour, its output, and its exit codes may change without a major
+# version bump. Nothing else here loses its usual contract.
+#
+# The refusal is deliberate. A feature nobody can reach never stops being
+# experimental, and a printed warning is read once and then filtered out of CI
+# logs. A refusal is read every time until somebody decides, and the decision
+# leaves a trace an auditor can find: this line, or GARRISON_EXPERIMENTAL in a
+# pipeline definition.
+#
+# GARRISON_EXPERIMENTAL is comma-separated and enables a feature for one
+# invocation. Either source is enough and neither can veto the other.
+
+# Unattended pull request review: `garrison-agent review`, read-only, exits
+# with a code a pipeline branches on. See docs/review-mode.md.
+review = false
+
 # [plane]
 # Enrolling with a control plane. Omit this section entirely and the agent runs
 # standalone, exactly as it did before enrollment existed.

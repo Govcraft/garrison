@@ -56,6 +56,14 @@ pub struct GarrisonConfig {
     /// the rules themselves live in the control plane, and nothing in this
     /// file can widen them. See [`PolicyConfig`].
     pub policy: PolicyConfig,
+    /// Features that ship in the binary but are off until asked for.
+    ///
+    /// Absent — no `[experimental]` section — is everything off, which is the
+    /// only safe default: a deployment that has not heard of a feature has
+    /// not opted into it. Enabling one accepts that its behaviour and exit
+    /// codes may change without a major version bump, which is a promise the
+    /// rest of this binary does not get to break.
+    pub experimental: crate::experimental::ExperimentalConfig,
 }
 
 /// How the centrally managed policy bundle is pulled and how long it lasts.
@@ -1110,6 +1118,10 @@ auto_start = false
         let config = GarrisonConfig::from_toml("[policy]\nrefresh_secs = 0\n").unwrap();
 
         assert_eq!(config.policy.refresh(), Duration::from_secs(300));
+        assert!(
+            !config.experimental.review,
+            "the shipped config documents the experimental section with it off"
+        );
     }
 
     #[test]
@@ -1156,5 +1168,31 @@ auto_start = false
             .expect("the shipped garrison.toml must parse");
 
         assert_eq!(config.policy.refresh(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn a_config_with_no_experimental_section_has_everything_off() {
+        // Every existing garrison.toml predates the section. Adding it must
+        // not change what any of them mean.
+        let config: GarrisonConfig = toml::from_str("").expect("an empty config parses");
+        assert!(!config.experimental.review);
+    }
+
+    #[test]
+    fn the_experimental_section_is_accepted_by_the_whole_config() {
+        // `deny_unknown_fields` is on the parent, so a section that parses in
+        // isolation can still be rejected here. This is the assertion that
+        // catches that.
+        let config: GarrisonConfig =
+            toml::from_str("[experimental]\nreview = true\n").expect("the section is accepted");
+        assert!(config.experimental.review);
+    }
+
+    #[test]
+    fn an_unknown_experimental_key_is_still_refused() {
+        // The gate must not become a place where typos are silently accepted:
+        // `reviw = true` looking like it worked is exactly the failure the
+        // refusal exists to prevent.
+        assert!(toml::from_str::<GarrisonConfig>("[experimental]\nreviw = true\n").is_err());
     }
 }
