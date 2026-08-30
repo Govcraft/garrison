@@ -123,11 +123,22 @@ impl Compositor {
 }
 
 /// Removes foreground, background, and underline colors without losing text.
+///
+/// Both levels, because a `Line` carries a style of its own and rendering
+/// patches it underneath each span's: clearing only the spans leaves a
+/// line-level color painted, so "colors off" would still emit color for any
+/// line built with `Line::styled`. Modifiers are deliberately untouched —
+/// bold and underline are how emphasis survives once color cannot carry it.
 fn remove_colors(lines: &mut [Line<'static>]) {
-    for span in lines.iter_mut().flat_map(|line| &mut line.spans) {
-        span.style.fg = None;
-        span.style.bg = None;
-        span.style.underline_color = None;
+    for line in lines.iter_mut() {
+        line.style.fg = None;
+        line.style.bg = None;
+        line.style.underline_color = None;
+        for span in &mut line.spans {
+            span.style.fg = None;
+            span.style.bg = None;
+            span.style.underline_color = None;
+        }
     }
 }
 
@@ -275,7 +286,7 @@ fn suspend_process() -> std::io::Result<()> {
 mod tests {
     use super::*;
     use ratatui::style::{Color, Style};
-    use ratatui::text::Line;
+    use ratatui::text::{Line, Span};
 
     fn snapshot(lines: &[&str], cursor: Option<(u16, u16)>) -> Snapshot {
         Snapshot {
@@ -323,6 +334,10 @@ mod tests {
 
     #[test]
     fn disabling_color_preserves_text_and_non_color_attributes() {
+        // `Line::styled` puts the style on the *line*; its spans keep the
+        // default style. Asserting the span here is how the original version
+        // of this test passed its fg/bg checks vacuously and then failed on
+        // the modifier: the bold it was looking for was never on the span.
         let mut lines = vec![Line::styled(
             "warning",
             Style::default().fg(Color::Red).bg(Color::Black).bold(),
@@ -331,12 +346,34 @@ mod tests {
         remove_colors(&mut lines);
 
         assert_eq!(texts(&lines), ["warning"]);
-        assert_eq!(lines[0].spans[0].style.fg, None);
-        assert_eq!(lines[0].spans[0].style.bg, None);
-        assert!(lines[0].spans[0]
-            .style
-            .add_modifier
-            .contains(ratatui::style::Modifier::BOLD));
+        assert_eq!(lines[0].style.fg, None);
+        assert_eq!(lines[0].style.bg, None);
+        assert!(
+            lines[0]
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD),
+            "emphasis has to survive losing color, or the no-color mode is \
+             also a no-emphasis mode",
+        );
+    }
+
+    #[test]
+    fn disabling_color_strips_a_line_level_color_not_only_its_spans() {
+        // Rendering patches the line's style underneath each span's, so a
+        // color left on the line is a color the terminal still paints.
+        // Clearing only spans made "colors off" a half-measure.
+        let mut lines = vec![Line::from(vec![Span::styled(
+            "warning",
+            Style::default().fg(Color::Yellow),
+        )])
+        .style(Style::default().fg(Color::Red).bg(Color::Black))];
+
+        remove_colors(&mut lines);
+
+        assert_eq!(lines[0].style.fg, None, "the line's own color is gone");
+        assert_eq!(lines[0].style.bg, None);
+        assert_eq!(lines[0].spans[0].style.fg, None, "and the span's with it");
     }
 
     #[test]
