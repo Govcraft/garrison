@@ -198,8 +198,28 @@ precisely the claim Garrison exists not to make.
 
 ## What is not built
 
-- **Policy distribution to a pipeline install** (#11), so a build agent runs
-  the organization's policy rather than whatever the repository ships.
+- **An install identity that is legitimately ephemeral** (#11). Note what this
+  is *not*: policy distribution already works here. The runner's daemon pulls
+  its assigned bundle from the plane, re-verifies the checksum against the
+  rows it received, and puts it in force before any turn, and a review's turn
+  is governed by that bundle like any other. Nothing about delivery is
+  review-specific or missing.
+
+  What is missing is upstream of the bundle. Enrollment is one-time and
+  durable on purpose: a daemon is enrolled if and only if it can read back its
+  install record, the packet is destroyed the moment it is spent, and the
+  signing key is generated on the machine and never transmitted. A container
+  has no durable disk, so every build is a first run. That gives either one
+  install row per build, which makes the fleet view and the seat count
+  meaningless, or a spent packet and a refusal to start, which is the right
+  behaviour and a broken pipeline.
+
+  The workaround today is to mount a provisioned install record and key into
+  the runner image. It works, and it costs a long-lived private key living in
+  an image and every concurrent build sharing one identity and one seat. The
+  real fix is a control-plane question rather than an agent one: a grant that
+  mints a short-lived identity per build, or an install kind provisioned once
+  and permitted to run concurrently.
 - **Reviewing anything that is not a Bitbucket pull request.** A local
   `git diff` mode would reuse everything except the transport, and the prompt
   layer is already independent of Bitbucket for that reason.
