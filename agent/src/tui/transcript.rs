@@ -1,14 +1,15 @@
-//! The conversation, and the unfinished tail of it.
+//! The conversation, committed to terminal scrollback exactly once.
 //!
 //! Owns exactly one thing: the part of the agent's reply that has arrived but
 //! is not yet a complete line. Complete lines are not owned at all — they go
 //! straight into the terminal's scrollback, where they belong to the terminal
 //! and can never be redrawn, which is what makes them cheap.
 //!
-//! Because this actor owns its own region it can commit a line the moment it
-//! is finished, whoever sent it. A message the user types while the agent is
-//! working appears in the transcript immediately, in its place in time, rather
-//! than waiting for the turn to end.
+//! The unfinished tail is buffered but not painted. Painting it would put its
+//! bytes into the terminal stream once as live text and again when the same
+//! text is committed to durable scrollback, which makes stream-tracking
+//! assistive technology announce it twice. A message the user types while the
+//! agent is working still appears immediately, in its place in time.
 
 use super::message::{
     AgentChunk, AgentFinished, CommitHistory, Note, Region, RegionRendered, Wire,
@@ -19,12 +20,6 @@ use ratatui::text::{Line, Span};
 
 /// The type every handler returns.
 type FutureBox = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync + 'static>>;
-
-/// The most rows of unfinished reply shown above the composer.
-///
-/// The tail is redrawn every frame, so it is bounded; everything older has
-/// already been committed and is scrollable in the terminal.
-const MAX_TAIL_ROWS: usize = 6;
 
 /// The part of the reply that is not a complete line yet.
 #[acton_actor]
@@ -77,25 +72,13 @@ impl Transcript {
         vec![agent_line(remaining)]
     }
 
-    /// The rows of the tail currently shown above the composer.
+    /// The tail region remains empty until text is committed to scrollback.
+    ///
+    /// Returning no live text is what guarantees each streamed line enters
+    /// the terminal's text stream only once.
     #[must_use]
-    pub fn render(&self) -> RegionRendered {
-        if self.tail.is_empty() {
-            return RegionRendered::empty(Region::Tail);
-        }
-
-        let rows: Vec<Line<'static>> = self
-            .tail
-            .split('\n')
-            .rev()
-            .take(MAX_TAIL_ROWS)
-            .map(|line| agent_line(line.to_string()))
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-
-        RegionRendered::showing(Region::Tail, rows)
+    pub const fn render(&self) -> RegionRendered {
+        RegionRendered::empty(Region::Tail)
     }
 }
 
@@ -267,18 +250,13 @@ mod tests {
     }
 
     #[test]
-    fn a_long_tail_shows_only_its_last_rows() {
+    fn buffered_stream_text_is_not_painted_before_commit() {
         let mut transcript = Transcript::default();
-        transcript.absorb("a\nb\nc\n");
-        transcript.tail = (1..=10)
-            .map(|n| format!("row{n}"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        transcript.absorb("not finished yet");
 
         let rendered = transcript.render();
-        assert_eq!(rendered.lines.len(), MAX_TAIL_ROWS);
-        assert_eq!(text(&rendered.lines[0]), "row5");
-        assert_eq!(text(rendered.lines.last().expect("rows")), "row10");
+        assert!(rendered.lines.is_empty());
+        assert_eq!(transcript.tail, "not finished yet");
     }
 
     #[test]
