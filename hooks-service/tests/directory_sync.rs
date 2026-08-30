@@ -337,7 +337,7 @@ fn run_apply(cwd: &Path, db_url: &str) -> bool {
 #[tokio::test]
 async fn provisioning_and_deprovisioning_flow_through_a_real_plane() {
     if schemaforge().is_none() {
-        eprintln!("skipping: schemaforge is not on PATH");
+        garrison_wire::skip_live("schemaforge is not on PATH");
         return;
     }
 
@@ -352,7 +352,7 @@ async fn provisioning_and_deprovisioning_flow_through_a_real_plane() {
     let postgres = match image.start().await {
         Ok(container) => container,
         Err(error) => {
-            eprintln!("skipping: no container runtime answered ({error})");
+            garrison_wire::skip_live(&format!("no container runtime answered ({error})"));
             return;
         }
     };
@@ -499,6 +499,7 @@ async fn provisioning_and_deprovisioning_flow_through_a_real_plane() {
                     "token_id": token_id,
                     "organization": org_id,
                     "scope": "organization",
+                    "install_lifecycle": "durable",
                     "max_uses": 1,
                     "issued_by": ADMIN_USER,
                     "expires_at": expires
@@ -506,6 +507,25 @@ async fn provisioning_and_deprovisioning_flow_through_a_real_plane() {
             )
             .await;
     }
+
+    // A pipeline grant: multi-use, because a runner enrolls on every build,
+    // and ephemeral, because the machine it admits will not exist in ten
+    // minutes.
+    plane
+        .create(
+            "EnrollmentToken",
+            json!({
+                "token_id": "tok_pipeline",
+                "organization": org_id,
+                "scope": "organization",
+                "install_lifecycle": "ephemeral",
+                "install_ttl_secs": 900,
+                "max_uses": 50,
+                "issued_by": ADMIN_USER,
+                "expires_at": expires
+            }),
+        )
+        .await;
 
     // No console User is seeded. The plane's user store has no tenant
     // column, so the tenant-scoped sync cannot list it; that half is
@@ -519,6 +539,7 @@ async fn provisioning_and_deprovisioning_flow_through_a_real_plane() {
     let directory_token = mint(&key, "garrison-directory", "directory_service", &chain);
     let enrollee_1 = mint(&key, "tok_alice_1", "enrollee", &chain);
     let enrollee_2 = mint(&key, "tok_alice_2", "enrollee", &chain);
+    let enrollee_pipeline = mint(&key, "tok_pipeline", "enrollee", &chain);
 
     let snapshot = work.path().join("directory.json");
     write_snapshot(
@@ -633,6 +654,65 @@ async fn provisioning_and_deprovisioning_flow_through_a_real_plane() {
         json!(alice_id),
         "the install binds to the operator the directory created"
     );
+    assert_eq!(
+        install["fields"]["lifecycle"],
+        json!("durable"),
+        "a workstation grant mints a machine that does not expire: {install}"
+    );
+    assert!(
+        install["fields"]["expires_at"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty(),
+        "a durable install carries no window: {install}"
+    );
+
+    // 1b. The pipeline path. Two builds redeem the same multi-use grant, each
+    // arriving as what a fresh container looks like from here: a new install
+    // id, a new keypair, no record of ever having enrolled. Nothing in the
+    // request says "I am ephemeral", because the daemon has no field for it
+    // and could not answer honestly if it had. The grant decides.
+    let mut windows = Vec::new();
+    for build in ["inst-build-1", "inst-build-2"] {
+        let minted: Value = redemption(&enrollee_pipeline, build)
+            .await
+            .expect("plane reachable")
+            .json()
+            .await
+            .expect("json");
+        assert_eq!(
+            minted["fields"]["outcome"],
+            json!("accepted"),
+            "a multi-use pipeline grant admits every build: {minted}"
+        );
+        let row = plane
+            .get(
+                "AgentInstall",
+                minted["fields"]["install"].as_str().expect("install id"),
+            )
+            .await;
+        assert_eq!(
+            row["fields"]["lifecycle"],
+            json!("ephemeral"),
+            "the grant decides the lifecycle, not the daemon: {row}"
+        );
+        let closes = row["fields"]["expires_at"]
+            .as_str()
+            .expect("an ephemeral install is dated at mint time")
+            .to_string();
+        let closes =
+            chrono::DateTime::parse_from_rfc3339(&closes).expect("the window parses as RFC 3339");
+        assert!(
+            closes > chrono::Utc::now(),
+            "the window opens in the future: {closes}"
+        );
+        assert!(
+            closes < chrono::Utc::now() + chrono::Duration::seconds(901),
+            "and closes within the TTL the grant asked for: {closes}"
+        );
+        windows.push(closes);
+    }
+    assert_eq!(windows.len(), 2, "both builds enrolled");
 
     // 2. Deprovisioning. Her account is disabled in the directory.
     write_snapshot(

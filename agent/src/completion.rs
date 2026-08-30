@@ -291,7 +291,10 @@ mod tests {
 
     #[test]
     fn a_fence_without_a_language_tag_is_unwrapped() {
-        assert_eq!(clean("```\ncompute();\n```", &request("", "")), "compute();");
+        assert_eq!(
+            clean("```\ncompute();\n```", &request("", "")),
+            "compute();"
+        );
     }
 
     #[test]

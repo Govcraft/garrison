@@ -1323,7 +1323,9 @@ async fn a_completion_comes_back_ready_to_insert_at_the_cursor() {
         .expect("a completion must be answered");
 
     assert_eq!(
-        response.get("completion").and_then(serde_json::Value::as_str),
+        response
+            .get("completion")
+            .and_then(serde_json::Value::as_str),
         Some("a + b;"),
         "the fence and the restated prefix must both be gone: {response}",
     );

@@ -83,6 +83,15 @@ pub struct EnrollmentTokenRow {
     pub status: String,
     pub expires_at: Option<String>,
     pub first_redeemed_at: Option<String>,
+    /// What this grant mints: `durable` or `ephemeral`.
+    ///
+    /// Defaulted rather than required so a row written before the column
+    /// existed reads as durable, which is what it was.
+    #[serde(default)]
+    pub install_lifecycle: String,
+    /// How long an ephemeral install minted by this grant may live, seconds.
+    #[serde(default)]
+    pub install_ttl_secs: i64,
 }
 
 /// The subset of an `Operator` row the hook and the sync both read.

@@ -703,6 +703,52 @@ install's own `_garrison/status`, not asserted by the console. That is the
 difference between "we require landlock and seccomp" as a policy statement and
 as an observation, and it is the field a reviewer will ask about.
 
+#### Machines that will not exist tomorrow
+
+**Implemented.** `AgentInstall.lifecycle` is `durable` or `ephemeral`, and an
+ephemeral install carries an `expires_at` stamped when it was minted.
+
+The problem it solves is that enrollment assumes a disk. A daemon is enrolled
+if and only if it can read back its install record; the packet is destroyed
+when spent; the signing key is generated locally and never transmitted. All
+three are correct for a workstation and all three assume storage that outlives
+the process. A CI runner has none, so every build is a first run. Without a way
+to say so, a pipeline gets either one undifferentiated install row per build or
+a spent packet and a refusal to start.
+
+Three properties make the ephemeral case work rather than merely permitted.
+
+**The grant decides, not the daemon.** `EnrollmentToken.install_lifecycle` says
+what a grant mints and `install_ttl_secs` says for how long. The daemon has no
+field to declare this in, deliberately: from inside, a fresh container and a
+freshly imaged laptop are the same situation, so a machine asked to classify
+itself would be guessing. Whoever provisions the runner knows, and the grant is
+where they say it. Being multi-use is what `max_uses` already did, so a pipeline
+grant is an ordinary grant with two more columns set.
+
+**The window is stamped at mint time.** `expires_at` is computed once, at
+redemption, from the clock and the grant's TTL. It is not recomputed later from
+the grant, because a grant can be revoked, edited, or spent again, and none of
+that should change when an install that already exists stops running.
+
+**A missing window is a refusal, not a licence.** `adjudicate` refuses an
+install marked ephemeral that carries no expiry, before it looks at a seat. The
+tempting reading of an absent date is "no limit", and that reading would turn a
+hook that failed to stamp the field into a standing pipeline identity, which is
+the exact failure the column exists to prevent. An unparseable date is refused
+the same way, matching how a seat's own expiry is read.
+
+Enforcement lives in the seat gate rather than in a sweep, because that is the
+one path every turn already passes. A sweep that retires expired rows is
+housekeeping for the fleet view; it is not what makes an expired identity safe,
+and nothing depends on it having run. Rows are retired rather than deleted:
+`AgentSession` and every audit entry hang off the install, so deleting one
+would orphan the evidence it was created to carry.
+
+What this does **not** change is seat cost. A seat belongs to an operator, and
+every ephemeral install a pipeline mints binds to the same CI operator and runs
+on that operator's seat. A hundred builds a day is one seat, not a hundred.
+
 `AgentSession` is where seat utilization and cost accounting roll up.
 `total_tokens` is `@compute("input_tokens + output_tokens")` — server-derived
 at write time, overwriting whatever a client sends.

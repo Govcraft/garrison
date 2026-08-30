@@ -222,6 +222,8 @@ mod tests {
             status: "issued".into(),
             expires_at: Some("2026-08-31T00:00:00Z".into()),
             first_redeemed_at: None,
+            install_lifecycle: "durable".into(),
+            install_ttl_secs: 3600,
         }
     }
 

@@ -44,6 +44,38 @@ schema AgentInstall {
                        )
                        @list(column)
 
+    // Whether this machine is expected to still exist tomorrow.
+    //
+    // Durable is a workstation: it enrolls once and keeps its install record
+    // across restarts, which is what makes "one row per machine" true. An
+    // ephemeral install is a CI runner, which has no disk that outlives the
+    // build, so every build is a first run and every build is a new row. That
+    // is not a defect to be worked around; it is what the machine is, and the
+    // fleet view is only misleading if the two are not told apart.
+    //
+    // Set by the enrollment hook from the grant, never by the daemon. A
+    // container cannot be trusted to declare that it is one, and it has no
+    // way to know: from inside, a fresh container and a fresh laptop are the
+    // same situation.
+    lifecycle:         enum("durable", "ephemeral")
+                       required
+                       default("durable")
+                       @enum_colors(durable: "blue", ephemeral: "amber")
+                       @list(column)
+
+    // When an ephemeral install stops being allowed to run, RFC 3339.
+    //
+    // Null on a durable install, which does not expire. On an ephemeral one
+    // this is the whole point: the identity is bounded at mint time, so a
+    // runner that is somehow still alive an hour after its build, or a
+    // credential lifted out of a container image, refuses turns without
+    // anybody having to notice and revoke it.
+    //
+    // Enforcement is on the agent side, in the seat gate, because that is the
+    // one path every turn already passes. A sweep that retires expired rows
+    // is housekeeping for the fleet view and is not what makes this safe.
+    expires_at:        datetime @format("relative")
+
     // The bundle this install last pulled and put in force.
     policy_bundle:     -> PolicyBundle
     bundle_checksum:   text(max: 128)

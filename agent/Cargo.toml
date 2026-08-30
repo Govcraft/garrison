@@ -15,6 +15,7 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock", "s
 clap = { version = "4.6.6", features = ["derive"] }
 crossterm = { version = "0.29", features = ["bracketed-paste", "event-stream"] }
 ed25519-dalek = { version = "3.0.0", features = ["pkcs8", "pem"] }
+garrison-bitbucket = { version = "1.0.0", path = "../bitbucket" }
 garrison-policy = { version = "1.0.0", path = "../policy" }
 garrison-wire = { version = "1.0.0", path = "../wire" }
 getrandom = "0.4.3"

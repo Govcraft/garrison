@@ -317,7 +317,7 @@ fn head_from_stored(rows: &[Value]) -> ChainHead {
 #[tokio::test]
 async fn sealed_entries_ship_into_a_real_plane_and_the_chain_head_matches() {
     if !schemaforge_on_path() {
-        eprintln!("skipping: schemaforge is not on PATH");
+        garrison_wire::skip_live("schemaforge is not on PATH");
         return;
     }
 
@@ -332,7 +332,7 @@ async fn sealed_entries_ship_into_a_real_plane_and_the_chain_head_matches() {
     let postgres = match image.start().await {
         Ok(container) => container,
         Err(error) => {
-            eprintln!("skipping: no container runtime answered ({error})");
+            garrison_wire::skip_live(&format!("no container runtime answered ({error})"));
             return;
         }
     };
@@ -482,6 +482,7 @@ async fn sealed_entries_ship_into_a_real_plane_and_the_chain_head_matches() {
                 "agent_version": "0.1.0",
                 "acton_ai_version": "0.35.0",
                 "sandbox_hardening": "enforce",
+                "lifecycle": "durable",
                 "status": "active"
             }),
         )

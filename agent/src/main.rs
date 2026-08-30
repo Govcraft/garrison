@@ -131,6 +131,70 @@ enum Command {
         #[arg(long)]
         approve_all: bool,
     },
+    /// Reviews a Bitbucket pull request and reports what it found.
+    ///
+    /// The unattended mode: no terminal, no approvals, no writes. Exits 0 when
+    /// the review ran (whatever it found), 3 when `--enforce` is set and a
+    /// blocker was found, 1 when the review did not happen. That last one is
+    /// not excused by advisory mode: a run that could not read its own answer
+    /// must not report a pass.
+    ///
+    /// The Bitbucket credential is read from `GARRISON_BITBUCKET_TOKEN` and is
+    /// deliberately not a flag. A token in argv is readable by every process
+    /// on the runner and lands in the pipeline log.
+    Review {
+        /// The socket to connect to.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// The Bitbucket Data Center base URL, e.g. `https://bitbucket.agency.gov`.
+        #[arg(long)]
+        bitbucket: String,
+        /// Which pull request, as `PROJECT/REPO/ID`.
+        #[arg(long)]
+        pull_request: String,
+        /// Post findings to the pull request instead of only printing them.
+        ///
+        /// Without it the run is a dry run: it reviews, prints, and touches
+        /// nothing. That is the right default for the first time anyone points
+        /// this at a repository they care about.
+        #[arg(long)]
+        post: bool,
+        /// Let a blocker-severity finding fail the build.
+        ///
+        /// Off by default. Failing a build on a model's opinion is a strong
+        /// claim, and a team should watch the reviewer for a while before
+        /// letting it make one.
+        #[arg(long)]
+        enforce: bool,
+        /// The commit to record a build status against.
+        ///
+        /// Without it no status is posted. The pull request still gets the
+        /// comments; it just does not get a pass/fail mark.
+        #[arg(long)]
+        commit: Option<String>,
+        /// Where a human goes to read this run, recorded on the build status.
+        #[arg(long)]
+        run_url: Option<String>,
+        /// How many unchanged lines to show either side of each change.
+        #[arg(long, default_value_t = 10)]
+        context: u32,
+        /// How long to wait for the audit trail to reach the control plane.
+        ///
+        /// A CI runner is deleted minutes after the review ends, so an entry
+        /// still in its buffer is destroyed evidence rather than delayed
+        /// evidence. The run waits for the plane to accept the trail before
+        /// exiting, and says so when it could not.
+        #[arg(long, default_value_t = 30)]
+        audit_timeout: u64,
+        /// Exit successfully even when the trail did not reach the plane.
+        ///
+        /// For running this from a workstation, where the trail file survives
+        /// and ships later. On an ephemeral runner it turns "no evidence this
+        /// review happened" into a green check, which is the failure the
+        /// default exists to prevent.
+        #[arg(long)]
+        allow_unshipped_audit: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -292,6 +356,32 @@ async fn run(cli: Cli) -> Result<(), GarrisonError> {
             message,
             approve_all,
         } => chat(socket, message, approve_all).await,
+        Command::Review {
+            socket,
+            bitbucket,
+            pull_request,
+            post,
+            enforce,
+            commit,
+            run_url,
+            context,
+            audit_timeout,
+            allow_unshipped_audit,
+        } => {
+            review(ReviewRun {
+                socket,
+                bitbucket,
+                pull_request,
+                post,
+                enforce,
+                commit,
+                run_url,
+                context,
+                audit_timeout,
+                allow_unshipped_audit,
+            })
+            .await
+        }
     }
 }
 
@@ -706,4 +796,435 @@ async fn chat(
 
     println!("\n[{:?}]", response.stop_reason);
     Ok(())
+}
+
+/// Everything one `review` invocation was told.
+///
+/// A struct rather than eight positional arguments, because a call site that
+/// reads `review(socket, url, pr, true, false, commit, None, 10)` is one
+/// transposition away from enforcing when it meant to post.
+struct ReviewRun {
+    socket: Option<PathBuf>,
+    bitbucket: String,
+    pull_request: String,
+    post: bool,
+    enforce: bool,
+    commit: Option<String>,
+    run_url: Option<String>,
+    context: u32,
+    audit_timeout: u64,
+    allow_unshipped_audit: bool,
+}
+
+/// The environment variable carrying the Bitbucket credential.
+///
+/// Not a flag, and not read from the config file. A flag lands in `ps` output
+/// and in the pipeline's own log of the command it ran; a config file is a
+/// standing secret on a runner that should not keep one.
+const TOKEN_VAR: &str = "GARRISON_BITBUCKET_TOKEN";
+
+/// The identity a build status is recorded under.
+///
+/// Bitbucket dedupes on this, so re-running a pipeline replaces the previous
+/// status rather than stacking another one beside it.
+const STATUS_KEY: &str = "garrison-review";
+
+/// `review`: read a pull request, say what is wrong with it, exit accordingly.
+///
+/// The order matters and is not arbitrary. The diff is fetched before the
+/// daemon is contacted, so a bad pull request reference or a rejected token
+/// fails in a second rather than after a model has been paid to read nothing.
+async fn review(run: ReviewRun) -> Result<(), GarrisonError> {
+    use garrison_agent::review::{self, Blocking};
+
+    gate_experimental()?;
+
+    let target = garrison_bitbucket::PullRequest::parse(&run.pull_request)
+        .map_err(|reason| GarrisonError::configuration("--pull-request", reason))?;
+
+    let token = std::env::var(TOKEN_VAR).map_err(|_| {
+        GarrisonError::configuration(
+            TOKEN_VAR,
+            "no Bitbucket credential in the environment; review mode reads one \
+             from this variable rather than a flag, so it cannot leak into the \
+             pipeline log",
+        )
+    })?;
+
+    let bitbucket = garrison_bitbucket::Client::new(
+        &run.bitbucket,
+        garrison_bitbucket::Credentials::Bearer(token),
+    )
+    .map_err(|error| GarrisonError::configuration("--bitbucket", error.to_string()))?;
+
+    let blocking = if run.enforce {
+        Blocking::Enforcing
+    } else {
+        Blocking::Advisory
+    };
+
+    let files = bitbucket
+        .pull_request_diff(&target, run.context)
+        .await
+        .map_err(|error| GarrisonError::runtime(format!("could not read the diff: {error}")))?;
+
+    let withheld = files.iter().filter(|file| file.truncated).count();
+    println!(
+        "reviewing {} ({} file(s){})",
+        run.pull_request,
+        files.len(),
+        if withheld == 0 {
+            String::new()
+        } else {
+            // Said up front, because a run that reviewed nine of ten files
+            // must not be read as having reviewed the pull request.
+            format!(", {withheld} withheld by the server and not reviewed")
+        }
+    );
+
+    let outcome = if files.is_empty() {
+        // Nothing to look at is not the same as nothing wrong, but it is not a
+        // failure either: a pull request can legitimately change no files.
+        println!("the diff is empty; there is nothing to review");
+        review::Outcome::Clean
+    } else {
+        let answer = ask(&run, &files).await?;
+        let parsed = review::parse_findings(&answer);
+        let outcome = review::decide(&parsed, blocking);
+
+        report(&parsed, &files, blocking, run.post);
+        if run.post {
+            publish(&bitbucket, &target, parsed.findings(), &files, blocking).await;
+        }
+        outcome
+    };
+
+    // Drain before the status is posted, so the status can report on the
+    // evidence as well as the findings. A pull request marked green by a run
+    // whose trail died with the container would be the exact claim Garrison
+    // exists not to make.
+    let evidence = drain_audit(&run).await;
+    let audit_failure = match &evidence {
+        Evidence::Shipped(through) => {
+            println!("the audit trail reached the plane through entry {through}");
+            None
+        }
+        Evidence::NotShipping => {
+            // Not an error here. A standalone install legitimately ships
+            // nothing, and this binary cannot tell that apart from a
+            // misconfigured runner. Said out loud so the difference is the
+            // operator's to notice rather than nobody's.
+            println!(
+                "this install ships no audit trail, so this review left evidence \
+                 only on the machine that ran it"
+            );
+            None
+        }
+        Evidence::Missing(reason) => Some(reason.clone()),
+    };
+
+    if let Some(reason) = &audit_failure {
+        eprintln!("the audit trail did not leave this machine: {reason}");
+    }
+
+    if let (Some(commit), true) = (run.commit.as_ref(), run.post) {
+        // A status is only posted when posting is on. A dry run that marked
+        // the pull request would not be a dry run.
+        let status = garrison_bitbucket::BuildStatus {
+            key: STATUS_KEY.to_string(),
+            state: if audit_failure.is_some() {
+                garrison_bitbucket::BuildState::Failed
+            } else {
+                outcome.build_state()
+            },
+            url: run
+                .run_url
+                .clone()
+                .unwrap_or_else(|| "https://garrison.local/review".to_string()),
+            name: "Garrison review".to_string(),
+            description: audit_failure.as_ref().map_or_else(
+                || outcome.description(),
+                |reason| format!("{} (audit not shipped: {reason})", outcome.description()),
+            ),
+        };
+        if let Err(error) = bitbucket.set_build_status(commit, &status).await {
+            // Not fatal on its own: the comments already landed, and losing
+            // the status should not turn a completed review into a failed run.
+            eprintln!("the build status could not be recorded: {error}");
+        }
+    }
+
+    println!("\n{}", outcome.description());
+
+    // Order matters. A blocked review is reported ahead of a missing trail,
+    // because a developer with a blocker to fix should be sent to the blocker
+    // first; the shipping failure is still printed above either way.
+    match outcome {
+        review::Outcome::Blocked { .. } => {
+            Err(GarrisonError::review_blocked(outcome.description()))
+        }
+        review::Outcome::Failed { reason } => Err(GarrisonError::turn_failed(reason)),
+        review::Outcome::Clean | review::Outcome::Advised { .. } => match audit_failure {
+            // The default. A review nobody can prove happened is not a review
+            // that passed, and on a runner that is about to be deleted there
+            // is no later attempt that fixes it.
+            Some(reason) if !run.allow_unshipped_audit => {
+                Err(GarrisonError::audit_unshipped(reason))
+            }
+            Some(reason) => {
+                println!("continuing anyway, because --allow-unshipped-audit was given: {reason}");
+                Ok(())
+            }
+            None => Ok(()),
+        },
+    }
+}
+
+/// Runs the one turn that does the reviewing.
+///
+/// Uses the default [`Interactions`] implementation, which refuses every
+/// permission request. That is review mode's whole posture and it is inherited
+/// rather than configured: there is no flag here that could turn it off.
+async fn ask(
+    run: &ReviewRun,
+    files: &[garrison_bitbucket::ChangedFile],
+) -> Result<String, GarrisonError> {
+    use garrison_agent::review::ReviewFile;
+
+    let reviewable: Vec<ReviewFile> = files
+        .iter()
+        .map(|file| ReviewFile {
+            path: file.path.clone(),
+            text: file.destination_text(),
+            truncated: file.truncated,
+        })
+        .collect();
+
+    let prompt = garrison_agent::review::build_prompt(&reviewable);
+
+    let (server, path) = client_target(run.socket.clone(), None)?;
+    let stream = daemon::connect_or_start(&server, &path).await?;
+    let mut client = AgentClient::from_stream(stream);
+    client.initialize("garrison-agent review").await?;
+
+    let cwd = std::env::current_dir()
+        .map_err(|error| GarrisonError::runtime(format!("no working directory: {error}")))?;
+    let session = client.new_session(cwd).await?;
+
+    let mut collected = Answer::default();
+    client
+        .prompt(session.session_id, &prompt, &mut collected)
+        .await?;
+    Ok(collected.text)
+}
+
+/// Accumulates the model's answer, and refuses everything else.
+///
+/// The refusal is not implemented here: it is [`Interactions`]'s default, and
+/// inheriting it rather than writing one is deliberate. A hand-written
+/// `permission` in review mode would be a place where someone could later add
+/// an exception.
+#[derive(Default)]
+struct Answer {
+    text: String,
+}
+
+impl Interactions for Answer {
+    fn update(&mut self, notification: &acp::SessionNotification) {
+        if let Some(chunk) = update_text(notification) {
+            self.text.push_str(chunk);
+        }
+    }
+}
+
+/// Prints what was found, whether or not it is being posted.
+///
+/// A pipeline log is the only place some of this is ever read, so it carries
+/// the same information the comments would.
+fn report(
+    review: &garrison_agent::review::Review,
+    files: &[garrison_bitbucket::ChangedFile],
+    blocking: garrison_agent::review::Blocking,
+    posting: bool,
+) {
+    let placed = garrison_agent::review::place(review.findings(), files, blocking);
+
+    for (finding, placement) in review.findings().iter().zip(&placed) {
+        let where_ = if placement.anchored {
+            format!("{}:{}", finding.file, finding.line)
+        } else {
+            format!("{} (could not be anchored)", finding.file)
+        };
+        println!(
+            "  [{}] {where_} — {}",
+            finding.severity.as_str(),
+            finding.message
+        );
+    }
+
+    let unanchored = placed.iter().filter(|entry| !entry.anchored).count();
+    if unanchored > 0 {
+        // Worth saying out loud: a review where several findings would not
+        // anchor is one whose line numbers should be distrusted.
+        println!(
+            "\n{unanchored} finding(s) named a line not present in the diff and \
+             will appear on the pull request rather than inline"
+        );
+    }
+
+    if !posting && !review.findings().is_empty() {
+        println!("\n(dry run: nothing was posted; pass --post to send these)");
+    }
+}
+
+/// Sends the comments, one at a time, surviving individual refusals.
+async fn publish(
+    bitbucket: &garrison_bitbucket::Client,
+    target: &garrison_bitbucket::PullRequest,
+    findings: &[garrison_agent::review::Finding],
+    files: &[garrison_bitbucket::ChangedFile],
+    blocking: garrison_agent::review::Blocking,
+) {
+    let placed = garrison_agent::review::place(findings, files, blocking);
+    let mut posted = 0_usize;
+    let mut refused = 0_usize;
+
+    for entry in &placed {
+        match bitbucket.post_comment(target, &entry.comment).await {
+            Ok(()) => posted += 1,
+            Err(error) if error.is_fatal() => {
+                // The credential died mid-run. Every later call uses it too,
+                // so continuing would post nothing and take a minute doing so.
+                eprintln!("posting stopped: {error}");
+                break;
+            }
+            Err(error) => {
+                refused += 1;
+                eprintln!("one comment was refused and the rest continue: {error}");
+            }
+        }
+    }
+
+    println!("\nposted {posted} comment(s)");
+    if refused > 0 {
+        println!("{refused} were refused by Bitbucket and are above in this log");
+    }
+}
+
+/// What the drain came to, once the polling stopped.
+enum Evidence {
+    /// The plane accepted the trail through this sequence.
+    Shipped(u64),
+    /// It did not, and this is why.
+    Missing(String),
+    /// This install does not ship at all.
+    NotShipping,
+}
+
+/// Waits for the audit trail to reach the control plane before the machine
+/// that wrote it stops existing.
+///
+/// This is the whole reason a CI review differs from a workstation one. The
+/// shipping policy elsewhere in this binary is built on the trail file being a
+/// durable buffer, which is true of a laptop and false of a container that is
+/// deleted when the pipeline step ends. Waiting here is what turns "the entry
+/// is queued" into "the entry is evidence".
+async fn drain_audit(run: &ReviewRun) -> Evidence {
+    use garrison_agent::shipping::drain::{self, Progress, Step};
+
+    let deadline = std::time::Duration::from_secs(run.audit_timeout);
+    let started = std::time::Instant::now();
+
+    let (_server, path) = match client_target(run.socket.clone(), None) {
+        Ok(target) => target,
+        Err(error) => {
+            return Evidence::Missing(format!("the daemon could not be located: {error}"))
+        }
+    };
+
+    let stream = match daemon::connect(&path).await {
+        Ok(stream) => stream,
+        // Not fatal to reach for: the daemon may have exited with the runner.
+        // But it does mean nobody can say whether the trail left, which is
+        // exactly the thing this function exists to establish.
+        Err(error) => {
+            return Evidence::Missing(format!(
+                "the daemon could not be reached to confirm shipping: {error}"
+            ))
+        }
+    };
+
+    let mut client = AgentClient::from_stream(stream);
+    if let Err(error) = client.initialize("garrison-agent review drain").await {
+        return Evidence::Missing(format!("the daemon would not answer: {error}"));
+    }
+
+    let mut progress = Progress::default();
+
+    loop {
+        let status: acp::GarrisonStatus = match client
+            .request(acp::ext::STATUS, &serde_json::json!({}), &mut Quiet)
+            .await
+        {
+            Ok(status) => status,
+            Err(error) => {
+                return Evidence::Missing(format!("the status could not be read: {error}"))
+            }
+        };
+
+        let Some(shipping) = status.shipping else {
+            // No shipping section at all. Reported as "not shipping" rather
+            // than as a failure, because the caller is the one that knows
+            // whether that is a configuration choice or a governance hole.
+            return Evidence::NotShipping;
+        };
+
+        match drain::step(&shipping, progress, started.elapsed(), deadline) {
+            Step::Complete { shipped_through } => return Evidence::Shipped(shipped_through),
+            Step::NotShipping => return Evidence::NotShipping,
+            Step::Halted { reason } => {
+                return Evidence::Missing(format!("shipping has halted: {reason}"))
+            }
+            Step::Expired { backlog } => {
+                return Evidence::Missing(format!(
+                    "{backlog} entr(ies) were still unshipped after {}s",
+                    run.audit_timeout
+                ))
+            }
+            Step::Waiting { next_poll, .. } => {
+                progress = Progress::observing(shipping.local_head);
+                tokio::time::sleep(next_poll).await;
+            }
+        }
+    }
+}
+
+/// Refuses unless review mode has been switched on deliberately.
+///
+/// Checked before the pull request reference, the credential, or anything
+/// else, so that "this is experimental" is the first thing an operator learns
+/// rather than the fourth. The config file is read directly rather than asked
+/// of the daemon: the gate has to answer even when no daemon is running, and a
+/// feature that could be enabled by whichever daemon happened to be up would
+/// not be a decision anyone made.
+fn gate_experimental() -> Result<(), GarrisonError> {
+    use garrison_agent::experimental::{self, Feature};
+
+    let config = GarrisonConfig::load()
+        .map(|config| config.experimental)
+        .unwrap_or_default();
+
+    let env = std::env::var(experimental::ENV_VAR).ok();
+
+    if experimental::enabled(config, env.as_deref(), Feature::Review) {
+        eprintln!("{}", experimental::notice(Feature::Review));
+        return Ok(());
+    }
+
+    // A refusal to start rather than a malfunction: nothing is broken, and a
+    // supervisor must not retry it.
+    Err(GarrisonError::configuration(
+        "experimental.review",
+        experimental::refusal(Feature::Review),
+    ))
 }

@@ -156,9 +156,54 @@ Dedicated prompts (`review_request.rs`, `review_exit.rs`) and prompt rules:
 findings first, ordered by severity, file:line references, explicit "no
 findings" statement. Review is a *mode*, not a vibe.
 
-→ **Planned:** `garrison review` — and this is the Bitbucket DC integration
-point (RFQ §3.A.2 "pull-request-level AI review is strongly desired"): fetch
-PR diff via Bitbucket DC REST, run review mode, post findings as PR comments.
+→ **Implemented, experimental:** `garrison-agent review` fetches a pull
+request diff via Bitbucket DC REST, runs the review prompt, and posts findings
+as inline PR comments with a build status on the commit (RFQ §3.A.2,
+"pull-request-level AI review is strongly desired"). See
+`docs/review-mode.md`.
+
+It ships in the binary and refuses to run until a deployment enables it
+(`GARRISON_EXPERIMENTAL=review`, or `[experimental] review = true` in
+`garrison.toml`). A feature nobody can reach never stops being experimental,
+and a printed warning is filtered out of CI logs within a week, so neither
+alone would keep a pipeline from depending on exit codes that are still
+moving. A refusal is read every time until somebody decides, and the decision
+leaves a trace an auditor can find. The gate is `experimental.rs`, pure, and
+the promise it takes back is bounded: this subcommand may change its behaviour
+and its exit codes without a major version bump, and nothing else does.
+
+Three things make it a mode rather than a prompt, and all three are enforced
+rather than requested of the model. It writes nothing: every tool call is
+refused, because a pipeline has nobody to answer a permission prompt and
+auto-approval would be the opposite of what Garrison claims. Its output has a
+shape, JSON with a file and a line, because prose cannot be anchored to a
+line. And it distinguishes "nothing wrong" from "nobody looked": an answer
+that does not parse exits 1 rather than reporting a clean review, since the
+alternative is a green check on code nobody read.
+
+Blocking is opt-in (`--enforce`) and off by default. Advisory also downgrades
+the comments themselves, because a Bitbucket BLOCKER comment gates a merge
+whatever the build status says.
+
+A review spends a seat, and does so by construction rather than by a rule
+written for review mode. `review` is a client: it connects to the daemon,
+opens a session, and prompts, so its turn passes the same gates as any other
+turn and the seat monitor is one of them. Building a per-review exemption
+would have meant a path on which work reaches a model with no live seat behind
+it, and review mode does not get to be that path.
+
+Which seat is worth stating, because it is easy to assume the wrong one. A
+seat belongs to an operator, not to a machine: `adjudicate` entitles an
+install from the seats its operator holds, and nothing counts concurrent
+turns. A fleet of runners bound to one CI operator therefore runs on one
+seat. Governed, and not a per-runner licensing cost.
+
+A review also waits for its audit trail to be accepted by the plane before it
+exits, and exits 5 when it was not. The general shipping policy assumes the
+trail file is a durable buffer, which is true of a laptop and false of a
+container deleted minutes after the step ends: there, an entry still in the
+buffer is destroyed evidence rather than delayed evidence. The drain is in
+`shipping/drain.rs`, pure and separate from the policy it qualifies.
 
 ### 1.11 Model-specific coding prompts
 Codex ships per-model system prompts (~80 focused lines) plus
@@ -262,8 +307,9 @@ client identity.
 7. **Integrate acton-ai capabilities:** persistent ACP sessions/checkpoints
    (~~compaction configuration and ACP plan events~~: implemented, see
    section 6)
-8. **Review mode + PTY unified exec**
-9. **Bitbucket DC PR review** (review mode over REST API)
+8. **Review mode + PTY unified exec** — review mode implemented; PTY unified
+   exec remains
+9. ~~**Bitbucket DC PR review** (review mode over REST API)~~ — implemented
 
 Items 3–6 are the current agent-critical path. Control-plane, extension, and
 compliance work is tracked separately from this agent implementation plan.
