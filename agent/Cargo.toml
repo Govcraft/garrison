@@ -15,6 +15,7 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock", "s
 clap = { version = "4.6.6", features = ["derive"] }
 crossterm = { version = "0.29", features = ["bracketed-paste", "event-stream"] }
 ed25519-dalek = { version = "3.0.0", features = ["pkcs8", "pem"] }
+garrison-policy = { version = "0.1.0", path = "../policy" }
 garrison-wire = { version = "0.1.0", path = "../wire" }
 getrandom = "0.4.3"
 hostname = "0.4.2"
@@ -37,6 +38,7 @@ unicode-width = "0.2.2"
 url = "2.5.8"
 
 [dev-dependencies]
+garrison-wire = { path = "../wire", features = ["testing"] }
 tempfile = "3.27.0"
 testcontainers = "0.28.0"
 vt100 = "0.16.2"

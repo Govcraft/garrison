@@ -177,6 +177,14 @@ pub struct AgentInstallRow {
     pub organization: String,
     #[serde(default)]
     pub status: String,
+    /// The `Operator` row this machine belongs to.
+    ///
+    /// Read by the audit ingest, which attributes every shipped entry from
+    /// here rather than from anything the daemon sent. Optional in the struct
+    /// and required in the schema: a row this bearer can see but not fully
+    /// read should narrow what the hook may conclude, not crash it.
+    #[serde(default)]
+    pub operator: Option<String>,
 }
 
 fn yes() -> bool {
@@ -469,6 +477,167 @@ fn kind_of(value: &Value) -> &'static str {
         Value::String(_) => "a string",
         Value::Array(_) => "an array",
         Value::Object(_) => "an object",
+    }
+}
+
+// =============================================================================
+// Policy bundles — read by the publish gate, and nothing here writes them
+// =============================================================================
+//
+// A second `impl` block rather than four more methods in the first, so this
+// file grows by appending. The row types are `garrison_policy`'s own: the
+// crate that computes the checksum defines what it is computing over, and the
+// daemon that verifies the answer deserializes the identical structs.
+
+impl Plane {
+    /// Every `CommandRule` belonging to one bundle, disabled ones included.
+    ///
+    /// Disabled rules are fetched rather than filtered out here because what
+    /// makes them not count is the canonical form, and that decision belongs
+    /// in one place: `garrison_policy::checksum`.
+    pub async fn command_rules_of(
+        &self,
+        bundle: &str,
+    ) -> Result<Vec<garrison_policy::CommandRule>, PlaneError> {
+        self.list_all("CommandRule", Some(("bundle", bundle))).await
+    }
+
+    /// Every `ToolRule` belonging to one bundle.
+    pub async fn tool_rules_of(
+        &self,
+        bundle: &str,
+    ) -> Result<Vec<garrison_policy::ToolRule>, PlaneError> {
+        self.list_all("ToolRule", Some(("bundle", bundle))).await
+    }
+
+    /// The endpoints a bundle cites, by row id.
+    ///
+    /// One GET each rather than one `in` query. A bundle cites a handful of
+    /// endpoints and this runs only on publish, so the round trips are free;
+    /// what they buy is not depending on a query operator whose behaviour on
+    /// a relation column would have to be probed first. An id the bearer
+    /// cannot see is skipped rather than failing the publish, and its absence
+    /// changes the checksum, which is the visible outcome.
+    pub async fn model_endpoints(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<garrison_policy::ModelEndpoint>, PlaneError> {
+        let mut endpoints = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(endpoint) = self.get("ModelEndpoint", id).await? {
+                endpoints.push(endpoint);
+            }
+        }
+        Ok(endpoints)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Audit shipping. Additive: the row types and lookups the verifying ingest and
+// the liveness sweep read, in their own `impl` block so this file stays easy
+// to merge.
+// ---------------------------------------------------------------------------
+
+/// The daemon's own claim about one trail.
+///
+/// Written by the install's operator bearer, so nothing on it is evidence.
+/// The ingest reads `install` from here rather than from the row the client
+/// sent, which is what makes shipping into somebody else's trail detectable.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AuditTrailRow {
+    pub id: String,
+    pub trail_id: String,
+    pub install: String,
+    pub organization: String,
+    #[serde(default)]
+    pub local_head_seq: i64,
+    #[serde(default)]
+    pub local_head_hash: Option<String>,
+    #[serde(default)]
+    pub shipped_through: i64,
+    #[serde(default)]
+    pub reported_at: Option<String>,
+    #[serde(default)]
+    pub halted_reason: Option<String>,
+}
+
+/// What the plane has verified about one trail.
+///
+/// The install cannot write this row at all. Its disagreement with the
+/// matching [`AuditTrailRow`] over time is the whole liveness signal.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AuditChainRow {
+    pub id: String,
+    pub trail_id: String,
+    pub trail: String,
+    pub organization: String,
+    pub install: String,
+    #[serde(default)]
+    pub head_hash: String,
+    #[serde(default)]
+    pub head_seq: i64,
+    #[serde(default)]
+    pub verified_through: i64,
+    #[serde(default)]
+    pub integrity: String,
+    #[serde(default)]
+    pub finding: Option<String>,
+    #[serde(default)]
+    pub last_entry_at: Option<String>,
+}
+
+/// One already-ingested entry, in the fields that resolve a re-send.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AuditEventRow {
+    pub id: String,
+    pub trail: String,
+    pub chain_seq: i64,
+    pub entry_hash: String,
+    #[serde(default)]
+    pub prev_hash: String,
+}
+
+impl Plane {
+    /// Fetch one trail by row id.
+    ///
+    /// The hook is handed `trail` as a row id, already resolved by the forge
+    /// from the relation the client set, so this is a `get` rather than a
+    /// lookup by `trail_id`.
+    pub async fn audit_trail(&self, id: &str) -> Result<Option<AuditTrailRow>, PlaneError> {
+        self.get("AuditTrail", id).await
+    }
+
+    /// Find the chain for a trail by the trail's own identity.
+    ///
+    /// Keyed on `trail_id` rather than the relation because `trail_id` is the
+    /// unique column: one chain per trail is a constraint the database holds,
+    /// not a convention the hook maintains.
+    pub async fn audit_chain(&self, trail_id: &str) -> Result<Option<AuditChainRow>, PlaneError> {
+        self.first("AuditChain", &equals("trail_id", trail_id))
+            .await
+    }
+
+    /// Find an already-ingested entry by its hash.
+    ///
+    /// `entry_hash` is unique, so this answers the one question a re-sent
+    /// entry raises: is this the same entry arriving twice, or a different
+    /// entry claiming a position the chain has already passed?
+    pub async fn audit_event_by_hash(
+        &self,
+        entry_hash: &str,
+    ) -> Result<Option<AuditEventRow>, PlaneError> {
+        self.first("AuditEvent", &equals("entry_hash", entry_hash))
+            .await
+    }
+
+    /// Every trail this bearer can see.
+    pub async fn audit_trails(&self) -> Result<Vec<AuditTrailRow>, PlaneError> {
+        self.list_all("AuditTrail", None).await
+    }
+
+    /// Every chain this bearer can see.
+    pub async fn audit_chains(&self) -> Result<Vec<AuditChainRow>, PlaneError> {
+        self.list_all("AuditChain", None).await
     }
 }
 

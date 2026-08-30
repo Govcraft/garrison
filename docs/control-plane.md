@@ -700,9 +700,14 @@ cannot launder a decision, and `match_examples` / `not_match_examples` are unit
 tests the agent runs when it loads a bundle — a rule that does not match its own
 examples refuses to load.
 
-`PolicyBundle.checksum` is a `@require`d BLAKE3 digest once a bundle is
-published. An install reports the checksum it loaded; a mismatch is drift, and
-drift is visible rather than deniable.
+`PolicyBundle.checksum` is the BLAKE3 digest of the bundle as distributed. An
+install reports the checksum it loaded; a mismatch is drift, and drift is
+visible rather than deniable. The field carries no `@require`: the plane
+evaluates `@require` ahead of `before_validate`, so a rule demanding 64
+characters would be a rule the hook that produces them runs too late to
+satisfy, and the only way through it would be a caller typing a hash the hook
+then discards. What guarantees the field is the binding below, which is
+`required = true`.
 
 Publishing is gated by a `before_validate` hook on `PolicyBundle`, bound in
 `config.toml` with `required = true`. When a bundle moves to `published`, the
@@ -713,11 +718,96 @@ onto the row before it persists. The hook reads those rows with the hook
 service's own bearer, which is why `enrollment_service` appears in the read
 lists of `PolicyBundle`, `CommandRule`, `ToolRule`, and `ModelEndpoint`. It
 holds no write grant on any of them: the checksum lands through the hook
-response, not a PATCH. Until the gate is implemented, the hook refuses every
-publish and passes drafting and retiring through untouched.
+response, not a PATCH. Publishing a bundle by *creating* it already published
+is refused: the rules point at the bundle by id, and a row being created does
+not have one yet, so a bundle is published by updating a draft.
+
+Both ends of that comparison run the same code. `garrison-policy` is a
+workspace crate with no IO, compiled by the hook service and by the daemon,
+and it defines the canonical form the checksum is taken over. The canonical
+form covers the bundle's name and version, its default approval mode, the two
+recorded-but-unenforced fields, and every **enabled** rule's matching terms and
+verdict, with rules sorted so the order two queries happened to return them in
+is not part of the answer. It deliberately excludes row ids, timestamps, the
+organization, the checksum itself, and justifications: rewording "because it
+deletes files" must not invalidate every install's cache mid-shift. A pinned
+fixture test in `policy/src/checksum.rs` makes a change to that form a
+deliberate break rather than an accidental fleet-wide cache invalidation.
 
 `ModelEndpoint` records authorization state (`pilot`, `interim_ato`, `ato`,
 `denied`) alongside hosting, and an ATO endpoint must name who authorized it.
+
+#### The rule, from the daemon's side
+
+`agent/src/policy/` holds the daemon half: `pull.rs` walks
+`AgentInstall` → `Operator` → `PolicyAssignment` → `PolicyBundle` → rules and
+endpoints with the install's own bearer, `cache.rs` keeps the last verified
+bundle at mode 0600, and `agent.rs` is the actor that holds the result. It is
+registered as a turn gate through `agent/src/admission.rs` and as a
+`_garrison/status` describer, so nothing on the turn path waits for the
+network: a turn asks the actor, which answers from what it already holds.
+
+The whole rule, and it is also in `garrison.toml`'s `[policy]` comments so an
+operator finds it where they are configuring it:
+
+1. A daemon without `[plane]` governs itself from `garrison.toml`. That is the
+   only case in which `[approval].auto_approve` is read.
+2. A daemon with `[plane]` runs turns only under a bundle the plane assigned to
+   it. It checks that the bundle is published, that its content hashes to the
+   checksum the plane recorded, and that every command rule matches its own
+   examples. It then writes the bundle id and checksum to its `AgentInstall`
+   row, which is what promotes the install from `enrolled` to `active`.
+3. If the plane cannot be reached, the daemon keeps running on the last bundle
+   it verified, for at most `offline_grace_secs` after that bundle was fetched
+   (default 24 h; set 0 to forbid it). `_garrison/status` reports
+   `source = "cache"` for the whole time. The window is measured from when the
+   plane last spoke, so restarting the daemon does not buy another one.
+4. If the plane answers and the answer is anything other than a verified bundle
+   (no assignment, unpublished, checksum mismatch, a rule that fails its own
+   examples, an install quarantined or retired, a credential refused), or the
+   grace runs out, the daemon starts, answers status with the reason, and
+   refuses every turn. It never falls back to `garrison.toml`.
+5. Local edits to `garrison.toml` cannot widen a governed daemon: while
+   governed, the local auto-approve list is not consulted, and `bash` is
+   decided only by the bundle's command rules. `_garrison/status` and
+   `garrison-agent ping` say so when a local list is being ignored.
+
+`[policy] offline_grace_secs` is a **cap, not a grant**. When the control plane
+supplies a bound of its own for the organization's impact level, the shorter of
+the two applies: a local file may shorten how long a machine runs offline and
+may never lengthen it.
+
+The scope resolution in rule 2 is narrowest-first: an `operator`-scoped
+assignment beats a `team`-scoped one, which beats `organization`. Among equally
+narrow assignments the most recently effective wins. A team-scoped assignment
+does not apply when the daemon could not read its operator's `Operator` row: a
+permission failure must not widen or narrow policy by accident.
+
+#### What a bundle says and what this release acts on
+
+`network_egress` and `allow_unsandboxed_escalation` are pulled, covered by the
+checksum, and reported in `_garrison/status` — and **nothing enforces them**.
+They are part of the checksum deliberately: an author who changes them has
+changed the published policy, and a fleet should see that. But a bundle author
+could reasonably believe the daemon acts on them, so `garrison-agent ping`
+prints them under "recorded in the bundle and NOT enforced by this release",
+and `_garrison/status` carries the same list in `policy.governance.notEnforced`.
+
+`ToolRule.sandbox_required` *is* enforced, against what the kernel actually
+granted rather than what was configured: a rule that requires a sandbox denies
+the call on a host where the sandbox degraded.
+
+#### What the cache does and does not buy
+
+The cache at `~/.config/garrison/bundle.json` is 0600 and re-verified against
+its own checksum on every read, so a bundle edited under the daemon is refused
+rather than enforced. Someone holding the daemon's uid can rewrite the content
+*and* the checksum consistently, and this check would accept it — but that same
+uid could edit `garrison.toml` or run a different binary, so it is not a hole
+the file format can close. What closes it is the write-back: the install
+records the checksum it is running on its `AgentInstall` row, and a row whose
+checksum is not the bundle the plane assigned is drift somebody can see. The
+cache buys availability, not integrity.
 
 ### Audit — `schemas/audit.schema`
 
@@ -824,10 +914,11 @@ The three schemas above are the plane's view of a trail. This section is the
 agent's, and it is deliberately independent of the plane: **the plane is not
 on the durability path.** Durability is enforced on the machine that writes
 the trail, the local anchor is written unconditionally, and no turn is ever
-refused because a control plane was unreachable. Pushing the anchored head to
-`AuditChain` is issue #8's job and is best effort; its staleness is reported
-in `_garrison/status` and never blocks a turn. A deployment that wants "no
-plane, no turns" is asking for a seat gate, not for this.
+refused because a control plane was unreachable. Getting the trail off the
+machine is a separate mechanism with a separate rule, described under "Audit
+shipping" below: an unreachable plane never stops a turn there either, but a
+backlog that has grown past its bound does. A deployment that wants "no plane,
+no turns" is asking for a seat gate, not for this.
 
 ### What an append promises
 
@@ -1129,6 +1220,166 @@ counts the sessions that will refuse a prompt until somebody decides about
 them. The whole field is absent on an install that persists nothing, which is
 the standalone case saying so plainly rather than reporting a healthy store
 that does not exist.
+## Audit shipping
+
+A hash chain proves that nobody edited the middle of a record. It proves
+nothing at all about the end of one, because a prefix of a valid chain is
+itself a valid chain: an operator who deletes the last hour and restarts
+leaves a file that verifies perfectly. The only defence against that is a copy
+somewhere the machine cannot reach. Shipping is how the copy gets there, and
+it is what turns "tamper-evident audit" into a claim an auditor can check
+without logging into the workstation.
+
+### The daemon side
+
+`agent/src/shipping/` is four files, one of which does I/O:
+
+- `cursor.rs` remembers how far the trail has been shipped, durably, in
+  `<trail>.shipped` beside the trail itself. Resuming compares the stored
+  cursor against the file: a trail shorter than the cursor was truncated, and
+  an entry at the cursor whose predecessor is not the hash the cursor recorded
+  was rewritten. Either is a halt, not a retry.
+- `reader.rs` reads whole entries out of a file the audit writer is still
+  appending to. A line without a trailing newline is left for next time (the
+  writer may be mid-line); a complete line that will not parse is an error
+  rather than a skip.
+- `policy.rs` holds the written rule for when a backlog stops the work, as
+  pure functions over a status and a clock.
+- `actor.rs` is `TrailShipper`: it polls, posts through the shared plane
+  component in `agent/src/plane/`, and answers both `AdmitTurn` and
+  `Describe`.
+
+Entries go up **one at a time, in chain order, with one batch in flight**.
+That is not a performance choice: two concurrent posts of sequences 8 and 9
+would race the ingest's read-then-patch of `AuditChain` and manufacture a gap
+finding out of a healthy trail. The mailbox provides the serialization.
+
+The shipper learns that a turn ended from acton-ai's `TurnLifecycle`
+broadcast, the same way the anchor keeper does. Nothing on the turn path sends
+it a message.
+
+### The rule: when shipping stops the work
+
+`TrailShipper` is on the ordered `gates` vector in `launch.rs`, so it answers
+`AdmitTurn` like every other gate. The rule is written down because the
+default is easy to get wrong in both directions:
+
+- **An unreachable control plane never stops a turn.** The trail file is the
+  buffer. A laptop on a train is not a governance failure, and a daemon that
+  stopped working every time a VPN dropped would be switched off within a
+  week.
+- **A backlog past its bound does stop turns**, when `[plane.shipping]
+  fail_closed` is set, which it is by default. The bound is a day or ten
+  thousand entries. No ordinary outage reaches it; an install that has kept a
+  day of evidence to itself has very much reached it.
+- **A halt stops turns always**, whatever `fail_closed` says. The plane
+  refused an entry as forked or edited, the credential was rejected, or the
+  local trail was rewritten under the cursor. None of those heal by waiting,
+  and all of them are findings rather than outages.
+
+A refusal is `TurnRefusal::AuditShipping`, JSON-RPC `-32017`, carrying the
+sentence an operator reads. `_garrison/status` grows one field, `shipping`,
+with the state, the backlog, the age of the oldest unshipped entry, the last
+successful ship, and the last error. A disabled shipper still answers with
+`state: "disabled"` rather than omitting the field: an absent status is not an
+answer an auditor can use.
+
+### The plane side: a verifying ingest
+
+`hooks-service/src/hooks/audit_event.rs` serves `AuditEvent.before_validate`.
+For each arriving entry it re-links the sealed entry against the trail's
+`AuditChain` and decides, in this order:
+
+1. **Do the flat columns agree with the sealed entry?** `garrison-wire`'s
+   `audit::project` is the one definition of that mapping and both ends
+   compile it, so the daemon's columns and the hook's expectations cannot
+   drift apart. A disagreement on `chain_seq`, `entry_hash`, `prev_hash`, or
+   `install` is refused. Every other projected column (the decision, the
+   decider, the outcome, the tool, the command, the timestamp) is
+   **re-derived from the entry and overwritten**, so an install cannot ship a
+   truthful entry beside a flattering export.
+2. **Does the entry belong to this trail?** The `trail_id` sealed into the
+   entry must be the trail's own.
+3. **Is it the next link?** `verify_next` against the chain head.
+
+An entry **past** the head is accepted with the hole recorded
+(`integrity = "gap"`, `finding` naming the missing sequences), because the
+entry is still evidence and the hole is still the finding. Its own hash is
+re-checked first, since `verify_next` stopped at the sequence and never
+reached the seal. An entry **at or behind** the head is either the same entry
+arriving twice, which is an acknowledgement, or different content in an
+occupied position, which is a fork and is refused.
+
+`operator` and `organization` are filled here from the `AgentInstall` row the
+trail belongs to. The daemon never sends them, which is why
+`AuditEvent.operator` is not marked `required` in the schema: required-field
+validation runs *before* `before_validate`, so a field the client is meant not
+to send cannot also be one the client must send. The binding is
+`required = true`, so the hook always runs and always fills it. This is the
+same shape as `Redemption.organization`.
+
+A consequence worth stating: **the plane's `AuditChain` is intact-or-gapped by
+construction.** `integrity = "broken"` is a value the ingest never writes,
+because an entry that would break the chain never lands. The tamper-evidence
+is that the tampered entry is *not here*, that the daemon halted, and that
+`_garrison/status` says why.
+
+### One channel, two meanings
+
+A hook can refuse exactly one way: `abort_reason`, which the plane turns into
+one status. "I do not believe your entry" and "I could not reach the plane to
+check" demand opposite responses from the daemon: halt and fetch a human, or
+back off and try again. The discriminator is the sentence
+`garrison_wire::audit::INGEST_UNAVAILABLE`, which lives in the shared crate so
+the side that writes it and the side that reads it compile the same bytes.
+
+On the daemon side the mapping is `shipping::actor::rejection_verdict`: `409`
+is an acknowledgement (the unique index on `entry_hash` answering a replay),
+`401` re-exchanges the bearer once, `429` and `5xx` are waited out, and
+anything else is a halt.
+
+### Liveness: silence is the difference between two claims
+
+`hooks-service/src/silence.rs` is a supervised actor that sweeps every
+`[garrison] sweep` seconds. It compares three vantage points:
+
+- `AuditTrail` is what the daemon **claims**: its local head, how far it says
+  it has shipped, when it last reported. Written by the install's own bearer,
+  so nothing on it is evidence.
+- `AuditChain` is what the plane **verified** as entries arrived. The install
+  cannot write it at all.
+- `AgentInstall.status` says whether the machine is still supposed to be
+  running.
+
+Silence is their difference over time. The findings, most serious first, are
+`broken` (the daemon recorded a halt, or the chain is broken), `gap` (entries
+missing from the middle), `silent` (no report inside `[garrison] silence`
+seconds), and `backlog` (the plane has verified less than the daemon says it
+has written). A `retired` install is exempt from the last two, because silence
+from a decommissioned machine is the point of decommissioning it; it is exempt
+from nothing else.
+
+The sweep **reads and never writes**. `AuditChain.integrity` is the ingest's
+record of what it verified link by link, and a background job that could set
+it from inference would put a guess in the same column as a proof. Findings go
+to `tracing::warn!` on the `garrison.audit.liveness` target.
+
+### Operational notes
+
+- The hook makes three or four plane calls per entry (trail, install, chain,
+  then a create or patch). A fleet shipping steadily will notice the plane's
+  `[rate_limit]` budget before it notices anything else; size it for the
+  fleet, not for the console.
+- The hook's bearer needs `audit_service` beside `enrollment_service`. It is
+  the only writer of `AuditChain`.
+- Like the directory bearer, it is tenant-scoped, so one `garrison-hooks`
+  serves the organizations its chain covers. See "Known gaps".
+- `hooks-service/tests/audit_shipping.rs` runs the whole path against a real
+  plane in a container: five sealed entries ship, the chain head matches the
+  fifth entry's hash, the stored `entry` columns re-derive that same head, a
+  replay collides with `409`, and an entry edited after sealing is refused
+  without the "temporarily unavailable" sentence. It skips cleanly when
+  `schemaforge` is not on `PATH` or no container runtime answers.
 
 ## Write-time rules: `@default` is what binds a value for `@require`
 
@@ -1166,6 +1417,21 @@ what makes the predicate evaluable. Deleting either changes behavior.
 The rule when adding a `@require`: list every field the expression names, and
 confirm each is `required` or carries `@default`. Then test the create that
 omits the optional fields, not just the one that violates the rule.
+
+### And a hook cannot satisfy a `@require`
+
+The same phase order puts `before_validate` *after* the rule phases, on create,
+update, and patch alike. So a `@require` on a field a hook produces is a rule
+nothing can satisfy: the write is rejected before the hook that would fill the
+field is ever called. `PolicyBundle.checksum` was written that way first, and
+every publish failed with `a published bundle must carry its BLAKE3 checksum`
+while the gate that computes the checksum sat there having answered the create
+and never the publish.
+
+The fix is not a placeholder the caller types. A rule satisfied by 64 zeroes
+guarantees nothing, and the hook discards the value anyway. It is to state the
+requirement where it can be enforced: the hook binding, with `required = true`,
+which fails the write when the gate cannot answer.
 
 ## Directory
 
@@ -1391,12 +1657,9 @@ exactly one install identity: a fleet of editor windows is one
 
 ## Known gaps
 
-- **The daemon does not heartbeat, and does not pull policy.** It enrolls
-  (`agent/src/enrollment/`), it exchanges its install key for a bearer
-  (`agent/src/plane/`), and it checks its seat on a timer
-  (`agent/src/entitlement/`). `AgentInstall.last_heartbeat` is never written,
-  and no bundle is pulled, so a console cannot yet tell a daemon that is
-  quietly wedged from one that was shut down cleanly.
+- **A bundle's `network_egress` and `allow_unsandboxed_escalation` are
+  recorded and not enforced.** They are part of the checksum and reported in
+  `_garrison/status`; no code acts on them. `ping` says so out loud.
 - **Schemas are unsigned.** Every command prints `schema signature
   verification is disabled (signing.mode = off)`. SchemaForge can require
   ed25519, SSH allowed-signers, or cosign-keyless signatures over `schemas/`
@@ -1423,10 +1686,14 @@ exactly one install identity: a fleet of editor windows is one
   the organizations that bearer can see. A deployment with several
   organizations on one plane runs one hooks service per organization, or
   waits for a chain-less service bearer.
-- **Two hooks are declared and refuse.** The `AuditEvent` and `PolicyBundle`
-  `before_validate` hooks are bound and served, and both are stubs that fail
-  closed: every audit ingest is refused, and every bundle publish is refused,
-  until the verifying ingest and the publish gate are implemented.
+- **The `PolicyBundle` hook is declared and refuses.** Its `before_validate`
+  hook is bound and served, and it is a stub that fails closed: every bundle
+  publish is refused until the publish gate is implemented. The `AuditEvent`
+  hook is no longer a stub; see "Audit shipping".
+- **The audit bearer is tenant-scoped, like the directory one.** The ingest
+  writes `AuditChain` with the chain its bearer was minted under, so one
+  `garrison-hooks` serves one organization's trails. Several organizations on
+  one plane means one hooks service each, or a chain-less service bearer.
 - **No provisioned database.** The apply path has been exercised against a
   throwaway container, not against an environment anyone can point a client at.
   There is no migration history, no seeded organization, and no bootstrapped

@@ -33,8 +33,6 @@ schema PolicyBundle {
 
     status:                enum("draft", "published", "retired")
                            default("draft")
-                           // Binds the value for the @require on `checksum` below.
-                           // A literal default() alone lands after the rule phases.
                            @default("'draft'")
                            @enum_colors(draft: "gray", published: "green", retired: "neutral")
                            @list(column)
@@ -50,12 +48,19 @@ schema PolicyBundle {
 
     // BLAKE3 of the serialized bundle as distributed. An install reports the
     // checksum it loaded; a mismatch is drift.
+    //
+    // Deliberately not guarded by a @require. The runtime evaluates @require
+    // ahead of before_validate, so a rule demanding 64 characters here would
+    // be a rule the hook that produces those characters runs too late to
+    // satisfy: every publish would be refused, and the only way through would
+    // be for a caller to type a hash the hook then discards. What guarantees a
+    // published bundle carries a real checksum is the binding itself, which is
+    // `required = true`: a publish the gate cannot answer is a publish that
+    // fails. And a bundle that somehow reached `published` with a wrong
+    // checksum grounds itself, because every install verifies the content
+    // against it before putting the bundle in force.
     checksum:              text(max: 128) indexed
                            @default("''")
-                           @require(
-                               "status != 'published' || size(checksum) == 64",
-                               "a published bundle must carry its BLAKE3 checksum"
-                           )
 
     published_at:          datetime
     published_by:          text(max: 320)

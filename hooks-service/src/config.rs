@@ -59,6 +59,24 @@ pub struct GarrisonConfig {
     /// key exists to avoid.
     #[serde(default = "default_lifetime")]
     pub lifetime: u64,
+
+    /// How long an audit trail may go without reporting before the liveness
+    /// sweep calls it silent, in seconds.
+    ///
+    /// The daemon reports its trail on every batch and at least once a minute
+    /// while it is running, so fifteen minutes is a machine that is off, on a
+    /// plane, or not shipping. One word, like every other field here, so
+    /// `ACTON_GARRISON_SILENCE` reaches it.
+    #[serde(default = "default_silence")]
+    pub silence: u64,
+
+    /// How often the liveness sweep runs, in seconds.
+    ///
+    /// Shorter than the silence window on purpose: a sweep that ran less often
+    /// than the thing it detects would report a trail as silent up to a whole
+    /// interval after it went quiet.
+    #[serde(default = "default_sweep")]
+    pub sweep: u64,
 }
 
 impl Default for GarrisonConfig {
@@ -68,8 +86,18 @@ impl Default for GarrisonConfig {
             token: String::new(),
             issuer: default_issuer(),
             lifetime: default_lifetime(),
+            silence: default_silence(),
+            sweep: default_sweep(),
         }
     }
+}
+
+const fn default_silence() -> u64 {
+    900
+}
+
+const fn default_sweep() -> u64 {
+    300
 }
 
 fn default_issuer() -> String {
@@ -111,6 +139,7 @@ mod tests {
             token: "v4.local.abc".into(),
             issuer: "garrison-enrollment".into(),
             lifetime: default_lifetime(),
+            ..GarrisonConfig::default()
         }
     }
 
@@ -141,6 +170,7 @@ mod tests {
             token: String::new(),
             issuer: String::new(),
             lifetime: default_lifetime(),
+            ..GarrisonConfig::default()
         };
         assert_eq!(config.missing().len(), 3);
     }
@@ -160,6 +190,18 @@ mod tests {
             "an unstated bearer lifetime is fifteen minutes"
         );
         assert_eq!(parsed.directory.mode, DirectoryMode::Off);
+    }
+
+    #[test]
+    fn the_liveness_sweep_runs_more_often_than_the_silence_it_detects() {
+        let config = GarrisonConfig::default();
+
+        assert_eq!(config.silence, 900);
+        assert_eq!(config.sweep, 300);
+        assert!(
+            config.sweep < config.silence,
+            "a sweep slower than the window reports a dark install a whole interval late"
+        );
     }
 
     #[test]

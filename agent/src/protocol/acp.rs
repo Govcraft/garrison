@@ -187,6 +187,15 @@ pub struct GarrisonStatus {
     /// prompt is coming back with code -32014 or -32015.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entitlement: Option<EntitlementStatus>,
+    /// Whether the audit trail is reaching the control plane, and how far
+    /// behind it is if not.
+    ///
+    /// Absent on a standalone agent, which has no plane to ship to, and when
+    /// the shipper could not be asked. [`Self::audit`] answers "is this
+    /// machine recording"; this answers "does anybody else have a copy", and
+    /// an auditor needs both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shipping: Option<ShippingStatus>,
 }
 
 /// What the session store holds, and whether it can be reached.
@@ -415,7 +424,104 @@ pub struct PolicyStatus {
     /// How long a permission request waits before it is denied.
     pub approval_timeout_secs: u64,
     /// Tool-name patterns that never reach the client.
+    ///
+    /// The local list from `garrison.toml`. It is reported even while it is
+    /// being ignored, alongside
+    /// [`GovernanceStatus::local_auto_approve_ignored`], because an operator
+    /// whose list stopped working needs to see both facts in one place.
     pub auto_approve: Vec<String>,
+    /// What the control plane says governs this install.
+    ///
+    /// Absent when the policy agent could not be asked, exactly as
+    /// [`GarrisonStatus::threads`] is. Present with `state = "standalone"` on
+    /// a daemon that answers to nobody.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governance: Option<GovernanceStatus>,
+}
+
+/// What the centrally managed policy is, and whether it is in force.
+///
+/// The first field an operator reads when a governed machine is refusing
+/// turns, and the answer an auditor is shown when they ask whether policy is
+/// managed centrally: a bundle name, a version, a checksum, and where the
+/// daemon got it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct GovernanceStatus {
+    /// `standalone`, `governed`, or `ungoverned`.
+    ///
+    /// `standalone` means there is no control plane and `garrison.toml`
+    /// governs. `governed` means a verified bundle is in force. `ungoverned`
+    /// means nothing is, and every turn is refused.
+    pub state: String,
+    /// The bundle in force, when one is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<BundleStatus>,
+    /// Why there is no policy, or what the last refresh ran into.
+    ///
+    /// Present on an ungoverned install as the reason turns are refused, and
+    /// on a governed one riding out an outage as the outage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The configured providers this bundle's approved endpoints cover.
+    ///
+    /// Empty on a bundle that names no endpoints, which is not the same as a
+    /// bundle that approves nothing: an organization that has recorded no
+    /// endpoints has not made a decision about them.
+    #[serde(default)]
+    pub approved_providers: Vec<String>,
+    /// The provider a turn uses when nothing names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_provider: Option<String>,
+    /// Bundle fields this release records and does not enforce.
+    ///
+    /// Stated rather than omitted: they are part of the checksum, so an
+    /// author who sets them has changed the published policy and could
+    /// reasonably believe the daemon is acting on them. It is not.
+    #[serde(default)]
+    pub not_enforced: Vec<String>,
+    /// Whether `[approval] auto_approve` in `garrison.toml` is being ignored.
+    ///
+    /// True only when this install is governed *and* the local list is
+    /// non-empty, which is exactly the case where somebody is likely to be
+    /// confused about why their setting is not working.
+    pub local_auto_approve_ignored: bool,
+    /// How long a bundle may be enforced after the plane stops answering.
+    pub offline_grace_secs: u64,
+    /// How often the daemon re-asks the plane.
+    pub refresh_secs: u64,
+    /// When the last refresh finished, whatever it concluded, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_refresh_at: Option<String>,
+}
+
+/// The bundle a governed install is enforcing.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct BundleStatus {
+    /// Its row id in the control plane.
+    pub id: String,
+    /// Its name, as a security officer wrote it.
+    pub name: String,
+    /// Its version.
+    pub version: u64,
+    /// The BLAKE3 this daemon computed over what it pulled.
+    ///
+    /// The same number the plane recorded at publish, because a bundle whose
+    /// content did not hash to that number was never put in force.
+    pub checksum: String,
+    /// `plane` or `cache`.
+    pub source: String,
+    /// When the plane last handed this bundle over, RFC 3339.
+    pub fetched_at: String,
+    /// Whether it is past the window it may be enforced offline for.
+    ///
+    /// Always false on a bundle actually in force: a stale one ungoverns the
+    /// install. It is reported so a status captured mid-transition still says
+    /// something true.
+    pub stale: bool,
 }
 
 /// What isolation stands between a tool call and the host.
@@ -566,6 +672,114 @@ pub struct AnchorStatus {
     pub last_error: Option<String>,
 }
 
+/// Where the trail stands on its way to the control plane.
+///
+/// The local trail says what happened; this says whether anybody else knows.
+/// An auditor's question is not "is there a chain" but "is there a copy of it
+/// somewhere the machine that wrote it cannot reach", and these are the
+/// fields that answer it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ShippingStatus {
+    /// Whether this install ships at all. False on a standalone agent and on
+    /// a governed one with `[plane.shipping] enabled = false`.
+    pub enabled: bool,
+    /// Where shipping stands, in one word.
+    pub state: ShipState,
+    /// The trail being shipped, as acton-ai sealed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trail_id: Option<String>,
+    /// The plane's `AuditTrail` row for it, once one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trail: Option<String>,
+    /// The highest sequence the plane has accepted.
+    pub shipped_through: u64,
+    /// The highest sequence on disk, as the writer last reported it.
+    pub local_head: u64,
+    /// How many sealed entries have not been accepted yet.
+    pub backlog: u64,
+    /// When the oldest unshipped entry was written, RFC 3339.
+    ///
+    /// This is the field the backlog bound is measured against, and the one
+    /// an auditor reads to answer "how long has this machine been keeping
+    /// evidence to itself".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_unshipped_at: Option<String>,
+    /// When the plane last accepted an entry, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_shipped_at: Option<String>,
+    /// What the last failed attempt said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// Why shipping stopped for good, when it has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halted_reason: Option<String>,
+    /// When the next attempt is due while backing off, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_at: Option<String>,
+}
+
+impl ShippingStatus {
+    /// What a daemon that ships nothing reports.
+    ///
+    /// Said plainly rather than omitted: "this install does not send its
+    /// audit anywhere" is an answer an auditor needs, and an absent field is
+    /// not one.
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            state: ShipState::Disabled,
+            trail_id: None,
+            trail: None,
+            shipped_through: 0,
+            local_head: 0,
+            backlog: 0,
+            oldest_unshipped_at: None,
+            last_shipped_at: None,
+            last_error: None,
+            halted_reason: None,
+            retry_at: None,
+        }
+    }
+}
+
+/// Where shipping stands, in one word.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ShipState {
+    /// Nothing is being shipped, and nothing is expected to be.
+    #[default]
+    Disabled,
+    /// Everything sealed so far has been accepted by the plane.
+    Current,
+    /// There is a backlog and the shipper is working through it.
+    Behind,
+    /// The last attempt failed and the next one is waiting out a delay.
+    Backoff,
+    /// Shipping has stopped and will not resume without a human.
+    ///
+    /// Reached when the plane refused an entry as forked or edited, when the
+    /// local trail was rewritten under the cursor, or when the credential was
+    /// rejected. All three are findings, not outages.
+    Halted,
+}
+
+impl std::fmt::Display for ShipState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let word = match self {
+            Self::Disabled => "disabled",
+            Self::Current => "current",
+            Self::Behind => "behind",
+            Self::Backoff => "backoff",
+            Self::Halted => "halted",
+        };
+        f.write_str(word)
+    }
+}
+
 /// What Garrison attaches to a `session/prompt` response's `_meta`.
 ///
 /// Token counts are not part of stable ACP — the schema hides `PromptResponse`
@@ -650,6 +864,24 @@ pub struct PlanMeta {
     pub completed: usize,
     /// How many steps there are.
     pub total: usize,
+}
+
+/// Why the policy in force wants a human to look at this call, in `_meta`.
+///
+/// Carried on a `session/request_permission` so a client's dialog can show
+/// the reason a security officer wrote when they added the rule. It is the
+/// difference between a prompt an operator clicks through and one they read:
+/// the justification is required on every rule in the schema precisely so
+/// that this field is never empty when a rule decided the call.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ApprovalMeta {
+    /// The stated reason, verbatim from the bundle.
+    pub justification: String,
+    /// Which rule said so, by name, when one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
 }
 
 /// What one compaction did, in `_meta`.

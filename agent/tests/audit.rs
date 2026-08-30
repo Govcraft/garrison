@@ -22,6 +22,7 @@
 
 mod support;
 
+use garrison_agent::admission::{Admission, AdmitTurn};
 use garrison_agent::approval;
 use garrison_agent::audit::{AnchorNow, AnchorOutcome, AuditState, VerifyOutcome};
 use garrison_agent::client::{AgentClient, Interactions};
@@ -29,6 +30,7 @@ use garrison_agent::config::{AnchorMismatchAction, GarrisonConfig};
 use garrison_agent::launch;
 use garrison_agent::protocol::acp;
 use garrison_agent::protocol::server;
+use garrison_agent::types::{ThreadId, TurnId};
 use serde_json::json;
 use support::mock_llm::{MockServer, Round};
 
@@ -160,7 +162,7 @@ impl Agent {
 
 /// Brings the whole audited stack up over a socket pair.
 async fn connect(ai: &ActonAI, config: &GarrisonConfig) -> (Agent, AgentClient) {
-    let setup = launch::build_setup(ai, config)
+    let setup = launch::build_setup(ai, config, None)
         .await
         .expect("the audited setup must build");
     // The keeper is both a gate and a describer; the gate list is where a
@@ -603,9 +605,13 @@ async fn a_daemon_refuses_to_start_over_a_trail_that_lost_its_tail() {
     // Refuse by default...
     let server = MockServer::start(Vec::new()).await;
     let ai = audited_runtime(server.base_url(), &fixture, AuditDurability::Strict).await;
-    let error = launch::build_setup(&ai, &config_for(&fixture, Some(AuditDurability::Strict)))
-        .await
-        .expect_err("a truncated trail must refuse to start");
+    let error = launch::build_setup(
+        &ai,
+        &config_for(&fixture, Some(AuditDurability::Strict)),
+        None,
+    )
+    .await
+    .expect_err("a truncated trail must refuse to start");
 
     assert!(error.is_configuration(), "{error}");
     assert_eq!(
@@ -618,7 +624,7 @@ async fn a_daemon_refuses_to_start_over_a_trail_that_lost_its_tail() {
     // ...and start anyway when the deployment asked for a warning instead.
     let mut relaxed = config_for(&fixture, Some(AuditDurability::Strict));
     relaxed.audit.on_anchor_mismatch = AnchorMismatchAction::Warn;
-    launch::build_setup(&ai, &relaxed)
+    launch::build_setup(&ai, &relaxed, None)
         .await
         .expect("warn mode must start over a trail it has said is incomplete");
 
@@ -641,7 +647,7 @@ async fn a_plane_without_a_trail_refuses_to_start() {
     let mut config = config_for(&fixture, None);
     config.audit.required = Some(true);
 
-    let error = launch::build_setup(&ai, &config)
+    let error = launch::build_setup(&ai, &config, None)
         .await
         .expect_err("a required trail that is not armed must refuse to start");
 
@@ -652,15 +658,31 @@ async fn a_plane_without_a_trail_refuses_to_start() {
         "{error}"
     );
 
-    // Without the requirement the same runtime starts, with no keeper and no
-    // gate: the standalone developer install.
+    // Without the requirement the same runtime starts, with no keeper: the
+    // standalone developer install. The policy gate is still in the list,
+    // because a standalone install is still governed, by `garrison.toml`
+    // rather than by a bundle, and it admits the turn.
     config.audit.required = Some(false);
-    let setup = launch::build_setup(&ai, &config)
+    let setup = launch::build_setup(&ai, &config, None)
         .await
         .expect("a standalone install starts unrecorded");
-    assert!(
-        setup.defaults.gates.is_empty(),
-        "nothing gates a turn when nothing is being recorded",
+    let gates = &setup.defaults.gates;
+    assert_eq!(
+        gates.len(),
+        1,
+        "nothing gates a turn for the trail when nothing is being recorded",
+    );
+    let admission = gates[0]
+        .ask(AdmitTurn {
+            thread_id: ThreadId::new(),
+            turn_id: TurnId::new(),
+        })
+        .await
+        .expect("the remaining gate must answer");
+    assert_eq!(
+        admission,
+        Admission::Admit,
+        "an unenrolled install is not refused by the policy gate"
     );
 
     ai.shutdown().await.expect("clean shutdown");
