@@ -212,7 +212,38 @@ pub fn help() -> Vec<Line<'static>> {
     lines.push(notice_line(
         "permission prompt: Esc or Ctrl+C refuses; Ctrl+Z suspends without answering".to_string(),
     ));
+    lines.push(notice_line(
+        "  /keys    list every keyboard binding".to_string(),
+    ));
     lines
+}
+
+/// The complete keyboard reference shown by `/keys`.
+#[must_use]
+pub fn keys() -> Vec<Line<'static>> {
+    [
+        "global",
+        "  Ctrl+C      interrupt; leave when idle (refuse in permission prompt)",
+        "  Esc         interrupt (refuse in permission prompt)",
+        "  Ctrl+Z      suspend to the shell without answering a prompt",
+        "composer",
+        "  Enter       submit",
+        "  Ctrl+J      insert newline",
+        "  Ctrl+D      leave when the composer is empty",
+        "  Ctrl+A/Home move to start · Ctrl+E/End move to end",
+        "  Left/Right  move one character",
+        "  Backspace   delete previous character · Delete deletes next",
+        "  Ctrl+W      delete previous word",
+        "  Ctrl+U      delete to start · Ctrl+K deletes to end",
+        "  Paste       insert text literally, including newlines",
+        "permission prompt",
+        "  Up/Down     move selection · Enter chooses selected option",
+        "  y           allow once · a allows session · n refuses",
+        "  Esc/Ctrl+C  refuse · Ctrl+Z suspends without answering",
+    ]
+    .into_iter()
+    .map(|line| notice_line(line.to_string()))
+    .collect()
 }
 
 /// How the agent's governance settings read.
@@ -447,6 +478,7 @@ fn run_command(
     let mut lines = vec![user_line(typed)];
 
     match command {
+        Command::Help if arguments == "keys" => lines.extend(keys()),
         Command::Help => lines.extend(help()),
         Command::Quit => {
             actor.model.leave();
@@ -900,6 +932,41 @@ mod tests {
                     .any(|line| text(line).contains(command.name())),
                 "/{} is missing from the help",
                 command.name()
+            );
+        }
+    }
+
+    #[test]
+    fn the_key_listing_covers_global_composer_and_permission_bindings() {
+        let listing = keys().iter().map(text).collect::<Vec<_>>().join("\n");
+        for expected in [
+            "Ctrl+C",
+            "Esc",
+            "Ctrl+Z",
+            "Enter",
+            "Ctrl+J",
+            "Ctrl+D",
+            "Ctrl+A",
+            "Home",
+            "Ctrl+E",
+            "End",
+            "Left",
+            "Right",
+            "Backspace",
+            "Delete",
+            "Ctrl+W",
+            "Ctrl+U",
+            "Ctrl+K",
+            "Paste",
+            "Up",
+            "Down",
+            "y",
+            "a",
+            "n",
+        ] {
+            assert!(
+                listing.contains(expected),
+                "{expected} is missing from /keys"
             );
         }
     }

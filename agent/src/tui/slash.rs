@@ -77,6 +77,10 @@ pub fn parse(line: &str) -> Option<(Command, &str)> {
     let rest = line.trim_start().strip_prefix('/')?;
     let (name, arguments) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
 
+    if name == "keys" {
+        return Some((Command::Help, "keys"));
+    }
+
     ALL.iter()
         .find(|command| command.name() == name)
         .map(|command| (*command, arguments.trim()))
@@ -128,5 +132,10 @@ mod tests {
         for command in ALL {
             assert_eq!(parse(&format!("/{}", command.name())), Some((command, "")));
         }
+    }
+
+    #[test]
+    fn keys_is_a_help_alias_with_a_distinct_topic() {
+        assert_eq!(parse("/keys"), Some((Command::Help, "keys")));
     }
 }
