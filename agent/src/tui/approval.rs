@@ -139,16 +139,30 @@ impl Approval {
             return RegionRendered::empty(Region::Approval);
         };
 
-        RegionRendered::showing(
-            Region::Approval,
-            prompt(
+        RegionRendered {
+            region: Region::Approval,
+            lines: prompt(
                 pending.title.as_str(),
                 pending.detail.as_deref(),
                 self.selected,
                 self.pending.len(),
             ),
-        )
+            cursor: Some(prompt_cursor(pending.detail.is_some(), self.selected)),
+        }
     }
+}
+
+/// Places the hardware cursor on the marker for the highlighted choice.
+///
+/// The title occupies the first row and an optional detail occupies the next,
+/// so choices begin one or two rows below the top of the approval region.
+#[must_use]
+pub fn prompt_cursor(has_detail: bool, selected: usize) -> (u16, u16) {
+    let choice = selected.min(CHOICES.len().saturating_sub(1));
+    let row = 1usize
+        .saturating_add(usize::from(has_detail))
+        .saturating_add(choice);
+    (2, u16::try_from(row).unwrap_or(u16::MAX))
 }
 
 /// Builds the modal's rows.
@@ -461,6 +475,23 @@ mod tests {
         assert_eq!(lines.len(), 2 + CHOICES.len());
         assert!(text(&lines[3]).starts_with("  ›"));
         assert!(text(&lines[2]).starts_with("    "));
+    }
+
+    #[test]
+    fn the_cursor_tracks_the_highlighted_choice() {
+        assert_eq!(prompt_cursor(false, 0), (2, 1));
+        assert_eq!(prompt_cursor(false, 2), (2, 3));
+    }
+
+    #[test]
+    fn a_detail_row_pushes_the_approval_cursor_down() {
+        assert_eq!(prompt_cursor(true, 0), (2, 2));
+        assert_eq!(prompt_cursor(true, 2), (2, 4));
+    }
+
+    #[test]
+    fn an_out_of_range_selection_keeps_the_cursor_on_the_last_choice() {
+        assert_eq!(prompt_cursor(false, usize::MAX), (2, 3));
     }
 
     #[test]
