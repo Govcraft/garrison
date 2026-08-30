@@ -33,9 +33,9 @@ Garrison is a good fit when you need several of the following:
 
 Garrison is probably not the right fit if you want a hosted assistant that
 requires no infrastructure, a general-purpose chat product, or a turnkey
-administration suite. This repository does **not** yet include the planned web
-administration site, deployment infrastructure, SIEM integration, or compliance
-document sets.
+administration suite. Garrison's governance mechanisms are open source.
+Turnkey administration, deployment automation, SIEM integration, compliance
+packages, and enterprise support may be offered separately by Govcraft.
 
 It is also not yet a complete enforcement point for network behavior. Policy
 can record `network_egress` and `allow_unsandboxed_escalation`, but the current
