@@ -218,6 +218,33 @@ async fn connect_with(
         .await
         .expect("the test runtime must launch");
 
+    serve(ai, config).await
+}
+
+/// The same, on a runtime built the way `launch::build_ai` builds the real
+/// one: builtins registered but *not* auto-attached to every prompt.
+///
+/// The difference matters to anything asserting which tools a prompt carries.
+/// [`connect`]'s runtime leaves auto-attach on, so every prompt it makes
+/// carries the builtins whether or not the code under test asked for them —
+/// which is convenient for the approval tests and useless for proving that a
+/// code path attaches nothing.
+async fn connect_as_launched(base_url: &str, config: &GarrisonConfig) -> (Agent, AgentClient) {
+    let ai = ActonAI::builder()
+        .app_name("garrison-agent-test")
+        .with_builtin_tools(&["calculate"])
+        .manual_builtins()
+        .ollama_at(base_url, "test-model")
+        .tool_policy(ToolPolicy::new().on_approval(approval::approval_hook))
+        .launch()
+        .await
+        .expect("the test runtime must launch");
+
+    serve(ai, config).await
+}
+
+/// Wires a launched runtime to a socket pair and returns a connected client.
+async fn serve(ai: ActonAI, config: &GarrisonConfig) -> (Agent, AgentClient) {
     // One runtime, acton-ai's own: the router lives on its broker.
     let setup = launch::build_setup(&ai, config, None)
         .await
@@ -1265,6 +1292,102 @@ async fn without_a_policy_nothing_is_summarized_and_nothing_is_announced() {
     let context = status.context.expect("the context part is always reported");
     assert!(context.compaction.is_none(), "no policy is in force");
     assert_eq!(context.compactions, 0);
+    agent.shutdown().await;
+}
 
+// =============================================================================
+// Inline completion
+// =============================================================================
+
+#[tokio::test]
+async fn a_completion_comes_back_ready_to_insert_at_the_cursor() {
+    // What a chat-tuned model actually tends to answer: a fenced block that
+    // restates the line the cursor is sitting on.
+    let server = MockServer::start(vec![Round::text("```rust\nlet total = a + b;\n```")]).await;
+    let (agent, mut client) = connect(server.base_url(), &strict_config(300)).await;
+    let session_id = open_session(&mut client).await;
+
+    let response = client
+        .request::<_, serde_json::Value>(
+            acp::ext::COMPLETE,
+            &serde_json::json!({
+                "sessionId": session_id,
+                "uri": "file:///src/main.rs",
+                "languageId": "rust",
+                "prefix": "fn add(a: i32, b: i32) -> i32 {\n    let total = ",
+                "suffix": "\n    total\n}\n",
+            }),
+            &mut Quiet,
+        )
+        .await
+        .expect("a completion must be answered");
+
+    assert_eq!(
+        response.get("completion").and_then(serde_json::Value::as_str),
+        Some("a + b;"),
+        "the fence and the restated prefix must both be gone: {response}",
+    );
+
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_completion_never_asks_the_model_for_a_tool() {
+    let server = MockServer::start(vec![Round::text("a + b;")]).await;
+    let (agent, mut client) = connect_as_launched(server.base_url(), &strict_config(300)).await;
+    let session_id = open_session(&mut client).await;
+
+    client
+        .request::<_, serde_json::Value>(
+            acp::ext::COMPLETE,
+            &serde_json::json!({
+                "sessionId": session_id,
+                "prefix": "let total = ",
+                "suffix": "",
+            }),
+            &mut Quiet,
+        )
+        .await
+        .expect("a completion must be answered");
+
+    // A tool offered at a cursor is a keystroke that can raise an approval
+    // dialog, so the request must carry no tool definitions at all.
+    let requests = server.requests();
+    let sent = requests.first().expect("the model must have been called");
+    let tools = sent.get("tools").and_then(serde_json::Value::as_array);
+    assert!(
+        tools.is_none_or(Vec::is_empty),
+        "a completion must offer the model no tools: {sent}",
+    );
+
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_completion_for_a_session_this_client_does_not_hold_is_refused() {
+    let server = MockServer::start(Vec::new()).await;
+    let (agent, mut client) = connect(server.base_url(), &strict_config(300)).await;
+    client
+        .initialize("integration-test")
+        .await
+        .expect("the handshake must succeed");
+
+    let refusal = client
+        .request::<_, serde_json::Value>(
+            acp::ext::COMPLETE,
+            &serde_json::json!({
+                "sessionId": "thread_01h455vb4pex5vsknk084sn02q",
+                "prefix": "let total = ",
+                "suffix": "",
+            }),
+            &mut Quiet,
+        )
+        .await
+        .expect_err("a session this client never opened must not be completable");
+
+    assert!(
+        refusal.to_string().contains("-32002"),
+        "expected the resource-not-found code, got: {refusal}",
+    );
     agent.shutdown().await;
 }

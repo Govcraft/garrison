@@ -74,6 +74,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// How long a `_garrison/complete` waits on the model before giving up.
+///
+/// Chosen against the developer rather than against the model: ghost text that
+/// lands after the next keystroke is not a suggestion, it is a distraction, and
+/// an editor that has already moved on will discard it anyway. Two seconds is
+/// generous enough for a small model on a warm connection and short enough
+/// that a stalled provider cannot leave requests piling up per keystroke.
+const COMPLETION_DEADLINE: Duration = Duration::from_secs(2);
+
 /// The server-wide settings a new session inherits.
 #[derive(Clone, Debug)]
 pub struct ThreadDefaults {
@@ -805,6 +814,7 @@ async fn handle(
         acp::method::SESSION_LIST => session_list(context, raw).await.map(Answer::Result),
         acp::ext::STATUS => status(context).await.map(Answer::Result),
         acp::ext::SESSION_ABANDON => session_abandon(context, raw).await.map(Answer::Result),
+        acp::ext::COMPLETE => complete(context, raw).await.map(Answer::Result),
         acp::method::SESSION_PROMPT => session_prompt(context, raw).await,
         acp::ext::SESSION_RESUME => session_resume(context, raw).await,
         other => Err(ErrorObject::method_not_found().data(Value::String(other.to_string()))),
@@ -1373,6 +1383,66 @@ async fn session_abandon(context: &Dispatch, raw: Option<Value>) -> Result<Value
 
     encode(&acp::AbandonResponse {
         turn_id: turn_id.to_string(),
+    })
+}
+
+/// `_garrison/complete`: suggest the code that goes at a cursor.
+///
+/// Runs on the dispatch task against the connection's runtime rather than
+/// being asked of the session actor. An editor emits completions as fast as
+/// its debounce allows, and routing them through the session's message loop
+/// would put every keystroke in line behind whatever turn that session is
+/// running — the completion would arrive after the turn, which for a turn that
+/// takes a minute means it never usefully arrives at all. The session is still
+/// resolved, because that is what proves the client owns it and what holds the
+/// request inside the workspace boundary; it is simply not asked to do the
+/// work.
+///
+/// The builder is deliberately bare: no builtins, no `apply_patch`, no
+/// language servers. The runtime is configured with `manual_builtins` (see
+/// `launch.rs`), so `continue_with` attaches nothing on its own, and
+/// `max_tool_rounds(1)` keeps it that way should a future MCP server make
+/// `continue_with` generous again. A tool call behind a completion would mean
+/// a keystroke raising an approval dialog.
+async fn complete(context: &Dispatch, raw: Option<Value>) -> Result<Value, ErrorObject> {
+    let request: acp::CompletionRequest = params(raw)?;
+    let thread_id = acp::thread_id(&request.session_id)?;
+    let _owned = context.find(&thread_id).await?;
+
+    let builder = context
+        .setup
+        .runtime
+        .continue_with(crate::completion::messages(&request))
+        .system(crate::completion::SYSTEM_PROMPT)
+        .max_tool_rounds(1)
+        // A cursor has one right answer far more often than it has an
+        // interesting one, and a suggestion that flickers between renders of
+        // the same buffer reads as a malfunction.
+        .temperature(0.0);
+
+    let outcome = tokio::time::timeout(COMPLETION_DEADLINE, builder.collect()).await;
+
+    // Every failure here is the same answer to the editor: no suggestion. A
+    // completion is speculative, so a model that erred, timed out, or asked
+    // for a tool it was not given is not worth interrupting a developer over —
+    // it is worth a log line and silence.
+    let text = match outcome {
+        Ok(Ok(response)) => response.text,
+        Ok(Err(error)) => {
+            tracing::debug!(%error, "no completion: the model call failed");
+            return encode(&acp::CompletionResponse::empty());
+        }
+        Err(_) => {
+            tracing::debug!(
+                deadline_ms = COMPLETION_DEADLINE.as_millis(),
+                "no completion: the model did not answer in time",
+            );
+            return encode(&acp::CompletionResponse::empty());
+        }
+    };
+
+    encode(&acp::CompletionResponse {
+        completion: crate::completion::clean(&text, &request),
     })
 }
 
