@@ -986,7 +986,11 @@ impl CompletionRequest {
     /// but it also means nothing outside this crate could otherwise build the
     /// request at all, and this is a type clients are supposed to build.
     #[must_use]
-    pub fn new(session_id: SessionId, prefix: impl Into<String>, suffix: impl Into<String>) -> Self {
+    pub fn new(
+        session_id: SessionId,
+        prefix: impl Into<String>,
+        suffix: impl Into<String>,
+    ) -> Self {
         Self {
             session_id,
             uri: None,
