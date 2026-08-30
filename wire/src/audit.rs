@@ -475,6 +475,7 @@ pub mod fixture {
             model: None,
             input_tokens: None,
             output_tokens: None,
+            context_sources: Vec::new(),
             resumed: false,
             trail_id: trail_id.cloned(),
             prev_hash: prev_hash.to_string(),

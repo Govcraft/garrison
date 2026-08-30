@@ -106,7 +106,7 @@ the next rebuild picks a change up silently.
 
 | Crate | Requirement | Why |
 | --- | --- | --- |
-| `acton-ai` | `=0.36.0` (exact) | It is 0.x, and `garrison-wire` re-exports its audit types as Garrison's own wire contract. An unreviewed bump would silently redefine what an audit entry is, which is surface 4 above. Exact makes it a reviewed commit — as 0.35 → 0.36 was: it turned the tool fields optional to make room for turn entries, and the fixture test is what proved no existing byte moved. |
+| `acton-ai` | `=0.37.0` (exact) | It is 0.x, and `garrison-wire` re-exports its audit types as Garrison's own wire contract. An unreviewed bump would silently redefine what an audit entry is, which is surface 4 above. Exact makes it a reviewed commit — as 0.35 → 0.36 was, when it turned the tool fields optional to make room for turn entries, and as 0.36 → 0.37 was, when it added a public append path for host refusals and a `context_sources` field skipped when empty. The fixture test is what proved no existing byte moved either time. |
 | `acton-service` | `0.39` | Plane-side only (`hooks-service`). For a 0.x crate, caret already caps below 0.40, so caret and tilde are the same requirement here. |
 | `acton-service-client` | `0.1.2` | Ships inside the agent binary, so a fix here needs an agent release, not just a plane redeploy. |
 | `acton-reactive` | `9.2.1` | Post-1.0 semver, patch float. |

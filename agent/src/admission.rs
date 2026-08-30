@@ -116,6 +116,30 @@ pub enum TurnRefusal {
     },
 }
 
+impl TurnRefusal {
+    /// The stable word the audit trail records as the refusal's decision.
+    ///
+    /// [`fmt::Display`] renders a refusal for a human reading an error; this
+    /// renders it for a machine filtering a year of trails. They are separate
+    /// on purpose: the prose may be reworded whenever it reads badly, and an
+    /// auditor's saved query must not break when it is. Every arm answers a
+    /// fixed lowercase word, and an arm added later adds a word rather than
+    /// changing one.
+    #[must_use]
+    pub const fn decision(&self) -> &'static str {
+        match self {
+            Self::Seat { .. } => "seat",
+            Self::PlaneUnavailable { .. } => "plane_unavailable",
+            Self::Policy { .. } => "policy",
+            Self::AuditShipping { .. } => "audit_shipping",
+            Self::AuditDegraded { .. } => "audit_degraded",
+            Self::StoreUnavailable => "store_unavailable",
+            Self::TurnInterrupted { .. } => "turn_interrupted",
+            Self::GateUnreachable { .. } => "gate_unreachable",
+        }
+    }
+}
+
 impl fmt::Display for TurnRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
