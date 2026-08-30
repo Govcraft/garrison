@@ -107,14 +107,7 @@ pub async fn ensure(
         "enrolling with the control plane"
     );
 
-    let outcome = redeem::redeem(
-        &plane.url,
-        &packet.artifact,
-        &packet.token_id,
-        &facts,
-        &public_key,
-    )
-    .await?;
+    let outcome = redeem::redeem(&plane.url, &packet.artifact, &facts, &public_key).await?;
 
     let Outcome::Accepted {
         install,

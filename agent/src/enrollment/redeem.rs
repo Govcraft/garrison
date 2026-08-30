@@ -65,13 +65,14 @@ pub enum Outcome {
 /// Builds the redemption body.
 ///
 /// Pure, so every field the plane will see can be asserted without a server.
-/// Note what is absent: `organization` is not sent. The daemon cannot read its
-/// own grant, has nothing truthful to say about which tenant it belongs to,
-/// and a field the client cannot set is a field the client cannot forge.
+/// Note what is absent: neither `organization` nor `token_id` is sent. The
+/// daemon cannot read its own grant, so it has nothing truthful to say about
+/// which tenant it belongs to or which token it is spending; the hook resolves
+/// both, the second from the artifact this request is bearing. A field the
+/// client cannot set is a field the client cannot forge.
 #[must_use]
-pub fn body(token_id: &str, facts: &InstallFacts, public_key: &str) -> Value {
+pub fn body(facts: &InstallFacts, public_key: &str) -> Value {
     let mut fields = serde_json::Map::new();
-    fields.insert("token_id".into(), json!(token_id));
     fields.insert("install_id".into(), json!(facts.install_id));
     fields.insert("hostname".into(), json!(facts.hostname));
     fields.insert("platform".into(), json!(facts.platform));
@@ -148,7 +149,6 @@ pub fn outcome(response: &Value) -> Outcome {
 pub async fn redeem(
     plane_url: &str,
     artifact: &str,
-    token_id: &str,
     facts: &InstallFacts,
     public_key: &str,
 ) -> Result<Outcome, GarrisonError> {
@@ -163,7 +163,7 @@ pub async fn redeem(
     let response: Value = client
         .post(
             "forge/schemas/Redemption/entities",
-            &body(token_id, facts, public_key),
+            &body(facts, public_key),
         )
         .await
         .map_err(|error| {
@@ -191,10 +191,9 @@ mod tests {
 
     #[test]
     fn the_body_reports_what_the_process_observed() {
-        let body = body("tok_7f3a", &facts(), "BASE64SPKI");
+        let body = body(&facts(), "BASE64SPKI");
         let fields = &body["fields"];
 
-        assert_eq!(fields["token_id"], json!("tok_7f3a"));
         assert_eq!(fields["sandbox_hardening"], json!("enforce"));
         assert_eq!(fields["isolation_active"], json!(true));
         assert_eq!(fields["public_key"], json!("BASE64SPKI"));
@@ -202,17 +201,21 @@ mod tests {
     }
 
     #[test]
-    fn the_daemon_never_asserts_its_own_tenant() {
-        let body = body("tok_7f3a", &facts(), "k");
+    fn the_daemon_never_asserts_its_own_tenant_or_its_own_grant() {
+        let body = body(&facts(), "k");
         assert!(
             body["fields"].get("organization").is_none(),
             "organization is the plane's to decide, never the daemon's to claim"
+        );
+        assert!(
+            body["fields"].get("token_id").is_none(),
+            "which grant is being spent comes from the artifact, not the body"
         );
     }
 
     #[test]
     fn no_private_material_reaches_the_body() {
-        let rendered = body("tok_7f3a", &facts(), "BASE64SPKI").to_string();
+        let rendered = body(&facts(), "BASE64SPKI").to_string();
         for secret in ["PRIVATE", "private", "secret", "v4.local"] {
             assert!(
                 !rendered.contains(secret),
@@ -225,14 +228,10 @@ mod tests {
     fn an_absent_operator_upn_is_omitted_rather_than_sent_blank() {
         let mut facts = facts();
         facts.operator_upn = None;
-        assert!(body("t", &facts, "k")["fields"]
-            .get("operator_upn")
-            .is_none());
+        assert!(body(&facts, "k")["fields"].get("operator_upn").is_none());
 
         facts.operator_upn = Some("   ".into());
-        assert!(body("t", &facts, "k")["fields"]
-            .get("operator_upn")
-            .is_none());
+        assert!(body(&facts, "k")["fields"].get("operator_upn").is_none());
     }
 
     #[test]
@@ -240,7 +239,7 @@ mod tests {
         let mut facts = facts();
         facts.operator_upn = Some("  dev@agency.gov \n".into());
         assert_eq!(
-            body("t", &facts, "k")["fields"]["operator_upn"],
+            body(&facts, "k")["fields"]["operator_upn"],
             json!("dev@agency.gov")
         );
     }

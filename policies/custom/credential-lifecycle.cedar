@@ -24,3 +24,23 @@ forbid (
     action == Action::"DeleteEnrollmentToken",
     resource is EnrollmentToken
 );
+
+// A redemption is a decided verdict, not a mutable row.
+//
+// The hook resolves `token_id` from the authenticated principal, and it runs
+// on creates alone — an update to a decided redemption must not mint a second
+// credential for the same install. That leaves update unattended: `@access`
+// grants `write` to `enrollee`, and `write` covers update, so without this a
+// same-organization enrollee could reach another install's row and rewrite the
+// token it was decided under.
+//
+// The row is also the evidence a security officer reads when an unknown
+// machine presents a revoked grant at 03:00. Same reasoning as
+// `garrison.auditevent.append_only`: a record that can be edited afterwards is
+// not a record.
+@id("garrison.redemption.append_only")
+forbid (
+    principal is Forge::Principal,
+    action == Action::"UpdateRedemption",
+    resource is Redemption
+);
