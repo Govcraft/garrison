@@ -45,10 +45,13 @@ final class GarrisonToolWindow implements Disposable, GarrisonConnection.Listene
         this.project = project;
         this.connection = GarrisonConnection.getInstance(project);
         this.connection.setListener(this);
+        root.getAccessibleContext().setAccessibleName("Garrison Chat");
         transcript.setEditable(false);
         transcript.setContentType("text/plain");
+        transcript.getAccessibleContext().setAccessibleName("Garrison transcript");
         input.setLineWrap(true);
         input.setWrapStyleWord(true);
+        input.getAccessibleContext().setAccessibleName("Message Garrison");
         transcriptScroll.setBorder(JBUI.Borders.empty());
 
         var buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
