@@ -46,6 +46,17 @@ direction, not checkout.
   approved, and every filesystem tool a turn registers is built for that root
   and no other directory.
 - Read-only LSP tools for diagnostics, hover, definitions, and references.
+- Inline completion at the cursor, in both editors: `_garrison/complete` takes
+  the text either side of a cursor and answers with the code that goes between
+  them. It runs off the session's message loop, so a keystroke never queues
+  behind a running turn, and it is abandoned after two seconds because ghost
+  text that lands after the next keystroke is a distraction rather than a
+  suggestion. The session is still resolved, which is what proves the client
+  owns it and holds the request inside the workspace boundary. It reaches no
+  admission gate, which is a hole in the governance premise rather than a
+  missing nicety; see
+  [#22](https://github.com/Govcraft/garrison/issues/22) and "Known gaps" in
+  [docs/control-plane.md](docs/control-plane.md).
 - Anthropic, OpenAI, Groq, Kimi, Ollama, and compatible endpoints through acton-ai.
 - An interactive terminal chat: streaming replies in the terminal's own
   scrollback, keystroke approvals, Esc to interrupt, and slash commands.
@@ -63,7 +74,16 @@ direction, not checkout.
   start, generates an Ed25519 install key it never transmits, and records the
   identity the plane assigns. A machine the plane turns away does not start;
   one already enrolled never calls the plane again. The plane side is a
-  `before_validate` gRPC hook in `hooks-service/`.
+  `before_validate` gRPC hook in `hooks-service/`. A grant also says what it
+  mints: `durable` is a workstation, which enrolls once and keeps its install
+  record; `ephemeral`, with a lifetime the grant sets, is a CI runner, which
+  has no disk that outlives the build and would otherwise leave a pipeline
+  choosing between an undifferentiated install row per build and a spent packet
+  that refuses to start. The grant decides and never the daemon, because from
+  inside a container a fresh runner and a freshly imaged laptop look identical.
+  An ephemeral install carrying no expiry is refused before a seat is
+  consulted, and every install a pipeline mints binds to the same CI operator,
+  so a hundred builds a day is one seat.
 - One authenticated path from an enrolled daemon to the plane: it signs a
   120-second assertion with its install key, trades it at
   `POST /api/v1/install/token` for a 15-minute bearer scoped to its
@@ -210,6 +230,7 @@ client of its socket (`$XDG_RUNTIME_DIR/garrison-agent.sock`):
 | `schemas/` | Implemented | Control-plane entity model in the SchemaForge DSL |
 | `policies/` | Implemented | Role ranks and hand-written Cedar policies |
 | `garrison.toml` | Implemented | Server, approval, thread, plane, and LSP configuration |
+| `bitbucket/` | Implemented | `garrison-bitbucket`: the Bitbucket Data Center client review mode reads pull requests and posts findings through |
 | `wire/` | Implemented | `garrison-wire`: the install assertion both the daemon and the hook service compile against, with its test vector |
 | `acton-ai.toml` | Implemented | Provider, context, sandbox, and acton-ai runtime configuration |
 | `config.toml` | Implemented | Control-plane (SchemaForge on acton-service) configuration |
@@ -217,8 +238,8 @@ client of its socket (`$XDG_RUNTIME_DIR/garrison-agent.sock`):
 | `packaging/` | Implemented | The per-user systemd unit and packaging notes |
 | `hooks-service/` | Working | The enrollment hook, the install-token exchange, and the Entra ID directory sync: adjudicates a token, provisions the install and its credential, mints the bearers enrolled daemons spend, keeps operators in step with the directory |
 | `site/` | Planned | Control-plane administration site |
-| `extensions/vscode/` | Implemented | VS Code ACP client, sidebar chat, approvals, and status |
-| `extensions/jetbrains/` | Implemented | JetBrains ACP client, tool-window chat, approvals, and status |
+| `extensions/vscode/` | Implemented | VS Code ACP client, sidebar chat, approvals, inline completion, and status |
+| `extensions/jetbrains/` | Implemented | JetBrains ACP client, tool-window chat, approvals, inline completion, and status |
 | `infra/`, `docs/compliance/` | Planned | Deployment and compliance material |
 
 ## Development quickstart
@@ -342,10 +363,16 @@ capabilities rather than this repository's runnable state.
 
 ## Status
 
-1.0. The agent daemon, the VS Code and JetBrains clients, and the four
+1.1. The agent daemon, the VS Code and JetBrains clients, and the four
 control-plane services behind the governance claims are implemented and
 verified against a live plane. `docs/compatibility.md` states what the number
 promises on each covered surface and what it deliberately does not.
+
+1.1 adds inline completion at the cursor in both editors, unattended Bitbucket
+pull request review shipped experimental and off, and enrollment grants that
+mint an install identity expiring with the build that redeemed it. Everything
+1.0 froze is unchanged: the additions are new fields, new methods, and a new
+crate, and nothing was removed or repurposed.
 
 The one deployment fact worth stating next to the number: there is no
 provisioned database. The apply path has been exercised against throwaway
