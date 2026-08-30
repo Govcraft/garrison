@@ -360,7 +360,7 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, LspServer>) {
                 .drain()
                 .flat_map(|(_, waiters)| waiters),
         );
-        let ready_waiters: Vec<OutboundEnvelope> = actor.model.ready_waiters.drain(..).collect();
+        let ready_waiters: Vec<OutboundEnvelope> = std::mem::take(&mut actor.model.ready_waiters);
 
         Reply::pending(async move {
             for envelope in owed {
@@ -427,7 +427,7 @@ fn complete_handshake(
         Err(reason) => {
             let reason = format!("initialize failed: {reason}");
             actor.model.phase = Phase::Failed(reason.clone());
-            let waiters: Vec<OutboundEnvelope> = actor.model.ready_waiters.drain(..).collect();
+            let waiters: Vec<OutboundEnvelope> = std::mem::take(&mut actor.model.ready_waiters);
             return Reply::pending(async move {
                 for envelope in waiters {
                     envelope
@@ -454,8 +454,8 @@ fn complete_handshake(
     );
 
     let utf8_positions = actor.model.utf8_positions;
-    let waiters: Vec<OutboundEnvelope> = actor.model.ready_waiters.drain(..).collect();
-    let parked: Vec<(SendRequest, OutboundEnvelope)> = actor.model.parked.drain(..).collect();
+    let waiters: Vec<OutboundEnvelope> = std::mem::take(&mut actor.model.ready_waiters);
+    let parked: Vec<(SendRequest, OutboundEnvelope)> = std::mem::take(&mut actor.model.parked);
     let mut frames = vec![notification("initialized", json!({}))];
     for (message, reply) in parked {
         let id = actor.model.allocate();
