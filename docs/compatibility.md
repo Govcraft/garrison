@@ -77,7 +77,7 @@ holds a trail a real daemon wrote and fails if today's code disagrees with it
 about a single byte. Regenerating that fixture is the visible cost of breaking
 this promise, and it is deliberately awkward.
 
-**Added in 1.1, without moving a byte:** the trail now also holds one entry per
+**Added in 1.2, without moving a byte:** the trail now also holds one entry per
 attempted *turn*, not only per tool invocation. A turn entry is a new shape in
 the same chain, distinguished by an `entry_kind` field that invocation entries
 omit — and omission is the whole trick. Every field a turn entry adds, and the
@@ -85,6 +85,14 @@ discriminator itself, is absent from an invocation's serialized form and from
 its hash pre-image, so a trail written by 1.0 still hashes to exactly what it
 hashed to. `agent/tests/audit_fixture.rs` is what holds that claim honest: it
 verifies a trail a 1.0 daemon wrote, unchanged.
+
+Two later additions extend that shape on the same terms. A turn Garrison's own
+admission gates refuse is sealed as a turn entry carrying the stable reason it
+was refused. And a turn steered by `AGENTS.md` project instructions names them
+in `context_sources`, by scope, path, and content hash, never by content. Both
+fields serialize away entirely when they are empty, so they are absent from the
+pre-image of every entry that predates them, and the fixture test proved that
+for each addition rather than assuming it.
 
 A reader that does not know about turn entries will still verify the chain,
 because verification is over the sealed bytes. It will simply see entries whose
