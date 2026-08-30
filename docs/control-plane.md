@@ -7,8 +7,10 @@ application, which means the entity model in `schemas/` is the source of truth
 for its tables, REST API, migrations, Cedar policies, and OpenAPI spec — there
 is no hand-written CRUD layer to drift from it.
 
-This is a roadmap document with one implemented part. Statements prefixed
-**Implemented** describe this checkout; **Planned** describes intended work.
+Statements prefixed **Implemented** describe this checkout; **Planned**
+describes intended work. As of 1.0 the four services behind the governance
+claims are implemented; what remains planned is listed at the end of this
+section and under "Known gaps".
 
 ## Status
 
@@ -20,7 +22,7 @@ the two gates that run without a database:
 task plane:check      # parse the schemas, then strict-mode validate the Cedar bundle
 ```
 
-18 schemas lower into a Cedar bundle of 231 policies, 12 of them hand-written
+18 schemas lower into a Cedar bundle of 233 policies, 13 of them hand-written
 in `policies/custom/`, all strict-mode validated. The model has also been
 applied end to end against a throwaway PostgreSQL 16 instance: 31 migration
 steps, 18 tables, every `unique` constraint and every CEL rule type-checked at
@@ -48,11 +50,17 @@ from a Microsoft Graph listing (or a JSON file), and the enrollment hook
 refuses anyone the directory has not vouched for. See "Directory" below for
 the rules and for what has and has not been proved against a real tenant.
 
-**Planned:** everything else that moves bytes. The agent does not yet pull
-policy from this plane or push audit to it, no database has been provisioned,
-and there is no administration site. The
-model landing first is deliberate — the wire contract between agent and plane is
-the entity model, so it is the thing worth being wrong about early and cheaply.
+The agent pulls its policy bundle from this plane and ships its audit trail to
+it, both over that same install bearer, and both as gates a turn passes through
+rather than as background sync. See "Policy distribution" and "Audit shipping"
+below.
+
+**Planned:** no database has been provisioned, and there is no administration
+site. A deployment therefore starts with `task plane:apply` against a fresh
+database, a seeded organization, and a bootstrapped `platform_admin`. The model
+landing first was deliberate — the wire contract between agent and plane is the
+entity model, so it was the thing worth being wrong about early and cheaply,
+and it is now frozen by `docs/compatibility.md`.
 
 ## What SchemaForge owns, and what it does not
 
@@ -1709,10 +1717,13 @@ exactly one install identity: a fleet of editor windows is one
   the organizations that bearer can see. A deployment with several
   organizations on one plane runs one hooks service per organization, or
   waits for a chain-less service bearer.
-- **The `PolicyBundle` hook is declared and refuses.** Its `before_validate`
-  hook is bound and served, and it is a stub that fails closed: every bundle
-  publish is refused until the publish gate is implemented. The `AuditEvent`
-  hook is no longer a stub; see "Audit shipping".
+- **A bundle's rules are checked against their own examples, and nothing
+  checks the examples.** The publish gate refuses a rule whose
+  `match_examples` it does not match, which catches a rule that does not do
+  what its author thought. It cannot catch a rule whose examples are all wrong
+  in the same direction. That is a review problem rather than a code one, and
+  it is stated here so nobody reads a green publish as proof the policy is
+  correct.
 - **The audit bearer is tenant-scoped, like the directory one.** The ingest
   writes `AuditChain` with the chain its bearer was minted under, so one
   `garrison-hooks` serves one organization's trails. Several organizations on

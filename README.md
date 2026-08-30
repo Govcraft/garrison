@@ -2,16 +2,24 @@
 
 **Governed agentic coding inside your boundary.**
 
-Garrison is a pre-alpha AI coding-agent daemon built on
+Garrison is an AI coding-agent daemon built on
 [acton-ai](https://github.com/rodzilla/acton-ai). The checked-in product is a
 Rust agent that speaks the Agent Client Protocol (ACP), routes tool approvals
 to its client, provides structural patching and language-server queries, and
 can use agency-approved model endpoints.
 
-The control plane's entity model has landed as SchemaForge schemas, and the
-agent enrolls itself against it on first run; the services that would carry
-policy and audit between the two have not. The rest of the federal product
-described below is direction, not checkout.
+**1.0 means an agency can deploy Garrison and the four governance claims below
+survive an auditor asking "prove it."** Policy comes from the plane, a seat is
+spent per turn, the audit trail leaves the machine that wrote it, and identity
+comes from the directory. Each is enforced by a gate a turn passes through
+rather than described in a document, and each is verified end to end against a
+real plane in a container rather than against a mock.
+
+What 1.0 does *not* promise is listed plainly under "Known gaps" in
+[docs/control-plane.md](docs/control-plane.md), and the compatibility surface it
+freezes is in [docs/compatibility.md](docs/compatibility.md). The federal-ui
+administration site, SIEM integration, and the compliance document sets are
+direction, not checkout.
 
 ## What is implemented
 
@@ -45,10 +53,10 @@ described below is direction, not checkout.
   `edit_file` run in a re-exec'd child with resource limits and, on Linux,
   landlock and seccomp hardening, confined to the session's root.
 - Provider login/logout helpers and a `ping` smoke client.
-- The control plane's administrative entity model: 16 SchemaForge schemas
+- The control plane's administrative entity model: 18 SchemaForge schemas
   covering tenancy, operators and seats, machine identity for the daemons, the
   install fleet, policy bundles and command rules, approved model endpoints,
-  and audit-chain aggregation — lowering into a 170-policy, strict-mode-
+  and audit-chain aggregation — lowering into a 233-policy, strict-mode-
   validated Cedar bundle. See
   [docs/control-plane.md](docs/control-plane.md).
 - Enrollment, end to end: the daemon redeems a single-use grant on its first
@@ -72,25 +80,47 @@ described below is direction, not checkout.
   was revoked" and "your plane is unreachable" are two different refusals with
   two different codes, each explained in prose. See
   [docs/control-plane.md](docs/control-plane.md#seat-entitlement-from-the-agents-side--agentsrcentitlement).
+- Centrally managed policy the laptop cannot edit: the daemon pulls the bundle
+  its organization assigned, verifies the content against the checksum the
+  plane recorded, and runs every rule against its own examples before putting
+  it in force. There are three states and deliberately no fourth — standalone
+  (no `[plane]` section, `garrison.toml` governs), governed (a verified bundle,
+  and the local auto-approve list is not read at all), and ungoverned (the
+  plane said no, or said nothing for longer than the organization allows, and
+  every turn is refused). A governed install never falls back to its local
+  file, because that would make policy something a laptop can edit. The refresh
+  is a timer, so nothing on the turn path waits for the network. The bundle
+  write-back doubles as the heartbeat, so a wedged daemon does not look like a
+  clean shutdown.
+- An audit trail that leaves the box. A hash chain proves nobody edited the
+  middle of a record and proves nothing about the end of one, because a prefix
+  of a valid chain is itself a valid chain — so the trail ships to the plane,
+  which refuses a forked or edited entry and collides a replay with a 409.
+  Shipping is itself a gate: an unreachable plane never stops a turn (a laptop
+  on a train is not a governance failure), a backlog past its bound does when
+  `fail_closed`, and a halt always does, because a refused entry is a finding
+  rather than an outage.
 - acton-ai policy, accounting, audit, planning, context, MCP, and tool-loop
   primitives where enabled by configuration.
 
 ## What is planned
 
-These components are not present in this repository today:
+All four control-plane services named by the 1.0 gates are wired: enrollment,
+policy distribution, seat entitlement, audit ingest, and the Entra ID directory
+sync alongside them. These components are not present in this repository today:
 
-- The rest of the control-plane *services*: policy distribution to installs
-  and audit ingest. The model those services will speak is in `schemas/`;
-  enrollment and the Entra ID directory sync are the paths wired against it
-  so far.
 - The federal-ui administration site.
 - Infrastructure, SIEM integration, and compliance document sets.
 - Command-prefix policy, turn diffs, repository context,
-  project-instruction discovery, persistent PTYs, and Bitbucket review mode.
+  project-instruction discovery, persistent PTYs, and Bitbucket review mode
+  ([#16](https://github.com/Govcraft/garrison/issues/16)).
 
-Active tracking issues include
-[documentation alignment](https://github.com/Govcraft/garrison/issues/2) and
-[session persistence](https://github.com/Govcraft/garrison/issues/3).
+Some things the plane models are recorded rather than enforced, and the code
+says so out loud rather than implying otherwise: a bundle's `network_egress`
+and `allow_unsandboxed_escalation` are part of the checksum and reported in
+`_garrison/status`, and no code acts on them. `ping` reports them as not
+enforced. The full list is under "Known gaps" in
+[docs/control-plane.md](docs/control-plane.md).
 
 ## Current architecture
 
@@ -288,14 +318,21 @@ overrides that inference either way. `_garrison/status` reports the store under
 
 ## Target architecture
 
-The roadmap connects the agent to the control plane whose model now lives in
-`schemas/` — identity, centrally managed policy, seats, and audit aggregation —
-and adds editor extensions that consume the same ACP service. Until those components land, claims about centralized
-governance, SIEM export, or compliance certification describe intended product
+The agent is connected to the control plane whose model lives in `schemas/`:
+identity, centrally managed policy, seats, and audit aggregation are each wired
+end to end, and the editor extensions consume the same ACP service. What
+remains direction rather than checkout is the administration site, SIEM export,
+and compliance certification — claims about those describe intended product
 capabilities rather than this repository's runnable state.
 
 ## Status
 
-Pre-alpha. The agent daemon and first VS Code and JetBrains clients are
-implemented. The control plane exists as a validated entity model with one
-service behind it: enrollment, which the agent now uses to join a fleet.
+1.0. The agent daemon, the VS Code and JetBrains clients, and the four
+control-plane services behind the governance claims are implemented and
+verified against a live plane. `docs/compatibility.md` states what the number
+promises on each covered surface and what it deliberately does not.
+
+The one deployment fact worth stating next to the number: there is no
+provisioned database. The apply path has been exercised against throwaway
+containers, so a deployment starts with `task plane:apply` against a fresh
+database, a seeded organization, and a bootstrapped `platform_admin`.

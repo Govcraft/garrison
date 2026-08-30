@@ -4,8 +4,11 @@
 workspace, ~100 crates. **Date:** 2026-08-19. **Updated for acton-ai 0.33.0:**
 2026-08-20.
 
-This is a roadmap document. Statements prefixed with **Implemented** describe
-this checkout; statements prefixed with **Planned** describe intended work.
+This is a roadmap document, written before 1.0 and kept for the reasoning
+rather than the status. Statements prefixed with **Implemented** describe this
+checkout; statements prefixed with **Planned** describe intended work. For what
+1.0 actually ships, read the README and `docs/compatibility.md` first — where
+this document and those disagree, they are right and this is stale.
 
 The question this document answers: what does codex-rs know that acton-ai
 doesn't, and which of those things must garrison-agent build to be a *coding

@@ -2155,7 +2155,7 @@ dependencies = [
 
 [[package]]
 name = "garrison-agent"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "acton-ai",
  "acton-reactive",
@@ -2194,7 +2194,7 @@ dependencies = [
 
 [[package]]
 name = "garrison-hooks"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "acton-reactive",
  "acton-service",
@@ -2221,7 +2221,7 @@ dependencies = [
 
 [[package]]
 name = "garrison-policy"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "serde",
@@ -2231,7 +2231,7 @@ dependencies = [
 
 [[package]]
 name = "garrison-wire"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "acton-ai",
  "base64 0.23.1",
