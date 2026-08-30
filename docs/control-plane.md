@@ -170,7 +170,7 @@ schemaforge token generate --sub tok_7f3a --lifetime 172800 \
   --custom-claim-long max_uses=25
 
 schemaforge entity create EnrollmentToken \
-  --set token_id=tok_7f3a --set issuer=garrison-control-plane \
+  --set token_id=tok_7f3a \
   --set organization=$ORG --set scope=organization --set max_uses=25 \
   --set issued_by=so@agency.gov --set expires_at=2026-08-31T04:00:00Z
 ```
@@ -259,7 +259,7 @@ in `hooks-service/`:
 
 | Step | Why it is there |
 |---|---|
-| Adjudicate the token | issuer, status, expiry, use count, tenant — in that order |
+| Adjudicate the token | status, expiry, use count, tenant — in that order |
 | Resolve the operator | an operator-scoped grant wins over the machine's claim |
 | Admit the operator | `status` must be `active`; with the directory on, the row must carry an `entra_object_id` and the organization's directory view must be fresh (R4 below) |
 | Create the `AgentInstall` | `status = enrolled`, not `active`: joining the fleet is not entitlement |
@@ -300,11 +300,17 @@ One constraint is worth recording because it is easy to design around and
 impossible to configure around. The plane validates every bearer against the
 single `issuer` in its `[token]` section, so an enrollment artifact minted
 under a distinct issuer is a 401 at authentication and never reaches the hook.
-Artifacts are therefore minted under the plane's own issuer, and
-`hooks-service`'s expected issuer must match it. What separates an artifact
-from a console bearer is not `iss` but the `enrollee` role, which is granted
-write on `Redemption` and nothing else anywhere in the bundle. Issuer
+Artifacts are therefore minted under the plane's own issuer. What separates an
+artifact from a console bearer is not `iss` but the `enrollee` role, which is
+granted write on `Redemption` and nothing else anywhere in the bundle. Issuer
 separation would need the plane to accept more than one issuer.
+
+`EnrollmentToken` carried an `issuer` column until 1.0, compared against the
+configured issuer on every redemption. Given the paragraph above, both sides
+were the same string in every deployment, so the check caught a typo in a
+hand-written row and nothing more, while reading like a security control. It
+is gone. `garrison.issuer` in `hooks-service`'s config remains, because the
+install-token exchange mints under it and that is a real use.
 
 Verified end to end against a live plane:
 
@@ -1674,18 +1680,6 @@ exactly one install identity: a fleet of editor windows is one
 
 ## Known gaps
 
-- **`EnrollmentToken.issuer` catches a typo, not a cross-purpose token.**
-  `adjudicate` compares the stored column against the plane's configured
-  issuer, and its doc comment reads as if that stopped a token minted for
-  some other purpose. It cannot: the plane validates `iss` against exactly
-  one issuer, every artifact is minted under it, and an attacker holding the
-  signing key mints under that same one. The check is worth keeping as a
-  provisioning guard, and the column is `required indexed` on a surface about
-  to freeze. Whether it should instead be re-founded on a custom claim
-  projected onto `Forge::Principal` and asserted in a `@require` depends on
-  whether SchemaForge can source a principal claim from a raw token claim
-  rather than only from `source = { user_field = ... }`. That is an open
-  question for 1.0, recorded here rather than answered.
 - **A bundle's `network_egress` and `allow_unsandboxed_escalation` are
   recorded and not enforced.** They are part of the checksum and reported in
   `_garrison/status`; no code acts on them. `ping` says so out loud.

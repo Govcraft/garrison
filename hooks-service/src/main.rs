@@ -191,8 +191,7 @@ async fn main() -> Result<()> {
         )
         .add_service(
             pb::redemption::redemption_hooks_server::RedemptionHooksServer::new(
-                hooks::redemption::Service::new(plane.clone(), garrison.issuer)
-                    .with_directory(gate),
+                hooks::redemption::Service::new(plane.clone()).with_directory(gate),
             ),
         )
         .add_service(

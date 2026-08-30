@@ -68,18 +68,15 @@ impl Default for DirectoryGate {
 /// How this service reaches the plane and what it expects to see there.
 pub struct Service {
     plane: Plane,
-    /// The `iss` an enrollment artifact must have been minted under.
-    expected_issuer: String,
     gate: DirectoryGate,
 }
 
 impl Service {
-    /// Build the service from a plane client and the issuer it trusts.
+    /// Build the service from a plane client.
     #[must_use]
-    pub fn new(plane: Plane, expected_issuer: impl Into<String>) -> Self {
+    pub fn new(plane: Plane) -> Self {
         Self {
             plane,
-            expected_issuer: expected_issuer.into(),
             gate: DirectoryGate::default(),
         }
     }
@@ -163,7 +160,7 @@ impl Service {
             ));
         };
 
-        let organization = match adjudicate(&token, &self.expected_issuer, now) {
+        let organization = match adjudicate(&token, now) {
             Verdict::Accept { organization } => organization,
             Verdict::Refuse(reason) => {
                 info!(%token_id, %reason, "enrollment refused");
@@ -527,7 +524,7 @@ mod tests {
     #[test]
     fn the_gate_is_off_by_default_and_can_be_turned_on() {
         let plane = Plane::new("https://plane.gov", "tok").unwrap();
-        let service = Service::new(plane, "garrison-enrollment");
+        let service = Service::new(plane);
         assert!(!service.gate.enabled);
         let gate = DirectoryGate {
             enabled: true,

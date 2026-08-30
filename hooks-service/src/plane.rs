@@ -75,7 +75,6 @@ impl From<ClientError> for PlaneError {
 #[derive(Debug, Clone, Deserialize)]
 pub struct EnrollmentTokenRow {
     pub id: String,
-    pub issuer: String,
     pub organization: Option<String>,
     pub scope: String,
     pub operator: Option<String>,

@@ -44,23 +44,21 @@ impl Verdict {
 
 /// Decide whether `token` may be spent at `now`.
 ///
-/// `expected_issuer` is the `iss` the plane mints enrollment artifacts under.
-/// The row records the issuer it was created for, and a mismatch means the
-/// artifact was signed for some other purpose against the same key, the one
-/// thing a shared signing key makes possible and a row can still catch.
+/// There is deliberately no issuer check here. The row used to carry an
+/// `issuer` column compared against the plane's configured one, and the
+/// comment above it claimed that refused an artifact signed for some other
+/// purpose against the same key. It could not: acton-service validates `iss`
+/// against exactly one configured issuer, so every artifact that reaches this
+/// function was minted under that one, and an attacker holding the signing key
+/// mints under it too. What the check actually caught was a provisioning typo
+/// in a hand-written row, at the price of a `required` column on a frozen
+/// surface and a doc comment that read like a security control.
+///
+/// What separates an enrollment artifact from a session token is its role set.
+/// `enrollee` is granted write on `Redemption` and nothing else anywhere in the
+/// bundle, and Cedar enforces that before this function is reached.
 #[must_use]
-pub fn adjudicate(
-    token: &EnrollmentTokenRow,
-    expected_issuer: &str,
-    now: DateTime<Utc>,
-) -> Verdict {
-    if token.issuer != expected_issuer {
-        return Verdict::Refuse(format!(
-            "token was issued for '{}', not '{expected_issuer}'",
-            token.issuer
-        ));
-    }
-
+pub fn adjudicate(token: &EnrollmentTokenRow, now: DateTime<Utc>) -> Verdict {
     match token.status.as_str() {
         "issued" => {}
         "revoked" => return Verdict::Refuse("token has been revoked".into()),
@@ -209,15 +207,6 @@ pub fn parse_instant(text: &str) -> Option<DateTime<Utc>> {
 mod tests {
     use super::*;
 
-    /// The issuer these tests configure the plane with.
-    ///
-    /// Deliberately not `garrison-control-plane`. The real deployments all use
-    /// that one on both sides, so a test that used it could not tell an
-    /// agreeing pair from a comparison that never ran. A fictional name here
-    /// keeps the mismatch case honest, and keeps this constant from being read
-    /// as a second issuer the plane accepts. It does not.
-    const ISSUER: &str = "test-issuer-not-a-real-one";
-
     fn now() -> DateTime<Utc> {
         parse_instant("2026-08-29T00:00:00Z").expect("fixture instant parses")
     }
@@ -225,7 +214,6 @@ mod tests {
     fn token() -> EnrollmentTokenRow {
         EnrollmentTokenRow {
             id: "enrollmenttoken_01".into(),
-            issuer: ISSUER.into(),
             organization: Some("organization_01".into()),
             scope: "organization".into(),
             operator: None,
@@ -263,7 +251,7 @@ mod tests {
 
     #[test]
     fn a_live_token_is_accepted_and_names_its_tenant() {
-        let verdict = adjudicate(&token(), ISSUER, now());
+        let verdict = adjudicate(&token(), now());
         assert_eq!(
             verdict,
             Verdict::Accept {
@@ -271,14 +259,6 @@ mod tests {
             }
         );
         assert_eq!(verdict.reason(), "");
-    }
-
-    #[test]
-    fn a_row_whose_issuer_disagrees_with_the_configuration_is_refused() {
-        let mut row = token();
-        row.issuer = "some-other-issuer".into();
-        let verdict = adjudicate(&row, ISSUER, now());
-        assert!(verdict.reason().contains("some-other-issuer"));
     }
 
     #[test]
@@ -290,7 +270,7 @@ mod tests {
         ] {
             let mut row = token();
             row.status = status.into();
-            let verdict = adjudicate(&row, ISSUER, now());
+            let verdict = adjudicate(&row, now());
             assert!(
                 verdict.reason().contains(expected),
                 "{status} refusal said {:?}",
@@ -303,9 +283,7 @@ mod tests {
     fn an_unknown_status_is_refused_rather_than_assumed_live() {
         let mut row = token();
         row.status = "provisional".into();
-        assert!(adjudicate(&row, ISSUER, now())
-            .reason()
-            .contains("provisional"));
+        assert!(adjudicate(&row, now()).reason().contains("provisional"));
     }
 
     #[test]
@@ -313,7 +291,7 @@ mod tests {
         let mut row = token();
         row.expires_at = Some("2026-08-29T00:00:00Z".into());
         assert_eq!(
-            adjudicate(&row, ISSUER, now()),
+            adjudicate(&row, now()),
             Verdict::Refuse("token expired".into())
         );
     }
@@ -322,16 +300,14 @@ mod tests {
     fn a_token_without_an_expiry_is_refused_not_admitted_forever() {
         let mut row = token();
         row.expires_at = None;
-        assert!(adjudicate(&row, ISSUER, now())
-            .reason()
-            .contains("no expiry"));
+        assert!(adjudicate(&row, now()).reason().contains("no expiry"));
     }
 
     #[test]
     fn an_unreadable_expiry_is_refused_rather_than_ignored() {
         let mut row = token();
         row.expires_at = Some("whenever".into());
-        assert!(adjudicate(&row, ISSUER, now())
+        assert!(adjudicate(&row, now())
             .reason()
             .contains("could not be read"));
     }
@@ -340,14 +316,14 @@ mod tests {
     fn a_spent_token_is_refused_and_says_the_count() {
         let mut row = token();
         row.uses = 5;
-        assert!(adjudicate(&row, ISSUER, now()).reason().contains("5 of 5"));
+        assert!(adjudicate(&row, now()).reason().contains("5 of 5"));
     }
 
     #[test]
     fn a_token_bound_to_no_organization_is_refused() {
         let mut row = token();
         row.organization = None;
-        assert!(adjudicate(&row, ISSUER, now())
+        assert!(adjudicate(&row, now())
             .reason()
             .contains("not bound to an organization"));
     }

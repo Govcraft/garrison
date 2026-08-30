@@ -209,23 +209,46 @@ client cannot lie about.
 The real defect behind the symptom was the documented mint command, which
 omitted `--tenant-chain`. That is fixed above.
 
-## Open, and the owner's to settle
+### Taken: `EnrollmentToken.issuer` is gone
 
-One candidate is genuinely a decision rather than a finding. It is recorded in
-`docs/control-plane.md` under "Known gaps" as well, so it cannot be mistaken
-for a promise.
+`adjudicate` compared the stored column against the plane's configured issuer,
+and its doc comment read as though that refused a token minted for some other
+purpose against the same key. It could not. The plane validates `iss` against
+exactly one issuer, so every artifact reaching the hook was minted under that
+one, and an attacker holding the signing key mints under it too. What the check
+caught was a typo in a hand-written row.
 
-### `EnrollmentToken.issuer` is a typo check, not a security control
+The alternative was to re-found it on a custom claim projected onto
+`Forge::Principal` and asserted in a `@require`. **That route does not exist.**
+A `principal_claims` entry with no `source` key does read straight from the
+presented token's `custom` map, with no `User` row involved — so the claim
+reaches Cedar. But there are two different `principal` namespaces, and CEL's is
+not Cedar's: `principal_map` in schema-forge-acton's `rules.rs` builds a fixed
+five-key map (`sub`, `email`, `username`, `roles`, `perms`) from named `Claims`
+fields and never reads `claims.custom`. A mapped principal claim is invisible to
+`@require`. Verified in the source at v0.37.2, not inferred.
 
-`adjudicate` compares the stored column against the configured issuer, and its
-doc comment reads as though that stopped a token minted for another purpose. It
-cannot: every artifact is minted under the one issuer the plane accepts, and an
-attacker holding the signing key mints under that same one. The check is worth
-keeping as a provisioning guard, but the column is `required indexed` on a
-surface about to freeze.
+The Cedar-side version of the idea — a source-less `purpose` claim plus a
+`forbid` on `CreateRedemption` — is expressible, and was declined on the merits
+rather than on feasibility. `required = true` on a principal claim is enforced
+against every bearer the plane accepts, so it would 401 console users and
+service tokens, which carry no such claim by construction; that constraint is
+already recorded under "Known gaps" for the directory claims. And with
+`required = false` plus a guarding `forbid` it would still buy nothing: anyone
+who can mint `--roles enrollee` can mint `--custom-claim-string
+purpose=enrollment` in the same breath. It is a second name for a fact the role
+set already carries, and one more way for a provisioner to mint a broken token.
 
-The alternative is to re-found it on a custom claim projected onto
-`Forge::Principal` and asserted in a `@require`. Whether that is possible turns
-on a question outside this repository: can a `principal_claims` entry take its
-value from a raw token claim, or only from `source = { user_field = ... }`,
-which reads a console `User` row an enrollment artifact does not have?
+What actually separates an enrollment artifact from a session token is the role
+set, enforced by Cedar before any of this runs. That is the control; the column
+was decoration with a security-sounding comment on it. Dropped before the
+surface froze.
+
+`garrison.issuer` in `hooks-service`'s config stays. The install-token exchange
+mints under it, which is a real use of a real value.
+
+## Nothing is left open
+
+Every candidate from the break pass is now taken or declined on the record. The
+`issuer` column and the enrollment packet were the two the owner was asked to
+settle, and both are settled above.

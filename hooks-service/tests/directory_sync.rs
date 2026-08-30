@@ -497,7 +497,6 @@ async fn provisioning_and_deprovisioning_flow_through_a_real_plane() {
                 "EnrollmentToken",
                 json!({
                     "token_id": token_id,
-                    "issuer": ISSUER,
                     "organization": org_id,
                     "scope": "organization",
                     "max_uses": 1,
