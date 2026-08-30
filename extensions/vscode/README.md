@@ -34,6 +34,24 @@ directory, `$HOME` under systemd or autostart) or be listed in its
 | `garrison.socket` | The daemon's socket, if not the default. Passed as `--socket`. |
 | `garrison.configPath` | A `garrison.toml` the relay reads for `[server]` only. Never passed to an autostarted daemon. |
 
+## Inline completion
+
+Garrison suggests code at the cursor as you type, as ghost text. Suggestions
+come from the same agent and the same session as the chat, over the
+`_garrison/complete` extension method, so they are inside the same workspace
+boundary and the same governance as everything else the agent does. The
+request carries no tools, so a keystroke can never raise an approval dialog.
+
+- `garrison.inlineCompletion.enabled` turns it off and on; **Garrison: Toggle
+  Inline Completion** does the same from the command palette.
+- `garrison.inlineCompletion.debounceMs` (default 250) is how long typing must
+  pause before the agent is asked. Explicit invocations ignore it.
+
+A suggestion that fails is logged to the Garrison output channel and never
+raises a dialog: it is speculative work you did not ask for. After a failure
+the agent is left alone for 30 seconds rather than being asked again on the
+next keystroke.
+
 ## Development
 
 1. Build `garrison-agent` and make it available on `PATH`, or set

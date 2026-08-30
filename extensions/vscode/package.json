@@ -14,7 +14,7 @@
     "vscode": "^1.96.0"
   },
   "categories": ["AI", "Other"],
-  "activationEvents": ["onView:garrison.chat"],
+  "activationEvents": ["onStartupFinished"],
   "main": "./dist/extension.js",
   "files": ["dist", "media", "README.md"],
   "scripts": {
@@ -27,7 +27,8 @@
     "commands": [
       { "command": "garrison.newSession", "title": "Garrison: New Session", "icon": "$(add)" },
       { "command": "garrison.cancelTurn", "title": "Garrison: Cancel Turn", "icon": "$(debug-stop)" },
-      { "command": "garrison.showStatus", "title": "Garrison: Show Governance Status", "icon": "$(shield)" }
+      { "command": "garrison.showStatus", "title": "Garrison: Show Governance Status", "icon": "$(shield)" },
+      { "command": "garrison.toggleInlineCompletion", "title": "Garrison: Toggle Inline Completion" }
     ],
     "viewsContainers": {
       "activitybar": [
@@ -63,6 +64,18 @@
           "type": "string",
           "default": "",
           "description": "Optional path to a garrison.toml the relay reads for its [server] section (socket path, autostart). It is never passed to an autostarted daemon, which reads only the XDG configuration files."
+        },
+        "garrison.inlineCompletion.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Suggest code at the cursor as you type, through the same governed agent the chat view uses."
+        },
+        "garrison.inlineCompletion.debounceMs": {
+          "type": "number",
+          "default": 250,
+          "minimum": 0,
+          "maximum": 5000,
+          "description": "How long typing must pause before a suggestion is requested. Explicit invocations ignore this."
         }
       }
     }

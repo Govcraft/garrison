@@ -19,5 +19,7 @@
         <applicationConfigurable id="com.govcraft.garrison.settings"
                                  displayName="Garrison"
                                  instance="com.govcraft.garrison.GarrisonConfigurable"/>
+        <inline.completion.provider
+                implementation="com.govcraft.garrison.GarrisonInlineCompletionProvider"/>
     </extensions>
 </idea-plugin>

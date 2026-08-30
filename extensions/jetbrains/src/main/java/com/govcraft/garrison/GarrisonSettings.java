@@ -18,6 +18,10 @@ public final class GarrisonSettings implements PersistentStateComponent<Garrison
         public String agentPath = "garrison-agent";
         public String socket = "";
         public String configPath = "";
+        /** Whether to suggest code at the cursor as you type. */
+        public boolean inlineCompletionEnabled = true;
+        /** How long typing must pause before a suggestion is requested. */
+        public int inlineCompletionDebounceMs = 250;
     }
 
     private State state = new State();
