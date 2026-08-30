@@ -58,6 +58,7 @@ use crate::approval::{ApprovalOutcome, RequestApproval, CANCELLED_REASON, REJECT
 use crate::protocol::acp::{self, Permission};
 use crate::protocol::codec::EventSink;
 use crate::protocol::jsonrpc::{encode, error_code, params, ErrorObject, Inbound, RequestId};
+use crate::router::DisownTurn;
 use crate::session;
 use crate::thread::{
     AbandonTurn, CreateThread, DescribeThread, FindThread, InterruptTurn, ListThreads, Reattach,
@@ -67,6 +68,7 @@ use crate::thread::{
 use crate::types::{ClientId, ThreadId};
 use acton_ai::checkpoint::CheckpointStatus;
 use acton_ai::facade::ActonAI;
+use acton_ai::types::TurnId as ActonTurnId;
 use acton_reactive::prelude::*;
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
@@ -1409,11 +1411,31 @@ async fn complete(context: &Dispatch, raw: Option<Value>) -> Result<Value, Error
     let thread_id = acp::thread_id(&request.session_id)?;
     let _owned = context.find(&thread_id).await?;
 
+    // A completion drives the same prompt loop a turn does, so it publishes
+    // the same `TurnStarted` the router's claim protocol reads. It holds no
+    // claim, so the router would bind that event to whatever claim happened to
+    // be outstanding and the turn that owns it would route nowhere. Minting
+    // the id here and disowning it before the loop can start is what keeps a
+    // keystroke from stealing a turn's identity; see `crate::router`.
+    let completion_turn = ActonTurnId::new();
+    if let Err(error) = context
+        .setup
+        .router
+        .ask(DisownTurn {
+            turn_id: completion_turn.clone(),
+        })
+        .await
+    {
+        tracing::debug!(%error, "no completion: the router would not disown the turn");
+        return encode(&acp::CompletionResponse::empty());
+    }
+
     let builder = context
         .setup
         .runtime
         .continue_with(crate::completion::messages(&request))
         .system(crate::completion::SYSTEM_PROMPT)
+        .turn_id(completion_turn)
         .max_tool_rounds(1)
         // A cursor has one right answer far more often than it has an
         // interesting one, and a suggestion that flickers between renders of
