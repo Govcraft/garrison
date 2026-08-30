@@ -7,9 +7,10 @@
 //! and no key except an explicit approval ever means yes.
 
 use super::message::{
-    Focus, FocusChanged, KeyPressed, Note, PermissionAnswered, PermissionAsked, Region,
-    RegionRendered, Wire,
+    Focus, FocusChanged, KeyPressed, Note, PermissionAnswered, PermissionAsked, PermissionExpired,
+    Region, RegionRendered, Wire,
 };
+use super::status::humanize;
 use super::transcript::notice_line;
 use crate::protocol::acp;
 use crate::protocol::jsonrpc::RequestId;
@@ -18,6 +19,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::collections::VecDeque;
+use std::time::Duration;
 
 /// The type every handler returns.
 type FutureBox = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync + 'static>>;
@@ -71,6 +73,8 @@ pub struct Approval {
     selected: usize,
     /// Whether every request is approved without asking.
     approve_all: bool,
+    /// How long a visible request remains answerable.
+    expires_after: Duration,
     /// Where rendered rows go.
     compositor: Option<ActorHandle>,
     /// Where the transcript lives.
@@ -87,9 +91,14 @@ impl Approval {
     /// `approve_all` turns the gate off. It exists for unattended runs and is
     /// named for what it does, because a flag whose default is "allow" is not
     /// a gate.
-    pub async fn start(runtime: &mut ActorRuntime, approve_all: bool) -> ActorHandle {
+    pub async fn start(
+        runtime: &mut ActorRuntime,
+        approve_all: bool,
+        expires_after: Duration,
+    ) -> ActorHandle {
         let mut builder = runtime.new_actor::<Self>();
         builder.model.approve_all = approve_all;
+        builder.model.expires_after = expires_after;
         configure(&mut builder);
         builder.start().await
     }
@@ -132,6 +141,17 @@ impl Approval {
         }
     }
 
+    /// Removes one request when its own timer fires.
+    fn take_expired(&mut self, id: &RequestId) -> Option<(String, bool)> {
+        let position = self.pending.iter().position(|pending| &pending.id == id)?;
+        let was_front = position == 0;
+        let expired = self.pending.remove(position)?;
+        if was_front {
+            self.selected = 0;
+        }
+        Some((expired.title, was_front))
+    }
+
     /// The rows this region shows right now.
     #[must_use]
     pub fn render(&self) -> RegionRendered {
@@ -146,6 +166,7 @@ impl Approval {
                 pending.detail.as_deref(),
                 self.selected,
                 self.pending.len(),
+                self.expires_after,
             ),
             cursor: Some(prompt_cursor(pending.detail.is_some(), self.selected)),
         }
@@ -154,12 +175,12 @@ impl Approval {
 
 /// Places the hardware cursor on the marker for the highlighted choice.
 ///
-/// The title occupies the first row and an optional detail occupies the next,
-/// so choices begin one or two rows below the top of the approval region.
+/// The title occupies the first row, the expiry occupies one more, and an
+/// optional detail adds another, so choices begin two or three rows down.
 #[must_use]
 pub fn prompt_cursor(has_detail: bool, selected: usize) -> (u16, u16) {
     let choice = selected.min(CHOICES.len().saturating_sub(1));
-    let row = 1usize
+    let row = 2usize
         .saturating_add(usize::from(has_detail))
         .saturating_add(choice);
     (2, u16::try_from(row).unwrap_or(u16::MAX))
@@ -174,6 +195,7 @@ pub fn prompt(
     detail: Option<&str>,
     selected: usize,
     waiting: usize,
+    expires_after: Duration,
 ) -> Vec<Line<'static>> {
     let muted = Style::default().fg(Color::DarkGray);
     let mut lines = vec![Line::from(vec![
@@ -189,6 +211,10 @@ pub fn prompt(
     if let Some(detail) = detail {
         lines.push(Line::from(Span::styled(format!("  {detail}"), muted)));
     }
+    lines.push(Line::from(Span::styled(
+        format!("  expires in {}", humanize(expires_after)),
+        muted,
+    )));
 
     for (index, choice) in CHOICES.iter().enumerate() {
         let chosen = index == selected;
@@ -290,6 +316,13 @@ fn configure(builder: &mut ManagedActor<Idle, Approval>) {
         if actor.model.pending.len() == 1 {
             actor.model.selected = 0;
         }
+        let expires_after = actor.model.expires_after;
+        let id = message.id.clone();
+        drop(
+            actor
+                .handle()
+                .send_after(PermissionExpired { id }, expires_after),
+        );
         open(actor, notice)
     });
 
@@ -303,6 +336,13 @@ fn configure(builder: &mut ManagedActor<Idle, Approval>) {
 
         actor.model.selected = 0;
         answer(actor, pending.id, option, &pending.title)
+    });
+
+    builder.mutate_on::<PermissionExpired>(|actor, context| {
+        let Some((title, was_front)) = actor.model.take_expired(&context.message().id) else {
+            return Reply::ready();
+        };
+        expire(actor, title, was_front)
     });
 }
 
@@ -383,6 +423,42 @@ fn repaint(actor: &mut ManagedActor<Started, Approval>) -> FutureBox {
     let compositor = actor.model.compositor.clone();
 
     Reply::pending(async move {
+        if let Some(compositor) = compositor {
+            compositor.send(rendered).await;
+        }
+    })
+}
+
+/// Clears an expired request, says why, and transfers focus when necessary.
+fn expire(
+    actor: &mut ManagedActor<Started, Approval>,
+    title: String,
+    was_front: bool,
+) -> FutureBox {
+    let rendered = actor.model.render();
+    let still_open = actor.model.is_open();
+    let compositor = actor.model.compositor.clone();
+    let transcript = actor.model.transcript.clone();
+    let router = actor.model.router.clone();
+    let notice = notice_line(format!("permission expired and was refused: {title}"));
+
+    Reply::pending(async move {
+        if let Some(transcript) = transcript {
+            transcript
+                .send(Note {
+                    lines: vec![notice],
+                })
+                .await;
+        }
+        if was_front && !still_open {
+            if let Some(router) = router {
+                router
+                    .send(FocusChanged {
+                        holder: Focus::Composer,
+                    })
+                    .await;
+            }
+        }
         if let Some(compositor) = compositor {
             compositor.send(rendered).await;
         }
@@ -486,33 +562,76 @@ mod tests {
 
     #[test]
     fn the_prompt_lists_every_choice_and_marks_the_selected_one() {
-        let lines = prompt("run bash", Some("cargo check"), 1, 1);
-        assert_eq!(lines.len(), 2 + CHOICES.len());
-        assert!(text(&lines[3]).starts_with("  ›"));
-        assert!(text(&lines[2]).starts_with("    "));
+        let lines = prompt(
+            "run bash",
+            Some("cargo check"),
+            1,
+            1,
+            Duration::from_secs(300),
+        );
+        assert_eq!(lines.len(), 3 + CHOICES.len());
+        assert!(text(&lines[4]).starts_with("  ›"));
+        assert!(text(&lines[3]).starts_with("    "));
     }
 
     #[test]
     fn the_cursor_tracks_the_highlighted_choice() {
-        assert_eq!(prompt_cursor(false, 0), (2, 1));
-        assert_eq!(prompt_cursor(false, 2), (2, 3));
+        assert_eq!(prompt_cursor(false, 0), (2, 2));
+        assert_eq!(prompt_cursor(false, 2), (2, 4));
     }
 
     #[test]
     fn a_detail_row_pushes_the_approval_cursor_down() {
-        assert_eq!(prompt_cursor(true, 0), (2, 2));
-        assert_eq!(prompt_cursor(true, 2), (2, 4));
+        assert_eq!(prompt_cursor(true, 0), (2, 3));
+        assert_eq!(prompt_cursor(true, 2), (2, 5));
     }
 
     #[test]
     fn an_out_of_range_selection_keeps_the_cursor_on_the_last_choice() {
-        assert_eq!(prompt_cursor(false, usize::MAX), (2, 3));
+        assert_eq!(prompt_cursor(false, usize::MAX), (2, 4));
     }
 
     #[test]
     fn a_queue_deeper_than_one_says_how_many_are_waiting() {
-        let lines = prompt("run bash", None, 0, 3);
+        let lines = prompt("run bash", None, 0, 3, Duration::from_secs(300));
         assert!(text(lines.last().expect("a tail row")).contains("2 more waiting"));
+    }
+
+    #[test]
+    fn the_prompt_states_when_permission_expires() {
+        let lines = prompt("run bash", None, 0, 1, Duration::from_secs(300));
+        assert_eq!(text(&lines[1]), "  expires in 5m00s");
+    }
+
+    #[test]
+    fn expiry_removes_only_the_correlated_request() {
+        let mut approval = Approval::default();
+        approval.pending.push_back(Pending {
+            id: RequestId::Number(1),
+            title: "first".to_string(),
+            detail: None,
+        });
+        approval.pending.push_back(Pending {
+            id: RequestId::Number(2),
+            title: "second".to_string(),
+            detail: None,
+        });
+        approval.selected = 2;
+
+        assert_eq!(
+            approval.take_expired(&RequestId::Number(1)),
+            Some(("first".to_string(), true))
+        );
+        assert_eq!(approval.selected, 0);
+        assert_eq!(approval.pending.len(), 1);
+        assert_eq!(
+            approval
+                .pending
+                .front()
+                .map(|pending| pending.title.as_str()),
+            Some("second")
+        );
+        assert!(approval.take_expired(&RequestId::Number(1)).is_none());
     }
 
     #[test]

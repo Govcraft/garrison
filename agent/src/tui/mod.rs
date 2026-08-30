@@ -87,6 +87,10 @@ pub async fn run(
             &acp::NewSessionRequest::new(cwd.clone()),
         )
         .await?;
+    let status: acp::GarrisonStatus = client
+        .request(acp::ext::STATUS, &serde_json::json!({}))
+        .await?;
+    let approval_timeout = std::time::Duration::from_secs(status.policy.approval_timeout_secs);
 
     let (writer, events) = client.split();
     let (exit, watching) = watch::channel(false);
@@ -101,7 +105,7 @@ pub async fn run(
     let transcript = transcript::Transcript::start(&mut runtime).await;
     let status = status::Status::start(&mut runtime).await;
     let composer = composer::Composer::start(&mut runtime).await;
-    let approval = approval::Approval::start(&mut runtime, approve_all).await;
+    let approval = approval::Approval::start(&mut runtime, approve_all, approval_timeout).await;
     let router = input::Router::start(&mut runtime).await;
     let session =
         session::Session::start(&mut runtime, writer, opened.session_id, cwd, exit.clone()).await;

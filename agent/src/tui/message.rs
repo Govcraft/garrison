@@ -211,6 +211,13 @@ pub struct PermissionAsked {
     pub request: Box<acp::RequestPermissionRequest>,
 }
 
+/// The visible lifetime of a permission request elapsed without an answer.
+#[acton_message]
+pub struct PermissionExpired {
+    /// The request to remove if it is still pending.
+    pub id: RequestId,
+}
+
 /// A permission was answered.
 #[acton_message]
 pub struct PermissionAnswered {
