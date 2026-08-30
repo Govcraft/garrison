@@ -188,10 +188,10 @@ class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
         body{padding:0;color:var(--vscode-foreground);font:var(--vscode-font-size)/1.5 var(--vscode-font-family)}
         #messages{padding:12px 12px calc(var(--composer-height, 130px) + 12px);display:flex;flex-direction:column;gap:12px}
         .message{white-space:pre-wrap;overflow-wrap:anywhere}.user{background:var(--vscode-input-background);padding:8px 10px;border-radius:6px}
-        .agent{border-left:2px solid var(--vscode-focusBorder);padding-left:10px}.error{color:var(--vscode-errorForeground)}
-        .tool{font-size:.9em;color:var(--vscode-descriptionForeground);padding:5px 8px;border:1px solid var(--vscode-widget-border);border-radius:4px}
-        #composer{position:fixed;bottom:0;left:0;right:0;padding:10px;background:var(--vscode-sideBar-background);border-top:1px solid var(--vscode-widget-border)}
-        textarea{box-sizing:border-box;width:100%;min-height:64px;resize:vertical;color:var(--vscode-input-foreground);background:var(--vscode-input-background);border:1px solid var(--vscode-input-border);padding:7px}
+        .agent{border-left:2px solid var(--vscode-focusBorder,currentColor);padding-left:10px}.error{color:var(--vscode-errorForeground)}
+        .tool{font-size:.9em;color:var(--vscode-descriptionForeground);padding:5px 8px;border:1px solid var(--vscode-widget-border,currentColor);border-radius:4px}
+        #composer{position:fixed;bottom:0;left:0;right:0;padding:10px;background:var(--vscode-sideBar-background);border-top:1px solid var(--vscode-widget-border,currentColor)}
+        textarea{box-sizing:border-box;width:100%;min-height:64px;resize:vertical;color:var(--vscode-input-foreground);background:var(--vscode-input-background);border:1px solid var(--vscode-input-border,currentColor);padding:7px}
         .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
         .actions{display:flex;justify-content:flex-end;gap:6px;margin-top:6px}button{color:var(--vscode-button-foreground);background:var(--vscode-button-background);border:0;padding:5px 12px}button:disabled{opacity:.5}
       </style></head><body><main><div id="messages" role="log" aria-live="polite" aria-relevant="additions text" aria-busy="false"></div></main><form id="composer" aria-label="Message Garrison"><label class="sr-only" for="input">Message Garrison</label><textarea id="input" placeholder="Ask Garrison…"></textarea><div class="actions"><button id="cancel" type="button" hidden>Cancel</button><button id="send" type="submit">Send</button></div></form>
