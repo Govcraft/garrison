@@ -225,9 +225,11 @@ final class GarrisonToolWindow implements Disposable, GarrisonConnection.Listene
     private void report(Throwable error) {
         Throwable cause = error instanceof ExecutionException && error.getCause() != null ? error.getCause() : error;
         String message = cause.getMessage();
-        announce("Garrison error: " + (message == null || message.isBlank() ? "The operation failed." : message), true);
+        if (message == null || message.isBlank()) message = "The operation failed. See the IDE log for details.";
+        announce("Garrison error: " + message, true);
+        String description = message;
         ApplicationManager.getApplication().invokeLater(() ->
-                Messages.showErrorDialog(project, message, "Garrison"));
+                Messages.showErrorDialog(project, description, "Garrison Error"));
     }
 
     private static String value(JsonObject object, String name, String fallback) {

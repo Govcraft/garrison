@@ -1,6 +1,7 @@
 package com.govcraft.garrison;
 
 import com.intellij.openapi.options.Configurable;
+import com.intellij.openapi.options.ConfigurationException;
 import com.intellij.ui.components.JBCheckBox;
 import com.intellij.ui.components.JBTextField;
 import com.intellij.util.ui.FormBuilder;
@@ -50,31 +51,38 @@ public final class GarrisonConfigurable implements Configurable {
                 || !Objects.equals(socket.getText(), state.socket)
                 || !Objects.equals(configPath.getText(), state.configPath)
                 || inlineCompletionEnabled.isSelected() != state.inlineCompletionEnabled
-                || debounceMs() != state.inlineCompletionDebounceMs;
+                || debounceMsOrNull() == null
+                || debounceMsOrNull() != state.inlineCompletionDebounceMs;
     }
 
     @Override
-    public void apply() {
+    public void apply() throws ConfigurationException {
+        Integer debounceMs = debounceMsOrNull();
+        if (debounceMs == null) {
+            throw new ConfigurationException(
+                    "Enter a whole number from 0 through 5000 milliseconds.",
+                    "Invalid inline completion delay");
+        }
         var state = GarrisonSettings.getInstance().getState();
         state.agentPath = agentPath.getText().trim();
         state.socket = socket.getText().trim();
         state.configPath = configPath.getText().trim();
         state.inlineCompletionEnabled = inlineCompletionEnabled.isSelected();
-        state.inlineCompletionDebounceMs = debounceMs();
+        state.inlineCompletionDebounceMs = debounceMs;
     }
 
     /**
      * The delay field as a number the provider can use.
      *
-     * <p>Anything unparseable falls back to the default rather than being
-     * rejected: a settings page that refuses to close because of a typo in an
-     * optional tuning knob is worse than one that ignores it.
+     * <p>An invalid value stays visible so {@link #apply()} can identify it to
+     * the user instead of silently saving a different value.
      */
-    private int debounceMs() {
+    private Integer debounceMsOrNull() {
         try {
-            return Math.clamp(Integer.parseInt(inlineCompletionDebounceMs.getText().trim()), 0, 5000);
+            int value = Integer.parseInt(inlineCompletionDebounceMs.getText().trim());
+            return value >= 0 && value <= 5000 ? value : null;
         } catch (NumberFormatException ignored) {
-            return 250;
+            return null;
         }
     }
 
