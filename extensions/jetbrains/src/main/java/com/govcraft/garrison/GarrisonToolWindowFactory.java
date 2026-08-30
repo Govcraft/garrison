@@ -11,6 +11,7 @@ public final class GarrisonToolWindowFactory implements ToolWindowFactory, DumbA
     @Override
     public void createToolWindowContent(@NotNull Project project, @NotNull ToolWindow toolWindow) {
         var panel = new GarrisonToolWindow(project);
+        GarrisonActions.register(project, panel);
         var content = ContentFactory.getInstance().createContent(panel.component(), "", false);
         content.setDisposer(panel);
         toolWindow.getContentManager().addContent(content);

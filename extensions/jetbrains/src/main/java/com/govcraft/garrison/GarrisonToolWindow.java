@@ -80,7 +80,7 @@ final class GarrisonToolWindow implements Disposable, GarrisonConnection.Listene
 
     JComponent component() { return root; }
 
-    private void sendPrompt() {
+    void sendPrompt() {
         String text = input.getText().trim();
         if (text.isEmpty() || busy) return;
         input.setText("");
@@ -150,7 +150,7 @@ final class GarrisonToolWindow implements Disposable, GarrisonConnection.Listene
         });
     }
 
-    private void cancelTurn() {
+    void cancelTurn() {
         if (!busy || !connection.hasSession()) return;
         var params = new JsonObject();
         try { params.addProperty("sessionId", connection.session()); }
@@ -160,13 +160,13 @@ final class GarrisonToolWindow implements Disposable, GarrisonConnection.Listene
         pendingApprovals.clear();
     }
 
-    private void newSession() {
+    void newSession() {
         cancelTurn();
         connection.resetSession();
         ApplicationManager.getApplication().invokeLater(() -> transcript.setText(""));
     }
 
-    private void showStatus() {
+    void showStatus() {
         worker.submit(() -> {
             try {
                 var status = connection.request("_garrison/status", new JsonObject()).get();
@@ -239,6 +239,7 @@ final class GarrisonToolWindow implements Disposable, GarrisonConnection.Listene
         // closing it here would kill the agent that inline completion is still
         // using after the tool window is closed.
         connection.setListener(null);
+        GarrisonActions.unregister(project, this);
         worker.shutdownNow();
     }
 }

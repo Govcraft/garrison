@@ -22,4 +22,15 @@
         <inline.completion.provider
                 implementation="com.govcraft.garrison.GarrisonInlineCompletionProvider"/>
     </extensions>
+
+    <actions>
+        <action id="Garrison.Send" class="com.govcraft.garrison.GarrisonActions$Send"
+                text="Garrison: Send Prompt" description="Send the current Garrison prompt"/>
+        <action id="Garrison.Cancel" class="com.govcraft.garrison.GarrisonActions$Cancel"
+                text="Garrison: Cancel Turn" description="Cancel the active Garrison turn"/>
+        <action id="Garrison.NewSession" class="com.govcraft.garrison.GarrisonActions$NewSession"
+                text="Garrison: New Session" description="Clear the transcript and start a new Garrison session"/>
+        <action id="Garrison.ShowStatus" class="com.govcraft.garrison.GarrisonActions$ShowStatus"
+                text="Garrison: Show Governance Status" description="Show the current Garrison governance status"/>
+    </actions>
 </idea-plugin>
