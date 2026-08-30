@@ -177,6 +177,14 @@ pub struct AgentInstallRow {
     pub organization: String,
     #[serde(default)]
     pub status: String,
+    /// The `Operator` row this machine belongs to.
+    ///
+    /// Read by the audit ingest, which attributes every shipped entry from
+    /// here rather than from anything the daemon sent. Optional in the struct
+    /// and required in the schema: a row this bearer can see but not fully
+    /// read should narrow what the hook may conclude, not crash it.
+    #[serde(default)]
+    pub operator: Option<String>,
 }
 
 fn yes() -> bool {
@@ -521,6 +529,115 @@ impl Plane {
             }
         }
         Ok(endpoints)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Audit shipping. Additive: the row types and lookups the verifying ingest and
+// the liveness sweep read, in their own `impl` block so this file stays easy
+// to merge.
+// ---------------------------------------------------------------------------
+
+/// The daemon's own claim about one trail.
+///
+/// Written by the install's operator bearer, so nothing on it is evidence.
+/// The ingest reads `install` from here rather than from the row the client
+/// sent, which is what makes shipping into somebody else's trail detectable.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AuditTrailRow {
+    pub id: String,
+    pub trail_id: String,
+    pub install: String,
+    pub organization: String,
+    #[serde(default)]
+    pub local_head_seq: i64,
+    #[serde(default)]
+    pub local_head_hash: Option<String>,
+    #[serde(default)]
+    pub shipped_through: i64,
+    #[serde(default)]
+    pub reported_at: Option<String>,
+    #[serde(default)]
+    pub halted_reason: Option<String>,
+}
+
+/// What the plane has verified about one trail.
+///
+/// The install cannot write this row at all. Its disagreement with the
+/// matching [`AuditTrailRow`] over time is the whole liveness signal.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AuditChainRow {
+    pub id: String,
+    pub trail_id: String,
+    pub trail: String,
+    pub organization: String,
+    pub install: String,
+    #[serde(default)]
+    pub head_hash: String,
+    #[serde(default)]
+    pub head_seq: i64,
+    #[serde(default)]
+    pub verified_through: i64,
+    #[serde(default)]
+    pub integrity: String,
+    #[serde(default)]
+    pub finding: Option<String>,
+    #[serde(default)]
+    pub last_entry_at: Option<String>,
+}
+
+/// One already-ingested entry, in the fields that resolve a re-send.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AuditEventRow {
+    pub id: String,
+    pub trail: String,
+    pub chain_seq: i64,
+    pub entry_hash: String,
+    #[serde(default)]
+    pub prev_hash: String,
+}
+
+impl Plane {
+    /// Fetch one trail by row id.
+    ///
+    /// The hook is handed `trail` as a row id, already resolved by the forge
+    /// from the relation the client set, so this is a `get` rather than a
+    /// lookup by `trail_id`.
+    pub async fn audit_trail(&self, id: &str) -> Result<Option<AuditTrailRow>, PlaneError> {
+        self.get("AuditTrail", id).await
+    }
+
+    /// Find the chain for a trail by the trail's own identity.
+    ///
+    /// Keyed on `trail_id` rather than the relation because `trail_id` is the
+    /// unique column: one chain per trail is a constraint the database holds,
+    /// not a convention the hook maintains.
+    pub async fn audit_chain(&self, trail_id: &str) -> Result<Option<AuditChainRow>, PlaneError> {
+        self.first("AuditChain", &equals("trail_id", trail_id))
+            .await
+    }
+
+    /// Find an already-ingested entry by its hash.
+    ///
+    /// `entry_hash` is unique, so this answers the one question a re-sent
+    /// entry raises: is this the same entry arriving twice, or a different
+    /// entry claiming a position the chain has already passed?
+    pub async fn audit_event_by_hash(
+        &self,
+        entry_hash: &str,
+    ) -> Result<Option<AuditEventRow>, PlaneError> {
+        self.first("AuditEvent", &equals("entry_hash", entry_hash))
+            .await
+    }
+
+    /// Every trail this bearer can see.
+    pub async fn audit_trails(&self) -> Result<Vec<AuditTrailRow>, PlaneError> {
+        self.list_all("AuditTrail", None).await
+    }
+
+    /// Every chain this bearer can see.
+    pub async fn audit_chains(&self) -> Result<Vec<AuditChainRow>, PlaneError> {
+        self.list_all("AuditChain", None).await
     }
 }
 

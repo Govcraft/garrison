@@ -38,6 +38,7 @@ unicode-width = "0.2.2"
 url = "2.5.8"
 
 [dev-dependencies]
+garrison-wire = { path = "../wire", features = ["testing"] }
 tempfile = "3.27.0"
 testcontainers = "0.28.0"
 vt100 = "0.16.2"

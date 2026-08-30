@@ -210,6 +210,8 @@ pub enum StatusPart {
     /// Boxed for the same reason [`Self::Audit`] is: it is wide, and every
     /// `StatusPart` in flight would otherwise be sized for it.
     Governance(Box<acp::GovernanceStatus>),
+    /// From the trail shipper: whether the audit is still leaving the box.
+    Shipping(acp::ShippingStatus),
 }
 
 impl Request for Describe {
@@ -1410,6 +1412,7 @@ fn own_status(context: &Dispatch) -> acp::GarrisonStatus {
         context: None,
         session_store: None,
         entitlement: None,
+        shipping: None,
     }
 }
 
@@ -1471,6 +1474,7 @@ fn assemble(
             StatusPart::Audit(audit) => status.audit = *audit,
             StatusPart::SessionStore(store) => status.session_store = Some(store),
             StatusPart::Governance(governance) => status.policy.governance = Some(*governance),
+            StatusPart::Shipping(shipping) => status.shipping = Some(shipping),
         }
     }
     status
@@ -1722,6 +1726,7 @@ mod tests {
             session_store: None,
             context: None,
             entitlement: None,
+            shipping: None,
         }
     }
 

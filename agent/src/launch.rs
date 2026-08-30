@@ -24,6 +24,7 @@ use crate::protocol::conn::ThreadDefaults;
 use crate::protocol::server::{self, ServerSetup};
 use crate::protocol::transport::{Listener, UnixListener};
 use crate::router::TurnRouter;
+use crate::shipping::{ShipperSettings, TrailShipper};
 use crate::thread::ThreadSupervisor;
 use acton_ai::facade::ActonAI;
 use acton_ai::memory::CompactionConfig;
@@ -243,6 +244,7 @@ pub async fn build_setup(
     let policy = spawn_policy(&mut runtime, config, acton_config, plane.clone(), &sandbox).await;
     let audit = spawn_audit(&mut runtime, ai, config, enrollment).await?;
     let sessions = spawn_sessions(&mut runtime, ai, config).await?;
+    let shipper = spawn_shipper(&mut runtime, ai, config, plane.as_ref(), &sandbox).await;
 
     // Ordered lists, because order is the contract: gates are asked first to
     // last and the first refusal wins; describers fill the status in sequence.
@@ -253,7 +255,9 @@ pub async fn build_setup(
     //
     // The trail is asked before the bundle. A refusal is only worth anything
     // if it was written down, so a daemon that cannot append has nothing to
-    // gain by working out what policy would have said.
+    // gain by working out what policy would have said. The shipper follows
+    // the keeper for the same reason one step further out: writing the record
+    // down is worth less if no copy of it is leaving the machine.
     let mut gates: Vec<ActorHandle> = Vec::new();
     let mut describers: Vec<ActorHandle> = vec![supervisor.clone(), router.clone()];
     describers.extend(plane.clone());
@@ -264,6 +268,10 @@ pub async fn build_setup(
     if let Some(keeper) = audit {
         gates.push(keeper.clone());
         describers.push(keeper);
+    }
+    if let Some(shipper) = shipper {
+        gates.push(shipper.clone());
+        describers.push(shipper);
     }
     gates.push(policy.clone());
     describers.push(policy.clone());
@@ -450,6 +458,124 @@ fn default_provider_name(config: &acton_ai::config::ActonAIConfig) -> Option<Str
         None if config.providers.len() == 1 => config.providers.keys().next().cloned(),
         None => None,
     }
+}
+
+/// The trail shipper, which is also a turn gate.
+///
+/// `None` on a standalone agent: no plane, nothing to ship to, and no
+/// shipping section in the status. A governed install always gets a shipper,
+/// even when `[plane.shipping] enabled = false` — it then reports itself
+/// disabled and admits every turn, because "this install does not send its
+/// audit anywhere" is an answer an auditor needs and an absent field is not
+/// one.
+///
+/// A governed install with no armed trail also gets none: [`spawn_audit`] has
+/// already refused to start in that case unless the deployment said the trail
+/// was optional, and shipping a trail that does not exist is not a thing to
+/// report an error about every five seconds.
+async fn spawn_shipper(
+    runtime: &mut ActorRuntime,
+    ai: &ActonAI,
+    config: &GarrisonConfig,
+    plane: Option<&ActorHandle>,
+    sandbox: &SandboxStatus,
+) -> Option<ActorHandle> {
+    let (Some(plane_config), Some(plane)) = (config.plane.as_ref(), plane) else {
+        return None;
+    };
+    let shipping = &plane_config.shipping;
+    if !shipping.enabled {
+        tracing::warn!(
+            "[plane.shipping] is disabled: this install records its audit trail locally and \
+             sends none of it to the control plane"
+        );
+        return Some(TrailShipper::spawn_disabled(runtime).await);
+    }
+
+    let Some(audit) = ai.audit_config() else {
+        tracing::warn!("no audit trail is armed, so there is nothing to ship to the control plane");
+        return Some(TrailShipper::spawn_disabled(runtime).await);
+    };
+    let trail_path = audit
+        .path()
+        .canonicalize()
+        .unwrap_or_else(|_| audit.path().to_path_buf());
+
+    // The identity acton-ai settled at launch and seals into every entry. A
+    // trail without one cannot be shipped: the plane keys a chain by it, and
+    // guessing would let two trails share a row.
+    let trail_id = match ai.audit_head().await {
+        Ok(head) => head.trail_id.map(|id| id.to_string()),
+        Err(error) => {
+            tracing::error!(%error, "the audit trail's identity could not be read; nothing will ship");
+            None
+        }
+    };
+    let Some(trail_id) = trail_id else {
+        tracing::error!(
+            trail = %trail_path.display(),
+            "the audit trail carries no identity, so the control plane cannot key a chain to it; \
+             nothing will ship",
+        );
+        return Some(TrailShipper::spawn_disabled(runtime).await);
+    };
+
+    let settings = ShipperSettings {
+        runtime: ai.clone(),
+        plane: plane.clone(),
+        cursor_path: crate::shipping::cursor::cursor_path(&trail_path),
+        trail_path,
+        trail_id,
+        sandbox_enabled: sandbox.enabled,
+        agent_version: env!("CARGO_PKG_VERSION").to_string(),
+        acton_ai_version: acton_ai_version(),
+        policy: shipping.policy(),
+    };
+    tracing::info!(
+        trail_id = %settings.trail_id,
+        trail = %settings.trail_path.display(),
+        "the audit trail will be shipped to the control plane",
+    );
+    Some(TrailShipper::spawn(runtime, settings).await)
+}
+
+/// The version of the crate that sealed the entries.
+///
+/// acton-ai exposes no version constant, so this reads the requirement this
+/// binary was compiled against out of its own manifest, which is compiled in
+/// rather than read at runtime. That is one string nobody has to remember to
+/// update: changing the dependency changes what the plane is told, and an
+/// auditor asking "which sealing code wrote this trail" gets an answer that
+/// cannot drift from the code.
+fn acton_ai_version() -> String {
+    declared_version(include_str!("../Cargo.toml"), "acton-ai")
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The version requirement a manifest declares for one dependency. Pure.
+///
+/// Handles both spellings Cargo accepts: `name = "1.2.3"` and
+/// `name = { version = "1.2.3", … }`. Anything else — a path-only or
+/// git-only dependency — has no version to report and answers `None`.
+fn declared_version(manifest: &str, dependency: &str) -> Option<String> {
+    let line = manifest
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with(&format!("{dependency} = ")))?;
+    let rest = line.split_once('=')?.1.trim();
+
+    let quoted = if rest.starts_with('{') {
+        rest.split_once("version")?
+            .1
+            .trim_start()
+            .strip_prefix('=')?
+    } else {
+        rest
+    };
+    let quoted = quoted.trim_start();
+    let inner = quoted.strip_prefix('"')?;
+    let end = inner.find('"')?;
+    Some(inner[..end].to_string())
 }
 
 /// The audit anchor keeper, which is also a turn gate.

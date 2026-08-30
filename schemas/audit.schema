@@ -90,7 +90,15 @@ schema AuditEvent {
     // Attribution by session is optional: a trail belongs to an install, and
     // an entry may be sealed before any session is known to the plane.
     session:       -> AgentSession
-    operator:      -> Operator required
+
+    // Resolved by the ingest hook from the install the trail belongs to,
+    // never sent by the daemon: an install that could attribute its own
+    // entries could attribute them to somebody else. Not marked `required`
+    // for the same reason Redemption.organization is not: required-field
+    // validation runs before `before_validate`, so a field the client is
+    // meant not to send cannot also be one the client must send. The binding
+    // is `required = true`, so the hook always runs and always fills it.
+    operator:      -> Operator
     install:       -> AgentInstall required
 
     // Chain position as the agent recorded it. Unique per tenant, so a

@@ -108,6 +108,30 @@ issuer = "garrison-control-plane"
 # round trip a quarter hour and makes a stolen bearer nearly worthless.
 # `ACTON_GARRISON_LIFETIME` overrides it.
 lifetime = 900
+
+# The liveness sweep. A hash chain proves nobody edited the middle of a
+# record; it proves nothing about the end of one, because a prefix of a valid
+# chain is a valid chain. So a supervised actor compares three vantage points
+# every `sweep` seconds and warns on `garrison.audit.liveness`:
+#
+#   AuditTrail   what the daemon claims: its local head, how far it shipped.
+#   AuditChain   what this service verified as entries arrived.
+#   AgentInstall whether the machine is still supposed to be running.
+#
+# A trail that has not reported in `silence` seconds is dark. A chain behind
+# its trail's local head is an install writing evidence it is not sending. A
+# gap or a recorded halt is a finding somebody has to read. A `retired`
+# install is exempt from the first two: silence from a decommissioned machine
+# is the point of decommissioning it.
+#
+# The sweep reads; it never writes. `AuditChain.integrity` is the ingest's
+# record of what it verified link by link, and a background job that could set
+# it from inference would put a guess in the same column as a proof.
+#
+# `ACTON_GARRISON_SILENCE` and `ACTON_GARRISON_SWEEP` override them. Keep
+# `sweep` under `silence`, or a dark install is reported a whole interval late.
+silence = 900
+sweep   = 300
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------

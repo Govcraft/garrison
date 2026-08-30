@@ -353,6 +353,96 @@ pub struct PlaneConfig {
     /// than the table's is ignored, and `0` means "the plane must answer for
     /// every turn".
     pub offline_grace_secs: Option<u64>,
+    /// How the audit trail reaches the plane, and when failing to reach it
+    /// stops the work.
+    ///
+    /// Present by default: a governed install that recorded everything
+    /// locally and shipped none of it would satisfy the letter of an audit
+    /// requirement and none of its purpose, since the machine that wrote the
+    /// record is the machine that could edit it.
+    pub shipping: ShippingConfig,
+}
+
+/// `[plane.shipping]`: the terms the audit trail leaves the box under.
+///
+/// Everything here is a duration or a bound; the *rule* they feed lives in
+/// [`crate::shipping::policy`] as pure functions, so the numbers can be read
+/// here and the behaviour tested there.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ShippingConfig {
+    /// Whether the trail is shipped at all.
+    ///
+    /// `false` leaves a governed install recording locally and telling the
+    /// plane nothing, which is a decision an agency may make for an
+    /// air-gapped machine and should have to make explicitly. The status says
+    /// so plainly either way.
+    pub enabled: bool,
+    /// How often the trail is checked for entries to send.
+    pub poll_interval_secs: u64,
+    /// How often the daemon files its own account of the trail, even when
+    /// nothing moved. This is what the plane's silence detection measures
+    /// against, so it is a heartbeat as much as a report.
+    pub report_interval_secs: u64,
+    /// The most entries one batch may carry.
+    pub batch: usize,
+    /// How old the oldest unshipped entry may get before turns are refused.
+    ///
+    /// A day by default: generous enough that an outage, a flight, or a
+    /// weekend offline costs nobody a turn, and short enough that an install
+    /// which has kept evidence to itself for longer is the case an auditor
+    /// asks about.
+    pub max_unshipped_age_secs: u64,
+    /// How many entries may go unshipped before turns are refused.
+    pub max_unshipped_entries: u64,
+    /// Whether a backlog past its bound refuses turns.
+    ///
+    /// A halt refuses either way. This governs only the backlog bound, and
+    /// setting it false is a deployment saying it would rather keep working
+    /// than keep the evidence moving. Default true, because that is the
+    /// posture the README claims.
+    pub fail_closed: bool,
+    /// The first delay after a failed batch, doubling to the ceiling.
+    pub backoff_base_secs: u64,
+    /// The longest that delay grows to.
+    pub backoff_ceiling_secs: u64,
+}
+
+impl Default for ShippingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            poll_interval_secs: 5,
+            report_interval_secs: 60,
+            batch: 50,
+            max_unshipped_age_secs: 86_400,
+            max_unshipped_entries: 10_000,
+            fail_closed: true,
+            backoff_base_secs: 1,
+            backoff_ceiling_secs: 300,
+        }
+    }
+}
+
+impl ShippingConfig {
+    /// The terms as the shipper reads them.
+    ///
+    /// Pure. A zero interval would spin, and a zero batch would ship nothing
+    /// forever, so both floor at one rather than being rejected: a typo in a
+    /// tuning knob must not stop a daemon that would otherwise be governed.
+    #[must_use]
+    pub fn policy(&self) -> crate::shipping::ShippingPolicy {
+        crate::shipping::ShippingPolicy {
+            poll_interval: Duration::from_secs(self.poll_interval_secs.max(1)),
+            report_interval: Duration::from_secs(self.report_interval_secs.max(1)),
+            batch: self.batch.max(1),
+            max_unshipped_age: Duration::from_secs(self.max_unshipped_age_secs),
+            max_unshipped_entries: self.max_unshipped_entries,
+            fail_closed: self.fail_closed,
+            backoff_base: Duration::from_secs(self.backoff_base_secs.max(1)),
+            backoff_ceiling: Duration::from_secs(self.backoff_ceiling_secs.max(1)),
+        }
+    }
 }
 
 impl PlaneConfig {
