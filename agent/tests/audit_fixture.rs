@@ -21,7 +21,8 @@
 //! `regenerate_the_frozen_audit_fixture` in `audit.rs`, where the daemon
 //! harness lives. Only for a break that has been decided on.
 
-use acton_ai::audit::{parse_entries, verify_chain, ChainBreakKind};
+use acton_ai::audit::{parse_entries, verify_chain, AuditEntryKind, ChainBreakKind};
+use garrison_wire::audit::kind;
 
 /// The trail as the daemon sealed it, byte for byte.
 const FIXTURE: &str = include_str!("fixtures/audit-1.0/audit.jsonl");
@@ -86,7 +87,7 @@ fn an_edited_argument_breaks_the_chain_where_it_was_edited() {
     let target = entries
         .get_mut(1)
         .expect("the fixture holds more than one entry");
-    target.arguments = serde_json::json!({ "path": "/edited/after/the/fact" });
+    target.arguments = Some(serde_json::json!({ "path": "/edited/after/the/fact" }));
 
     let broken = verify_chain(&entries).expect_err("an edited entry must not verify");
 
@@ -114,4 +115,39 @@ fn dropping_the_last_entry_is_not_detectable_from_the_chain_alone() {
     // verifies perfectly, so nothing on this machine can tell that the last
     // hour was deleted. Only a copy the machine cannot reach can, by holding
     // a head this one no longer matches. See `garrison_agent::shipping`.
+}
+
+#[test]
+fn every_entry_the_1_0_daemon_wrote_still_reads_as_a_tool_call() {
+    // 1.1 added turn entries, distinguished by a discriminator that
+    // invocation entries omit. Omission is what kept the promise above: a
+    // field present on these lines would have changed their bytes, and their
+    // bytes are their hashes. So the rule "an entry that names no kind is a
+    // tool call" is not a convenience, it is the compatibility guarantee, and
+    // it is asserted here against the trail a 1.0 daemon actually wrote.
+    let entries = parse_entries(FIXTURE).expect("the frozen trail still parses");
+
+    for entry in &entries {
+        assert!(
+            entry.entry_kind.is_none(),
+            "a 1.0 entry names no kind: sequence {}",
+            entry.sequence,
+        );
+        assert_eq!(kind(entry), AuditEntryKind::Invocation);
+        assert!(
+            entry.tool_name.is_some(),
+            "a 1.0 entry is an invocation and names its tool: sequence {}",
+            entry.sequence,
+        );
+        assert!(
+            entry.turn_outcome.is_none(),
+            "a 1.0 entry carries none of the turn fields: sequence {}",
+            entry.sequence,
+        );
+    }
+
+    assert!(
+        !FIXTURE.contains("entry_kind"),
+        "the discriminator must not appear in bytes written before it existed",
+    );
 }

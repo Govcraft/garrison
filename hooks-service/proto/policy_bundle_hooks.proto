@@ -22,14 +22,16 @@ message PolicyBundleBeforeValidateRequest {
   optional string default_approval_mode = 105;
   optional string network_egress = 106;
   optional bool allow_unsandboxed_escalation = 107;
-  optional string checksum = 108;
-  optional string published_at = 109;
-  optional string published_by = 110;
-  optional string created_at = 111;
-  repeated string command_rules = 112;
-  repeated string tool_rules = 113;
-  repeated string allowed_endpoints = 114;
-  repeated string assignments = 115;
+  optional string agents_md_discovery = 108;
+  optional string agents_md_allowed_paths = 109;
+  optional string checksum = 110;
+  optional string published_at = 111;
+  optional string published_by = 112;
+  optional string created_at = 113;
+  repeated string command_rules = 114;
+  repeated string tool_rules = 115;
+  repeated string allowed_endpoints = 116;
+  repeated string assignments = 117;
 }
 
 message PolicyBundleBeforeValidateResponse {
@@ -42,13 +44,15 @@ message PolicyBundleBeforeValidateResponse {
   optional string default_approval_mode = 105;
   optional string network_egress = 106;
   optional bool allow_unsandboxed_escalation = 107;
-  optional string checksum = 108;
-  optional string published_at = 109;
-  optional string published_by = 110;
-  optional string created_at = 111;
-  repeated string command_rules = 112;
-  repeated string tool_rules = 113;
-  repeated string allowed_endpoints = 114;
-  repeated string assignments = 115;
+  optional string agents_md_discovery = 108;
+  optional string agents_md_allowed_paths = 109;
+  optional string checksum = 110;
+  optional string published_at = 111;
+  optional string published_by = 112;
+  optional string created_at = 113;
+  repeated string command_rules = 114;
+  repeated string tool_rules = 115;
+  repeated string allowed_endpoints = 116;
+  repeated string assignments = 117;
 }
 

@@ -471,7 +471,12 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, TurnRouter>) {
                 next = actor.model.settle(Some(turn_id.clone()));
                 arm_expiry(actor, next.is_some());
             }
-            TurnLifecycle::TurnRefused => {
+            // The refused turn's id is not read here on purpose. A turn
+            // acton-ai never admitted holds no claim to release, so there is
+            // nothing to settle *on*; settling on `None` simply lets the next
+            // waiter through. The id matters to the trail, which seals it,
+            // not to the router.
+            TurnLifecycle::TurnRefused { .. } => {
                 next = actor.model.settle(None);
                 arm_expiry(actor, next.is_some());
             }

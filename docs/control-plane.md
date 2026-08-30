@@ -874,6 +874,14 @@ and `_garrison/status` carries the same list in `policy.governance.notEnforced`.
 granted rather than what was configured: a rule that requires a sandbox denies
 the call on a host where the sandbox degraded.
 
+`agents_md_discovery` and `agents_md_allowed_paths` are also enforced, unlike
+`network_egress`: they gate whether and how far `garrison-agent` searches the
+approved root for `AGENTS.md` project instructions before a turn starts. See
+[garrison-agent-design.md §1.7](garrison-agent-design.md) for the trust model
+— project instructions are untrusted content that can shape a turn and never
+widen what this bundle, the approved root, the sandbox, or the approval gate
+allow.
+
 #### What the cache does and does not buy
 
 The cache at `~/.config/garrison/bundle.json` is 0600 and re-verified against
@@ -891,7 +899,7 @@ cache buys availability, not integrity.
 | Schema | What it answers |
 |---|---|
 | `AuditTrail` | What the install says about its own trail: local head, shipped through |
-| `AuditEvent` | One entry from an install's BLAKE3 chain, the sealed line verbatim |
+| `AuditEvent` | One entry from an install's BLAKE3 chain — a turn or a tool call — the sealed line verbatim |
 | `AuditChain` | Where the plane has verified a trail's chain to, and whether it holds |
 
 The agent keeps a hash-chained JSONL trail locally; acton-ai seals every entry
@@ -917,6 +925,37 @@ proof. Every other column (`kind`, `decision`, `decider`, `outcome`,
 and may change; the verbatim entry may not. `session` is optional: a trail
 belongs to an install, and an entry can be sealed before any session is known
 to the plane. `trail` is required.
+
+`kind` says which of two things an entry is, and the distinction matters more
+than it looks. A `tool_call` row is one invocation: what ran, with what
+arguments, decided by which gate. A `turn` row is one attempted model turn,
+sealed whether or not that turn called anything. Without it the export answers
+"what did this install run" and never "what did this install ask" — a session
+where the model produced code and called no tool left no row at all, and a
+compliance regime that specifies audit logging as *user activity* would have
+been reading a trail that quietly only covered half of it.
+
+A `turn` row carries metadata and no content: `prompt_bytes`,
+`response_bytes`, `input_tokens`, `output_tokens`, `provider`, and `model`.
+The byte counts answer the user/timestamp/activity/response-length question
+without copying a prompt or an answer into a trail that leaves the workstation
+and lands in a SIEM. There is no column for prompt text; adding one would be a
+decision about retention rather than about auditing, and it is not made here.
+
+`decision` and `decider` mean the approval gate on a `tool_call` row and the
+*admission* gate on a `turn` row: a turn that ran was let through
+(`auto_approved` / `default`) and a turn that did not was refused
+(`forbidden` / `policy`), with the rendered reason in `justification`.
+Admission is a gate in exactly the sense approval is, so a turn fills the same
+columns rather than needing its own. A refused turn has no `outcome`, for the
+same reason a denied call has none: it never ran. `sandboxed` is written
+`false` on every turn row rather than inheriting the schema's `default(true)`,
+because a turn confines nothing.
+
+The ingest hook re-derives every one of those columns, turn columns included.
+An install that could set its own `kind` could file a turn as a tool call and
+vanish from a turn-level export; one that could set its own token counts could
+under-report what it spent.
 
 `AuditChain` is the plane's answer, one per trail rather than one per session.
 Only the `audit_service` role writes it. The `before_validate` hook on
@@ -1747,6 +1786,12 @@ exactly one install identity: a fleet of editor windows is one
 - **A bundle's `network_egress` and `allow_unsandboxed_escalation` are
   recorded and not enforced.** They are part of the checksum and reported in
   `_garrison/status`; no code acts on them. `ping` says so out loud.
+- **Which `AGENTS.md` files steered a turn is logged, not sealed.** The
+  daemon records the loaded files and their BLAKE3 hashes via structured
+  tracing, but the acton-ai audit chain has no field for it yet, so that
+  record is not tamper-evident the way the rest of the trail is.
+  [Govcraft/acton-ai#18](https://github.com/Govcraft/acton-ai/issues/18)
+  tracks giving it one.
 - **Schemas are unsigned.** Every command prints `schema signature
   verification is disabled (signing.mode = off)`. SchemaForge can require
   ed25519, SSH allowed-signers, or cosign-keyless signatures over `schemas/`

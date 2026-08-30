@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "acton-ai"
-version = "0.35.0"
+version = "0.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdbcb4ac30042cb345d82528804d732545e4521e20bb9a9cba803659e99ddfd7"
+checksum = "77e3170bd3121159fdc4cddb9c31619c8a1d308dd0a58144d263eb9983c17abb"
 dependencies = [
  "acton-ai-macros",
  "acton-reactive",
@@ -714,7 +714,7 @@ dependencies = [
  "bitflags 2.13.1",
  "cexpr",
  "clang-sys",
- "itertools 0.12.1",
+ "itertools 0.13.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -2227,9 +2227,11 @@ dependencies = [
  "acton-service-client",
  "agent-client-protocol-schema",
  "base64 0.23.1",
+ "blake3",
  "chrono",
  "clap",
  "crossterm",
+ "dirs",
  "ed25519-dalek 3.0.0",
  "garrison-bitbucket",
  "garrison-policy",

@@ -530,10 +530,23 @@ async fn a_conversation_survives_the_daemon_that_opened_it() {
         trail.contains(&chain_head),
         "the first daemon's head must still be in the chain the second extended",
     );
+    // One tool call and one turn apiece. The turn entries are what make a
+    // prompt-only turn visible at all, so a count that only tallied tool calls
+    // would stop noticing if they ever went missing again.
+    let kinds: Vec<String> = trail
+        .lines()
+        .map(|line| {
+            let entry: Value = serde_json::from_str(line).expect("every trail line is an entry");
+            entry["entry_kind"]
+                .as_str()
+                .unwrap_or("invocation")
+                .to_string()
+        })
+        .collect();
     assert_eq!(
-        trail.lines().count(),
-        2,
-        "one entry per tool call, across both daemons: {trail}",
+        kinds,
+        ["invocation", "turn", "invocation", "turn"],
+        "one tool call and one turn per daemon, in the order they happened: {trail}",
     );
 
     drop(client);
