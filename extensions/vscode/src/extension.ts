@@ -186,7 +186,7 @@ class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
       <meta name="viewport" content="width=device-width,initial-scale=1">
       <style>
         body{padding:0;color:var(--vscode-foreground);font:var(--vscode-font-size)/1.5 var(--vscode-font-family)}
-        #messages{padding:12px 12px 130px;display:flex;flex-direction:column;gap:12px}
+        #messages{padding:12px 12px calc(var(--composer-height, 130px) + 12px);display:flex;flex-direction:column;gap:12px}
         .message{white-space:pre-wrap;overflow-wrap:anywhere}.user{background:var(--vscode-input-background);padding:8px 10px;border-radius:6px}
         .agent{border-left:2px solid var(--vscode-focusBorder);padding-left:10px}.error{color:var(--vscode-errorForeground)}
         .tool{font-size:.9em;color:var(--vscode-descriptionForeground);padding:5px 8px;border:1px solid var(--vscode-widget-border);border-radius:4px}
@@ -200,6 +200,8 @@ class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
         const speakers={user:'You',agent:'Garrison',tool:'Tool',error:'Error'};
         const atBottom=()=>{const root=document.scrollingElement;return !root||root.scrollHeight-root.scrollTop-root.clientHeight<=2};
         const scrollToBottom=()=>window.scrollTo(0,document.body.scrollHeight);
+        const reserveComposerSpace=()=>document.documentElement.style.setProperty('--composer-height',composer.getBoundingClientRect().height+'px');
+        new ResizeObserver(reserveComposerSpace).observe(composer);reserveComposerSpace();
         const add=(kind,text)=>{const stick=atBottom(),el=document.createElement('div'),label=document.createElement('span'),content=document.createElement('span');el.className='message '+kind;if(kind==='error')el.setAttribute('role','alert');else label.className='sr-only';label.textContent=(speakers[kind]||'Message')+': ';content.textContent=text;el.append(label,content);messages.append(el);if(stick)scrollToBottom();return content};
         const submit=()=>{const text=input.value.trim();if(!text||busy)return;input.value='';vscode.postMessage({type:'prompt',text})}; composer.onsubmit=e=>{e.preventDefault();submit()}; cancel.onclick=()=>vscode.postMessage({type:'cancel'});
         input.onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();submit()}};
