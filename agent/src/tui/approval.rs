@@ -56,6 +56,12 @@ pub const CHOICES: [Choice; 3] = [
     },
 ];
 
+/// The fail-closed selection used whenever a prompt first receives focus.
+#[must_use]
+pub const fn default_selection() -> usize {
+    CHOICES.len() - 1
+}
+
 /// One request waiting for an answer.
 #[derive(Clone, Debug)]
 struct Pending {
@@ -99,6 +105,7 @@ impl Approval {
         let mut builder = runtime.new_actor::<Self>();
         builder.model.approve_all = approve_all;
         builder.model.expires_after = expires_after;
+        builder.model.selected = default_selection();
         configure(&mut builder);
         builder.start().await
     }
@@ -147,7 +154,7 @@ impl Approval {
         let was_front = position == 0;
         let expired = self.pending.remove(position)?;
         if was_front {
-            self.selected = 0;
+            self.selected = default_selection();
         }
         Some((expired.title, was_front))
     }
@@ -314,7 +321,7 @@ fn configure(builder: &mut ManagedActor<Idle, Approval>) {
             detail,
         });
         if actor.model.pending.len() == 1 {
-            actor.model.selected = 0;
+            actor.model.selected = default_selection();
         }
         let expires_after = actor.model.expires_after;
         let id = message.id.clone();
@@ -334,7 +341,7 @@ fn configure(builder: &mut ManagedActor<Idle, Approval>) {
             return repaint(actor);
         };
 
-        actor.model.selected = 0;
+        actor.model.selected = default_selection();
         answer(actor, pending.id, option, &pending.title)
     });
 
@@ -538,10 +545,17 @@ mod tests {
     }
 
     #[test]
-    fn the_highlight_starts_on_allow_once_and_cannot_run_off_either_end() {
-        let mut approval = Approval::default();
+    fn the_highlight_defaults_to_refuse_and_cannot_run_off_either_end() {
+        let mut approval = Approval {
+            selected: default_selection(),
+            ..Approval::default()
+        };
+        assert_eq!(
+            approval.press(key(KeyCode::Enter)),
+            Some(acp::OPTION_REJECT)
+        );
         approval.press(key(KeyCode::Up));
-        assert_eq!(approval.selected, 0);
+        assert_eq!(approval.selected, default_selection() - 1);
 
         for _ in 0..10 {
             approval.press(key(KeyCode::Down));
@@ -616,13 +630,13 @@ mod tests {
             title: "second".to_string(),
             detail: None,
         });
-        approval.selected = 2;
+        approval.selected = 1;
 
         assert_eq!(
             approval.take_expired(&RequestId::Number(1)),
             Some(("first".to_string(), true))
         );
-        assert_eq!(approval.selected, 0);
+        assert_eq!(approval.selected, default_selection());
         assert_eq!(approval.pending.len(), 1);
         assert_eq!(
             approval
