@@ -131,7 +131,7 @@ pub fn error_line(text: String) -> Line<'static> {
 /// A line reporting something the interface did, rather than the model.
 #[must_use]
 pub fn notice_line(text: String) -> Line<'static> {
-    Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)))
+    Line::from(Span::styled(text, Style::default().fg(Color::Gray)))
 }
 
 /// A line reporting a tool call that finished.
@@ -288,5 +288,11 @@ mod tests {
             text(&tool_line("bash".to_string(), false)),
             "✗ failed: bash"
         );
+    }
+
+    #[test]
+    fn notices_use_primary_text_contrast() {
+        let line = notice_line("turn started".to_string());
+        assert_eq!(line.spans[0].style.fg, Some(Color::Gray));
     }
 }

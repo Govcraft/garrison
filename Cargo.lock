@@ -2220,7 +2220,7 @@ dependencies = [
 
 [[package]]
 name = "garrison-agent"
-version = "1.1.7"
+version = "1.1.8"
 dependencies = [
  "acton-ai",
  "acton-reactive",

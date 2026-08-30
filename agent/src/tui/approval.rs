@@ -204,7 +204,7 @@ pub fn prompt(
     waiting: usize,
     expires_after: Duration,
 ) -> Vec<Line<'static>> {
-    let muted = Style::default().fg(Color::DarkGray);
+    let secondary = Style::default().fg(Color::Gray);
     let mut lines = vec![Line::from(vec![
         Span::styled("⚠ ".to_string(), Style::default().fg(Color::LightYellow)),
         Span::styled(
@@ -216,11 +216,11 @@ pub fn prompt(
     ])];
 
     if let Some(detail) = detail {
-        lines.push(Line::from(Span::styled(format!("  {detail}"), muted)));
+        lines.push(Line::from(Span::styled(format!("  {detail}"), secondary)));
     }
     lines.push(Line::from(Span::styled(
         format!("  expires in {}", humanize(expires_after)),
-        muted,
+        secondary,
     )));
 
     for (index, choice) in CHOICES.iter().enumerate() {
@@ -242,7 +242,7 @@ pub fn prompt(
     if waiting > 1 {
         lines.push(Line::from(Span::styled(
             format!("  {} more waiting", waiting - 1),
-            muted,
+            secondary,
         )));
     }
 
@@ -615,6 +615,7 @@ mod tests {
     fn the_prompt_states_when_permission_expires() {
         let lines = prompt("run bash", None, 0, 1, Duration::from_secs(300));
         assert_eq!(text(&lines[1]), "  expires in 5m00s");
+        assert_eq!(lines[1].spans[0].style.fg, Some(Color::Gray));
     }
 
     #[test]

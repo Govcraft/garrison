@@ -8,7 +8,7 @@ use super::message::{KeyPressed, Pasted, Quit, Region, RegionRendered, Submitted
 use super::slash;
 use acton_reactive::prelude::*;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
@@ -79,7 +79,7 @@ impl Composer {
 
                 let head = if row == 0 { prefix } else { "  " };
                 lines.push(Line::from(vec![
-                    Span::styled(head.to_string(), Style::default().fg(Color::DarkGray)),
+                    Span::styled(head.to_string(), Style::default().fg(Color::Gray)),
                     Span::raw(piece.clone()),
                 ]));
             }
@@ -89,12 +89,10 @@ impl Composer {
 
         if lines.is_empty() {
             lines.push(Line::from(vec![
-                Span::styled(PROMPT.to_string(), Style::default().fg(Color::DarkGray)),
+                Span::styled(PROMPT.to_string(), Style::default().fg(Color::Gray)),
                 Span::styled(
                     "send a message, /help for commands".to_string(),
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
+                    Style::default().fg(Color::Gray),
                 ),
             ]));
             caret = (u16::try_from(indent).unwrap_or(0), 0);
@@ -430,6 +428,14 @@ mod tests {
         let rendered = Composer::default().render(80);
         assert_eq!(rendered.lines.len(), 1);
         assert_eq!(rendered.cursor, Some((2, 0)));
+        assert!(rendered.lines[0]
+            .spans
+            .iter()
+            .all(|span| span.style.fg == Some(Color::Gray)));
+        assert!(rendered.lines[0].spans.iter().all(|span| !span
+            .style
+            .add_modifier
+            .contains(ratatui::style::Modifier::DIM)));
     }
 
     #[test]

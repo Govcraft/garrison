@@ -83,20 +83,20 @@ pub fn summary(
     tools: &BTreeMap<String, String>,
 ) -> Vec<Line<'static>> {
     let accent = Style::default().fg(Color::LightCyan);
-    let muted = Style::default().fg(Color::DarkGray);
+    let secondary = Style::default().fg(Color::Gray);
 
     let mut lines = vec![Line::from(vec![
         Span::styled(format!("{spinner} "), accent),
         Span::styled("Working".to_string(), accent.add_modifier(Modifier::BOLD)),
         Span::styled(
             format!("  ({} · Esc to interrupt)", humanize(elapsed)),
-            muted,
+            secondary,
         ),
     ])];
 
     for title in tools.values().take(MAX_DETAIL_ROWS) {
         lines.push(Line::from(vec![
-            Span::styled("  └ ".to_string(), muted),
+            Span::styled("  └ ".to_string(), secondary),
             Span::styled(title.clone(), Style::default().fg(Color::Gray)),
         ]));
     }
@@ -104,7 +104,7 @@ pub fn summary(
     if tools.len() > MAX_DETAIL_ROWS {
         lines.push(Line::from(Span::styled(
             format!("  └ and {} more", tools.len() - MAX_DETAIL_ROWS),
-            muted,
+            secondary,
         )));
     }
 
@@ -216,6 +216,7 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert!(text(&lines[0]).contains("Esc to interrupt"));
         assert!(text(&lines[0]).contains("3s"));
+        assert_eq!(lines[0].spans[2].style.fg, Some(Color::Gray));
     }
 
     #[test]
