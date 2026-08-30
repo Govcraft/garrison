@@ -139,18 +139,24 @@ stage('Garrison review') {
 }
 ```
 
-## Open questions, and the defaults in force
-
-Issue #16 raised four. Three are settled in the code; one is not.
+## The four questions #16 raised, and how each is answered
 
 1. **DC or Cloud** — Data Center. Different products with different REST
    surfaces and auth, and the on-premises posture is DC's.
-2. **Does a pipeline run consume a seat?** — **Unsettled.** Nothing in review
-   mode consumes or checks a seat today. The review is attributed to the
-   install that ran it, and seat enforcement stays where #12 puts it. This is
-   a placeholder, not a decision: charging a seat per build agent would be
-   surprising, and attributing every review to the pull request's author
-   complicates revocation. Whoever settles #12 should settle this with it.
+2. **Does a pipeline run consume a seat?** — Yes, the runner install's own,
+   and this is settled by construction rather than by a rule written for
+   review mode. `review` is a client: it connects to the daemon, opens a
+   session, and sends a prompt. That prompt is an ordinary turn, so it passes
+   the same gates every turn passes, and the seat monitor is one of them. A
+   revoked seat refuses the review with `SEAT_REFUSED` exactly as it refuses a
+   turn typed into a terminal.
+
+   The alternative was a per-review exemption, and building one would have
+   meant a path on which work reaches a model without a live seat behind it.
+   Nothing in review mode gets to be that path. The consequence worth stating
+   plainly: a build agent is a seat, so a fleet of runners is a fleet of
+   seats, and that is a licensing fact an agency should know before wiring
+   this into every repository.
 3. **Which credential?** — A short-lived bearer token from the environment.
    The install key never leaves the runner and is not used here.
 4. **What does a finding block?** — Nothing, by default. See advisory above.

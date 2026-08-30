@@ -185,6 +185,14 @@ Blocking is opt-in (`--enforce`) and off by default. Advisory also downgrades
 the comments themselves, because a Bitbucket BLOCKER comment gates a merge
 whatever the build status says.
 
+A review spends a seat, and does so by construction rather than by a rule
+written for review mode. `review` is a client: it connects to the daemon,
+opens a session, and prompts, so its turn passes the same gates as any other
+turn and the seat monitor is one of them. Building a per-review exemption
+would have meant a path on which work reaches a model with no live seat behind
+it, and review mode does not get to be that path. The consequence is a
+licensing fact rather than a design one: a build agent is a seat.
+
 A review also waits for its audit trail to be accepted by the plane before it
 exits, and exits 5 when it was not. The general shipping policy assumes the
 trail file is a durable buffer, which is true of a laptop and false of a
