@@ -131,6 +131,54 @@ enum Command {
         #[arg(long)]
         approve_all: bool,
     },
+    /// Reviews a Bitbucket pull request and reports what it found.
+    ///
+    /// The unattended mode: no terminal, no approvals, no writes. Exits 0 when
+    /// the review ran (whatever it found), 3 when `--enforce` is set and a
+    /// blocker was found, 1 when the review did not happen. That last one is
+    /// not excused by advisory mode: a run that could not read its own answer
+    /// must not report a pass.
+    ///
+    /// The Bitbucket credential is read from `GARRISON_BITBUCKET_TOKEN` and is
+    /// deliberately not a flag. A token in argv is readable by every process
+    /// on the runner and lands in the pipeline log.
+    Review {
+        /// The socket to connect to.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// The Bitbucket Data Center base URL, e.g. `https://bitbucket.agency.gov`.
+        #[arg(long)]
+        bitbucket: String,
+        /// Which pull request, as `PROJECT/REPO/ID`.
+        #[arg(long)]
+        pull_request: String,
+        /// Post findings to the pull request instead of only printing them.
+        ///
+        /// Without it the run is a dry run: it reviews, prints, and touches
+        /// nothing. That is the right default for the first time anyone points
+        /// this at a repository they care about.
+        #[arg(long)]
+        post: bool,
+        /// Let a blocker-severity finding fail the build.
+        ///
+        /// Off by default. Failing a build on a model's opinion is a strong
+        /// claim, and a team should watch the reviewer for a while before
+        /// letting it make one.
+        #[arg(long)]
+        enforce: bool,
+        /// The commit to record a build status against.
+        ///
+        /// Without it no status is posted. The pull request still gets the
+        /// comments; it just does not get a pass/fail mark.
+        #[arg(long)]
+        commit: Option<String>,
+        /// Where a human goes to read this run, recorded on the build status.
+        #[arg(long)]
+        run_url: Option<String>,
+        /// How many unchanged lines to show either side of each change.
+        #[arg(long, default_value_t = 10)]
+        context: u32,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -292,6 +340,28 @@ async fn run(cli: Cli) -> Result<(), GarrisonError> {
             message,
             approve_all,
         } => chat(socket, message, approve_all).await,
+        Command::Review {
+            socket,
+            bitbucket,
+            pull_request,
+            post,
+            enforce,
+            commit,
+            run_url,
+            context,
+        } => {
+            review(ReviewRun {
+                socket,
+                bitbucket,
+                pull_request,
+                post,
+                enforce,
+                commit,
+                run_url,
+                context,
+            })
+            .await
+        }
     }
 }
 
@@ -706,4 +776,263 @@ async fn chat(
 
     println!("\n[{:?}]", response.stop_reason);
     Ok(())
+}
+
+/// Everything one `review` invocation was told.
+///
+/// A struct rather than eight positional arguments, because a call site that
+/// reads `review(socket, url, pr, true, false, commit, None, 10)` is one
+/// transposition away from enforcing when it meant to post.
+struct ReviewRun {
+    socket: Option<PathBuf>,
+    bitbucket: String,
+    pull_request: String,
+    post: bool,
+    enforce: bool,
+    commit: Option<String>,
+    run_url: Option<String>,
+    context: u32,
+}
+
+/// The environment variable carrying the Bitbucket credential.
+///
+/// Not a flag, and not read from the config file. A flag lands in `ps` output
+/// and in the pipeline's own log of the command it ran; a config file is a
+/// standing secret on a runner that should not keep one.
+const TOKEN_VAR: &str = "GARRISON_BITBUCKET_TOKEN";
+
+/// The identity a build status is recorded under.
+///
+/// Bitbucket dedupes on this, so re-running a pipeline replaces the previous
+/// status rather than stacking another one beside it.
+const STATUS_KEY: &str = "garrison-review";
+
+/// `review`: read a pull request, say what is wrong with it, exit accordingly.
+///
+/// The order matters and is not arbitrary. The diff is fetched before the
+/// daemon is contacted, so a bad pull request reference or a rejected token
+/// fails in a second rather than after a model has been paid to read nothing.
+async fn review(run: ReviewRun) -> Result<(), GarrisonError> {
+    use garrison_agent::review::{self, Blocking};
+
+    let target = garrison_bitbucket::PullRequest::parse(&run.pull_request)
+        .map_err(|reason| GarrisonError::configuration("--pull-request", reason))?;
+
+    let token = std::env::var(TOKEN_VAR).map_err(|_| {
+        GarrisonError::configuration(
+            TOKEN_VAR,
+            "no Bitbucket credential in the environment; review mode reads one \
+             from this variable rather than a flag, so it cannot leak into the \
+             pipeline log",
+        )
+    })?;
+
+    let bitbucket = garrison_bitbucket::Client::new(
+        &run.bitbucket,
+        garrison_bitbucket::Credentials::Bearer(token),
+    )
+    .map_err(|error| GarrisonError::configuration("--bitbucket", error.to_string()))?;
+
+    let blocking = if run.enforce {
+        Blocking::Enforcing
+    } else {
+        Blocking::Advisory
+    };
+
+    let files = bitbucket
+        .pull_request_diff(&target, run.context)
+        .await
+        .map_err(|error| GarrisonError::runtime(format!("could not read the diff: {error}")))?;
+
+    let withheld = files.iter().filter(|file| file.truncated).count();
+    println!(
+        "reviewing {} ({} file(s){})",
+        run.pull_request,
+        files.len(),
+        if withheld == 0 {
+            String::new()
+        } else {
+            // Said up front, because a run that reviewed nine of ten files
+            // must not be read as having reviewed the pull request.
+            format!(", {withheld} withheld by the server and not reviewed")
+        }
+    );
+
+    let outcome = if files.is_empty() {
+        // Nothing to look at is not the same as nothing wrong, but it is not a
+        // failure either: a pull request can legitimately change no files.
+        println!("the diff is empty; there is nothing to review");
+        review::Outcome::Clean
+    } else {
+        let answer = ask(&run, &files).await?;
+        let parsed = review::parse_findings(&answer);
+        let outcome = review::decide(&parsed, blocking);
+
+        report(&parsed, &files, blocking, run.post);
+        if run.post {
+            publish(&bitbucket, &target, parsed.findings(), &files, blocking).await;
+        }
+        outcome
+    };
+
+    if let (Some(commit), true) = (run.commit.as_ref(), run.post) {
+        // A status is only posted when posting is on. A dry run that marked
+        // the pull request would not be a dry run.
+        let status = garrison_bitbucket::BuildStatus {
+            key: STATUS_KEY.to_string(),
+            state: outcome.build_state(),
+            url: run
+                .run_url
+                .clone()
+                .unwrap_or_else(|| "https://garrison.local/review".to_string()),
+            name: "Garrison review".to_string(),
+            description: outcome.description(),
+        };
+        if let Err(error) = bitbucket.set_build_status(commit, &status).await {
+            // Not fatal on its own: the comments already landed, and losing
+            // the status should not turn a completed review into a failed run.
+            eprintln!("the build status could not be recorded: {error}");
+        }
+    }
+
+    println!("\n{}", outcome.description());
+
+    match outcome {
+        review::Outcome::Clean | review::Outcome::Advised { .. } => Ok(()),
+        review::Outcome::Blocked { .. } => {
+            Err(GarrisonError::review_blocked(outcome.description()))
+        }
+        review::Outcome::Failed { reason } => Err(GarrisonError::turn_failed(reason)),
+    }
+}
+
+/// Runs the one turn that does the reviewing.
+///
+/// Uses the default [`Interactions`] implementation, which refuses every
+/// permission request. That is review mode's whole posture and it is inherited
+/// rather than configured: there is no flag here that could turn it off.
+async fn ask(
+    run: &ReviewRun,
+    files: &[garrison_bitbucket::ChangedFile],
+) -> Result<String, GarrisonError> {
+    use garrison_agent::review::ReviewFile;
+
+    let reviewable: Vec<ReviewFile> = files
+        .iter()
+        .map(|file| ReviewFile {
+            path: file.path.clone(),
+            text: file.destination_text(),
+            truncated: file.truncated,
+        })
+        .collect();
+
+    let prompt = garrison_agent::review::build_prompt(&reviewable);
+
+    let (server, path) = client_target(run.socket.clone(), None)?;
+    let stream = daemon::connect_or_start(&server, &path).await?;
+    let mut client = AgentClient::from_stream(stream);
+    client.initialize("garrison-agent review").await?;
+
+    let cwd = std::env::current_dir()
+        .map_err(|error| GarrisonError::runtime(format!("no working directory: {error}")))?;
+    let session = client.new_session(cwd).await?;
+
+    let mut collected = Answer::default();
+    client
+        .prompt(session.session_id, &prompt, &mut collected)
+        .await?;
+    Ok(collected.text)
+}
+
+/// Accumulates the model's answer, and refuses everything else.
+///
+/// The refusal is not implemented here: it is [`Interactions`]'s default, and
+/// inheriting it rather than writing one is deliberate. A hand-written
+/// `permission` in review mode would be a place where someone could later add
+/// an exception.
+#[derive(Default)]
+struct Answer {
+    text: String,
+}
+
+impl Interactions for Answer {
+    fn update(&mut self, notification: &acp::SessionNotification) {
+        if let Some(chunk) = update_text(notification) {
+            self.text.push_str(chunk);
+        }
+    }
+}
+
+/// Prints what was found, whether or not it is being posted.
+///
+/// A pipeline log is the only place some of this is ever read, so it carries
+/// the same information the comments would.
+fn report(
+    review: &garrison_agent::review::Review,
+    files: &[garrison_bitbucket::ChangedFile],
+    blocking: garrison_agent::review::Blocking,
+    posting: bool,
+) {
+    let placed = garrison_agent::review::place(review.findings(), files, blocking);
+
+    for (finding, placement) in review.findings().iter().zip(&placed) {
+        let where_ = if placement.anchored {
+            format!("{}:{}", finding.file, finding.line)
+        } else {
+            format!("{} (could not be anchored)", finding.file)
+        };
+        println!(
+            "  [{}] {where_} — {}",
+            finding.severity.as_str(),
+            finding.message
+        );
+    }
+
+    let unanchored = placed.iter().filter(|entry| !entry.anchored).count();
+    if unanchored > 0 {
+        // Worth saying out loud: a review where several findings would not
+        // anchor is one whose line numbers should be distrusted.
+        println!(
+            "\n{unanchored} finding(s) named a line not present in the diff and \
+             will appear on the pull request rather than inline"
+        );
+    }
+
+    if !posting && !review.findings().is_empty() {
+        println!("\n(dry run: nothing was posted; pass --post to send these)");
+    }
+}
+
+/// Sends the comments, one at a time, surviving individual refusals.
+async fn publish(
+    bitbucket: &garrison_bitbucket::Client,
+    target: &garrison_bitbucket::PullRequest,
+    findings: &[garrison_agent::review::Finding],
+    files: &[garrison_bitbucket::ChangedFile],
+    blocking: garrison_agent::review::Blocking,
+) {
+    let placed = garrison_agent::review::place(findings, files, blocking);
+    let mut posted = 0_usize;
+    let mut refused = 0_usize;
+
+    for entry in &placed {
+        match bitbucket.post_comment(target, &entry.comment).await {
+            Ok(()) => posted += 1,
+            Err(error) if error.is_fatal() => {
+                // The credential died mid-run. Every later call uses it too,
+                // so continuing would post nothing and take a minute doing so.
+                eprintln!("posting stopped: {error}");
+                break;
+            }
+            Err(error) => {
+                refused += 1;
+                eprintln!("one comment was refused and the rest continue: {error}");
+            }
+        }
+    }
+
+    println!("\nposted {posted} comment(s)");
+    if refused > 0 {
+        println!("{refused} were refused by Bitbucket and are above in this log");
+    }
 }

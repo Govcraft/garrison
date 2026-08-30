@@ -156,9 +156,27 @@ Dedicated prompts (`review_request.rs`, `review_exit.rs`) and prompt rules:
 findings first, ordered by severity, file:line references, explicit "no
 findings" statement. Review is a *mode*, not a vibe.
 
-→ **Planned:** `garrison review` — and this is the Bitbucket DC integration
-point (RFQ §3.A.2 "pull-request-level AI review is strongly desired"): fetch
-PR diff via Bitbucket DC REST, run review mode, post findings as PR comments.
+→ **Implemented:** `garrison-agent review` fetches a pull request diff via
+Bitbucket DC REST, runs the review prompt, and posts findings as inline PR
+comments with a build status on the commit (RFQ §3.A.2, "pull-request-level AI
+review is strongly desired"). See `docs/review-mode.md`.
+
+Three things make it a mode rather than a prompt, and all three are enforced
+rather than requested of the model. It writes nothing: every tool call is
+refused, because a pipeline has nobody to answer a permission prompt and
+auto-approval would be the opposite of what Garrison claims. Its output has a
+shape, JSON with a file and a line, because prose cannot be anchored to a
+line. And it distinguishes "nothing wrong" from "nobody looked": an answer
+that does not parse exits 1 rather than reporting a clean review, since the
+alternative is a green check on code nobody read.
+
+Blocking is opt-in (`--enforce`) and off by default. Advisory also downgrades
+the comments themselves, because a Bitbucket BLOCKER comment gates a merge
+whatever the build status says.
+
+**Not** covered: audit shipping from an ephemeral runner (#8), which is a hard
+dependency for CI evidence and is not built. A review run in a container
+currently leaves its trail only where the container kept it.
 
 ### 1.11 Model-specific coding prompts
 Codex ships per-model system prompts (~80 focused lines) plus
@@ -262,8 +280,10 @@ client identity.
 7. **Integrate acton-ai capabilities:** persistent ACP sessions/checkpoints
    (~~compaction configuration and ACP plan events~~: implemented, see
    section 6)
-8. **Review mode + PTY unified exec**
-9. **Bitbucket DC PR review** (review mode over REST API)
+8. **Review mode + PTY unified exec** — review mode implemented; PTY unified
+   exec remains
+9. ~~**Bitbucket DC PR review** (review mode over REST API)~~ — implemented,
+   less audit shipping from an ephemeral runner (#8)
 
 Items 3–6 are the current agent-critical path. Control-plane, extension, and
 compliance work is tracked separately from this agent implementation plan.

@@ -19,6 +19,7 @@ pub mod patch;
 pub mod plane;
 pub mod policy;
 pub mod protocol;
+pub mod review;
 pub mod router;
 pub mod session;
 pub mod shipping;

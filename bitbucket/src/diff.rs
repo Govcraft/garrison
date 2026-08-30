@@ -129,18 +129,45 @@ impl ChangedFile {
     #[must_use]
     pub fn destination_text(&self) -> String {
         let mut out = String::new();
-        for hunk in &self.hunks {
-            for segment in &hunk.segments {
-                if segment.kind == "REMOVED" {
-                    continue;
-                }
-                for entry in &segment.lines {
-                    out.push_str(&entry.line);
-                    out.push('\n');
-                }
-            }
+        for entry in self.destination_lines() {
+            out.push_str(&entry.line);
+            out.push('\n');
         }
         out
+    }
+
+    /// The lines [`destination_text`](Self::destination_text) renders, in the
+    /// order it renders them.
+    ///
+    /// The single source of truth for that order. Both the text a reviewer is
+    /// shown and the line numbers a finding is resolved against are built from
+    /// this one walk, so they cannot disagree about which line is which.
+    fn destination_lines(&self) -> impl Iterator<Item = &Line> {
+        self.hunks
+            .iter()
+            .flat_map(|hunk| &hunk.segments)
+            .filter(|segment| segment.kind != "REMOVED")
+            .flat_map(|segment| &segment.lines)
+    }
+
+    /// The real destination line number for the `position`-th line of
+    /// [`destination_text`](Self::destination_text), counting from 1.
+    ///
+    /// A review prompt shows the destination text with its own margin, because
+    /// asking a model to count lines is asking it to be wrong. That margin is
+    /// *not* the file's line numbering: the text is only the changed regions,
+    /// so margin 3 might be line 118. This converts one to the other.
+    ///
+    /// Returns `None` when `position` is outside what was shown, which is a
+    /// model naming a line it was not given. That is a refusal rather than a
+    /// clamp: pinning an out-of-range finding to the nearest real line would
+    /// put a confident comment next to unrelated code.
+    #[must_use]
+    pub fn destination_line_at(&self, position: usize) -> Option<u64> {
+        position
+            .checked_sub(1)
+            .and_then(|index| self.destination_lines().nth(index))
+            .map(|entry| entry.destination)
     }
 }
 
@@ -281,6 +308,47 @@ mod tests {
             !text.contains("let x = 1;"),
             "a removed line is not in the destination: {text}"
         );
+    }
+
+    #[test]
+    fn a_margin_position_resolves_to_the_real_destination_line() {
+        // The rendered text is context(9), added(10), added(11), context(12).
+        // So margin 1 is line 9 and margin 4 is line 12 — the margin and the
+        // file's numbering are different things, which is the whole point.
+        let file = changed();
+        assert_eq!(file.destination_line_at(1), Some(9));
+        assert_eq!(file.destination_line_at(2), Some(10));
+        assert_eq!(file.destination_line_at(4), Some(12));
+    }
+
+    #[test]
+    fn the_margin_and_the_rendered_text_never_disagree() {
+        // Both are built from one walk. This asserts the property directly,
+        // because a future edit to either could silently break anchoring and
+        // nothing else would notice.
+        let file = changed();
+        let text = file.destination_text();
+        let rendered: Vec<&str> = text.lines().collect();
+        for (index, text) in rendered.iter().enumerate() {
+            let position = index + 1;
+            let line = file
+                .destination_line_at(position)
+                .expect("every rendered line resolves");
+            let anchor = Anchor::for_line(&file, line).expect("and anchors");
+            assert_eq!(
+                anchor.line, line,
+                "margin {position} ({text}) resolved to a line that does not anchor back"
+            );
+        }
+    }
+
+    #[test]
+    fn a_margin_position_outside_the_shown_text_resolves_to_nothing() {
+        // A model naming line 99 of a four-line excerpt. Clamping this to the
+        // last real line would post a confident finding onto unrelated code.
+        let file = changed();
+        assert_eq!(file.destination_line_at(99), None);
+        assert_eq!(file.destination_line_at(0), None, "the margin starts at 1");
     }
 
     #[test]

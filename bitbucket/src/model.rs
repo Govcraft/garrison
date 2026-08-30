@@ -26,6 +26,39 @@ impl PullRequest {
             self.project, self.repository, self.id
         )
     }
+
+    /// Reads a `PROJECT/REPO/ID` reference, as a pipeline would pass one.
+    ///
+    /// # Errors
+    ///
+    /// A message naming what was wrong, for a pipeline log. A malformed
+    /// reference is a configuration mistake and gets caught here rather than
+    /// becoming a 404 later, because a 404 from Bitbucket does not distinguish
+    /// "you typed the slug wrong" from "this token cannot see that repository"
+    /// and an operator would chase the wrong one.
+    pub fn parse(reference: &str) -> Result<Self, String> {
+        let parts: Vec<&str> = reference.split('/').collect();
+        let [project, repository, id] = parts.as_slice() else {
+            return Err(format!(
+                "expected PROJECT/REPO/ID, got {reference:?} with {} part(s)",
+                parts.len()
+            ));
+        };
+
+        if project.is_empty() || repository.is_empty() {
+            return Err(format!("expected PROJECT/REPO/ID, got {reference:?}"));
+        }
+
+        let id = id
+            .parse()
+            .map_err(|_| format!("the pull request id must be a number, got {id:?}"))?;
+
+        Ok(Self {
+            project: (*project).to_string(),
+            repository: (*repository).to_string(),
+            id,
+        })
+    }
 }
 
 /// How seriously a reviewer means a finding.
@@ -114,6 +147,37 @@ mod tests {
             id: 1,
         };
         assert!(pr.path().starts_with("projects/agency/"));
+    }
+
+    #[test]
+    fn a_reference_a_pipeline_would_pass_parses() {
+        let pr = PullRequest::parse("AGENCY/benefits-portal/42").unwrap();
+        assert_eq!(pr.project, "AGENCY");
+        assert_eq!(pr.repository, "benefits-portal");
+        assert_eq!(pr.id, 42);
+    }
+
+    #[test]
+    fn a_reference_with_the_wrong_number_of_parts_is_refused_by_name() {
+        // Caught here rather than becoming a 404, which would not distinguish
+        // a typo from a permission problem.
+        for bad in ["AGENCY/42", "AGENCY/repo/42/extra", "AGENCY"] {
+            let error = PullRequest::parse(bad).expect_err("{bad} should not parse");
+            assert!(error.contains("PROJECT/REPO/ID"), "{bad}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_non_numeric_id_says_so_rather_than_saying_the_shape_is_wrong() {
+        let error = PullRequest::parse("AGENCY/repo/main").expect_err("not a number");
+        assert!(error.contains("must be a number"), "{error}");
+    }
+
+    #[test]
+    fn an_empty_project_or_repository_is_refused() {
+        // "/repo/1" would otherwise build a URL with a doubled slash and 404.
+        assert!(PullRequest::parse("/repo/1").is_err());
+        assert!(PullRequest::parse("AGENCY//1").is_err());
     }
 
     #[test]

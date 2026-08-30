@@ -2194,6 +2194,7 @@ dependencies = [
  "clap",
  "crossterm",
  "ed25519-dalek 3.0.0",
+ "garrison-bitbucket",
  "garrison-policy",
  "garrison-wire",
  "getrandom 0.4.3",
