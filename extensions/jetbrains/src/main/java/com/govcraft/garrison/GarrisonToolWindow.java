@@ -46,6 +46,8 @@ final class GarrisonToolWindow implements Disposable, GarrisonConnection.Listene
         this.connection.setListener(this);
         transcript.setEditable(false);
         transcript.setContentType("text/plain");
+        input.setLineWrap(true);
+        input.setWrapStyleWord(true);
         var scroll = new JBScrollPane(transcript);
         scroll.setBorder(JBUI.Borders.empty());
 
