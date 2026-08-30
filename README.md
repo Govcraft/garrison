@@ -244,11 +244,11 @@ waits for the append to reach disk and refuses further non-idempotent work after
 an audit failure. An anchor stored outside the trail detects deletion of its
 tail, which the chain alone cannot detect.
 
-One gap remains: a turn that Garrison's own admission gates refuse — a lapsed
-seat, an unreachable plane, a full shipping backlog — is turned away before the
-model loop is entered, and nothing appends it to the trail. Closing that gap
-needs a public append path on the audit writer, which the agent runtime does
-not expose yet.
+A turn Garrison's own admission gates refuse is sealed too, though the model
+loop never runs it: a lapsed seat, an unreachable plane, a full shipping
+backlog. The entry records the stable reason it was refused, so an install
+refused fifty times in an afternoon reads differently from an install nobody
+touched.
 
 ```sh
 garrison-agent audit verify

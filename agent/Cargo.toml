@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-acton-ai = { version = "=0.36.0", default-features = false, features = ["fips", "sandbox-hardening", "derive", "otel", "ipc"] }
+acton-ai = { version = "=0.37.0", default-features = false, features = ["fips", "sandbox-hardening", "derive", "otel", "ipc"] }
 acton-reactive = "9.2.1"
 acton-service-client = "0.1.2"
 agent-client-protocol-schema = "1.6.0"

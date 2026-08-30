@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "acton-ai"
-version = "0.36.0"
+version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77e3170bd3121159fdc4cddb9c31619c8a1d308dd0a58144d263eb9983c17abb"
+checksum = "9992f4e1a9d7da5daed28bc337db55a7182f921d18bef69f57254bac318f9205"
 dependencies = [
  "acton-ai-macros",
  "acton-reactive",

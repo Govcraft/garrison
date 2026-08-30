@@ -30,7 +30,7 @@ mod support;
 
 use garrison_agent::client::{AgentClient, Interactions};
 use garrison_agent::protocol::acp;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::io::BufRead;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -661,6 +661,39 @@ async fn a_turn_the_daemon_died_in_blocks_the_session_until_it_is_settled() {
     assert!(
         refused.to_string().contains("(code -32019)"),
         "the refusal must be TURN_INTERRUPTED, got {refused}",
+    );
+
+    // And the refusal is evidence, not just an error code. The gates run
+    // before the prompt loop, so nothing else in the daemon would have
+    // written this turn down; without it, an install refused all afternoon
+    // would leave the same trail as an install nobody touched. The append is
+    // durable and awaited before the refusal is returned, so it is on disk by
+    // the time the client sees the error.
+    let trail = std::fs::read_to_string(fixture.trail()).expect("the trail must be readable");
+    let sealed: Value = trail
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("every trail line is an entry"))
+        .find(|entry: &Value| entry["turn_outcome"]["kind"] == "refused")
+        .expect("the refused turn must have been sealed");
+    assert_eq!(sealed["entry_kind"], "turn");
+    assert_eq!(
+        sealed["turn_outcome"]["decision"], "turn_interrupted",
+        "the sealed decision is the stable word, not the prose: {sealed}",
+    );
+    assert!(
+        sealed["turn_outcome"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("interrupted")),
+        "the refusal carries its reason: {sealed}",
+    );
+    assert_eq!(
+        sealed["prompt_size_bytes"],
+        json!("never mind, do this instead".len()),
+        "the refused prompt is counted, never copied: {sealed}",
+    );
+    assert!(
+        !trail.contains("never mind, do this instead"),
+        "and the prompt text itself never reaches the trail",
     );
 
     // And the escape hatch: the operator says the work is not wanted, and the
