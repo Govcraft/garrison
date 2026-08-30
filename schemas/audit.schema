@@ -116,11 +116,18 @@ schema AuditEvent {
     occurred_at:   datetime required indexed @format("relative") @exportable
     recorded_at:   datetime @default("now") @exportable
 
-    kind:          enum("session_start", "session_end", "tool_call", "approval", "escalation", "policy_load")
+    // `turn` is one attempted model turn, sealed whether or not it called a
+    // tool. Without it the export answers "what did this install run" and
+    // never "what did this install ask", so a session that produced code and
+    // called nothing left no row at all. A refused turn is a `turn` row too:
+    // an install that lost its seat and was turned away fifty times is a
+    // finding, and silence is not one.
+    kind:          enum("session_start", "session_end", "turn", "tool_call", "approval", "escalation", "policy_load")
                    required
                    @enum_colors(
                        session_start: "blue",
                        session_end: "gray",
+                       turn: "purple",
                        tool_call: "neutral",
                        approval: "teal",
                        escalation: "amber",
@@ -129,10 +136,18 @@ schema AuditEvent {
                    @list(column)
                    @exportable
 
+    // Empty on a `turn` row: a turn is not a tool call and naming one here
+    // would put it in the same bucket as the calls it made.
     tool_name:     text(max: 128) indexed @exportable
     // Canonicalized argv as the policy gate saw it, not the raw shell string.
     command:       text(max: 2048) @exportable
 
+    // On a `tool_call` row this is the approval gate's verdict. On a `turn`
+    // row it is admission's: a turn that ran was let through
+    // (`auto_approved`) and a turn that did not was refused (`forbidden`).
+    // Admission is a gate in exactly the sense approval is, so a turn fills
+    // the same column rather than needing one of its own — and `justification`
+    // carries the rendered reason a refusal came with.
     decision:      enum("auto_approved", "approved", "denied", "forbidden", "timed_out")
                    required
                    @enum_colors(
@@ -146,17 +161,23 @@ schema AuditEvent {
                    @exportable
 
     // Which gate produced the verdict, and the identity behind it when a human
-    // was in the loop.
+    // was in the loop. Admission is never a person — nobody is prompted to let
+    // a turn start — so a refused turn reads `policy` and an admitted one
+    // reads `default`.
     decider:       enum("policy", "callback", "operator", "default")
                    required
                    @exportable
     decided_by:    text(max: 320) @exportable
     justification: text(max: 1024) @exportable
 
+    // Absent on a refused `tool_call` and on a refused `turn` alike: neither
+    // ran, and recording `error` for a refusal would file it beside a failure.
     outcome:       enum("success", "error", "aborted")
                    @enum_colors(success: "green", error: "red", aborted: "gray")
                    @exportable
 
+    // False on every `turn` row. The daemon writes it explicitly rather than
+    // inheriting this default, because a turn confines nothing.
     sandboxed:     boolean default(true) @exportable
     // Milliseconds, lifted from the entry's `duration_ms`. An integer rather
     // than a `duration` because the hook proto generator cannot carry a
@@ -170,6 +191,28 @@ schema AuditEvent {
     // Free-form payload. Deliberately not @exportable: a bulk file is the
     // wrong place for whatever a tool happened to attach.
     detail:        json
+
+    // What a `turn` row adds, and only a `turn` row fills.
+    //
+    // Metadata, deliberately and permanently. Byte counts make user activity
+    // and response length auditable — which is the shape a compliance regime
+    // actually asks for — without copying a prompt or an answer into a trail
+    // that leaves the workstation and lands in a SIEM. There is no column here
+    // for prompt text, and adding one would be a decision about retention
+    // rather than about auditing.
+    //
+    // Appended after `detail` rather than filed beside the columns they read
+    // with, because the hook proto numbers its fields in declaration order: a
+    // field inserted in the middle renumbers every field after it, and a
+    // renumbered tag is a wire break for any plane still holding the old
+    // descriptor.
+    provider:       text(max: 64) @exportable
+    model:          text(max: 128) indexed @exportable
+    prompt_bytes:   integer(min: 0) @exportable
+    // Also filled on a `tool_call` row, from the entry's serialized result.
+    response_bytes: integer(min: 0) @exportable
+    input_tokens:   integer(min: 0) @exportable
+    output_tokens:  integer(min: 0) @exportable
 }
 
 // Per-trail chain state as the plane verified it, maintained by the audit

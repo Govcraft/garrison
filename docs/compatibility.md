@@ -77,6 +77,21 @@ holds a trail a real daemon wrote and fails if today's code disagrees with it
 about a single byte. Regenerating that fixture is the visible cost of breaking
 this promise, and it is deliberately awkward.
 
+**Added in 1.1, without moving a byte:** the trail now also holds one entry per
+attempted *turn*, not only per tool invocation. A turn entry is a new shape in
+the same chain, distinguished by an `entry_kind` field that invocation entries
+omit — and omission is the whole trick. Every field a turn entry adds, and the
+discriminator itself, is absent from an invocation's serialized form and from
+its hash pre-image, so a trail written by 1.0 still hashes to exactly what it
+hashed to. `agent/tests/audit_fixture.rs` is what holds that claim honest: it
+verifies a trail a 1.0 daemon wrote, unchanged.
+
+A reader that does not know about turn entries will still verify the chain,
+because verification is over the sealed bytes. It will simply see entries whose
+tool fields are absent. Code that reads those fields must treat them as
+optional; in this repo, `garrison_wire::audit::kind` is the one place that
+decides which kind an entry is, and an entry that names no kind is a tool call.
+
 Note what the chain does *not* promise, and never did: a prefix of a valid
 chain is itself a valid chain, so truncation of the most recent entries is
 undetectable from the file alone. That is why the trail ships off the box.
@@ -91,7 +106,7 @@ the next rebuild picks a change up silently.
 
 | Crate | Requirement | Why |
 | --- | --- | --- |
-| `acton-ai` | `=0.35.0` (exact) | It is 0.x, and `garrison-wire` re-exports its audit types as Garrison's own wire contract. An unreviewed 0.36 would silently redefine what an audit entry is, which is surface 4 above. Exact makes the bump a reviewed commit. |
+| `acton-ai` | `=0.36.0` (exact) | It is 0.x, and `garrison-wire` re-exports its audit types as Garrison's own wire contract. An unreviewed bump would silently redefine what an audit entry is, which is surface 4 above. Exact makes it a reviewed commit — as 0.35 → 0.36 was: it turned the tool fields optional to make room for turn entries, and the fixture test is what proved no existing byte moved. |
 | `acton-service` | `0.39` | Plane-side only (`hooks-service`). For a 0.x crate, caret already caps below 0.40, so caret and tilde are the same requirement here. |
 | `acton-service-client` | `0.1.2` | Ships inside the agent binary, so a fix here needs an agent release, not just a plane redeploy. |
 | `acton-reactive` | `9.2.1` | Post-1.0 semver, patch float. |

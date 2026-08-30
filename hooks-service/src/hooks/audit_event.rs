@@ -45,8 +45,9 @@ use std::collections::BTreeMap;
 
 use chrono::{SecondsFormat, Utc};
 use garrison_wire::audit::{
-    command_of, decider_of, decision_of, outcome_of, projection_disagreement, verify_next,
-    AuditEntry, ChainBreakKind, ChainHead, EventProjection, GENESIS_HASH, INGEST_UNAVAILABLE,
+    command_of, decider_of, decision_of, kind_column, outcome_of, projection_disagreement,
+    refusal_reason, truncate, verify_next, AuditEntry, ChainBreakKind, ChainHead, EventProjection,
+    GENESIS_HASH, INGEST_UNAVAILABLE, REASON_MAX,
 };
 use serde_json::{json, Value};
 use tonic::{Request, Response, Status};
@@ -243,40 +244,82 @@ pub fn verified_after(previous: Option<&AuditChainRow>, integrity: &str, head_se
 /// The columns the hook re-derives from the sealed entry rather than trusting.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Derived {
-    /// Always `tool_call` for 1.0: acton-ai seals one entry per invocation.
+    /// What the entry is: `tool_call` for one invocation, `turn` for one
+    /// attempted model turn. Read from the entry's own discriminator, which
+    /// an invocation omits.
     pub kind: &'static str,
-    /// The tool the entry names.
+    /// The tool the entry names, empty on a turn.
     pub tool_name: String,
     /// The shell command, empty for every other tool.
     ///
     /// Empty rather than absent so a fabricated command is erased: an unset
     /// optional in the hook response leaves whatever the client sent.
     pub command: String,
-    /// How the call was decided.
+    /// How the call, or the turn, was decided.
     pub decision: &'static str,
     /// Which gate decided it.
     pub decider: &'static str,
-    /// What the call came to, absent for a call that never ran.
+    /// The rendered reason a refusal came with, empty when there was none.
+    ///
+    /// Empty for the same reason `command` is: an install that could write
+    /// this column freely could explain away its own refusals.
+    pub justification: String,
+    /// What it came to, absent for a call or a turn that never ran.
     pub outcome: Option<&'static str>,
     /// When it happened, as the entry recorded it.
     pub occurred_at: String,
-    /// How long it took.
+    /// How long it took. Zero on a turn, which records no duration.
     pub elapsed_ms: i64,
+    /// The provider billed for a turn, empty on a tool call.
+    pub provider: String,
+    /// The model a turn ran against, empty on a tool call.
+    pub model: String,
+    /// Prompt length in bytes, zero when the entry records none.
+    pub prompt_bytes: i64,
+    /// Response length in bytes, zero when the entry records none.
+    pub response_bytes: i64,
+    /// Input tokens summed across the turn.
+    pub input_tokens: i64,
+    /// Output tokens summed across the turn.
+    pub output_tokens: i64,
 }
 
 /// Re-derive every column that is a function of the sealed entry. Pure.
+///
+/// Every field here is written back over whatever the client sent. The turn
+/// columns are derived for the same reason the tool columns always were: an
+/// install that could set its own token counts could under-report what it
+/// spent, and one that could set `kind` could file a turn as a tool call and
+/// disappear from a turn-level export.
 #[must_use]
 pub fn derive(entry: &AuditEntry) -> Derived {
     Derived {
-        kind: "tool_call",
-        tool_name: entry.tool_name.clone(),
+        kind: kind_column(entry),
+        tool_name: entry.tool_name.clone().unwrap_or_default(),
         command: command_of(entry).unwrap_or_default(),
         decision: decision_of(entry),
-        decider: decider_of(entry.decision),
-        outcome: outcome_of(&entry.outcome),
+        decider: decider_of(entry),
+        justification: refusal_reason(entry)
+            .map(|reason| truncate(reason, REASON_MAX))
+            .unwrap_or_default(),
+        outcome: outcome_of(entry),
         occurred_at: entry.timestamp.clone(),
-        elapsed_ms: i64::try_from(entry.duration_ms).unwrap_or(i64::MAX),
+        elapsed_ms: count(entry.duration_ms),
+        provider: entry.provider.clone().unwrap_or_default(),
+        model: entry.model.clone().unwrap_or_default(),
+        prompt_bytes: count(entry.prompt_size_bytes),
+        response_bytes: count(entry.response_size_bytes),
+        input_tokens: count(entry.input_tokens),
+        output_tokens: count(entry.output_tokens),
     }
+}
+
+/// One optional count as the column carries it. Pure.
+///
+/// Absent becomes zero rather than being left unset, so a count the client
+/// invented for an entry that records none is erased instead of surviving.
+fn count(value: Option<u64>) -> i64 {
+    value.map_or(0, |value| i64::try_from(value).unwrap_or(i64::MAX))
 }
 
 /// The one derived column the hook can refuse but cannot correct. Pure.
@@ -516,9 +559,16 @@ fn accept(
         command: Some(derived.command.clone()),
         decision: Some(derived.decision.to_string()),
         decider: Some(derived.decider.to_string()),
+        justification: Some(derived.justification.clone()),
         outcome: derived.outcome.map(ToString::to_string),
         occurred_at: Some(derived.occurred_at.clone()),
         elapsed_ms: Some(derived.elapsed_ms),
+        provider: Some(derived.provider.clone()),
+        model: Some(derived.model.clone()),
+        prompt_bytes: Some(derived.prompt_bytes),
+        response_bytes: Some(derived.response_bytes),
+        input_tokens: Some(derived.input_tokens),
+        output_tokens: Some(derived.output_tokens),
         ..Default::default()
     }
 }
@@ -547,7 +597,9 @@ fn abort(reason: &str) -> AuditEventBeforeValidateResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use garrison_wire::audit::{fixture, AuditDecision, AuditOutcome, Decider, TrailId};
+    use garrison_wire::audit::{
+        fixture, AuditDecision, AuditOutcome, Decider, TrailId, TurnAuditOutcome,
+    };
 
     /// A fresh trail identity. Reached through `garrison-wire`, like every
     /// other acton-ai type this crate touches: the hook service does not
@@ -686,7 +738,7 @@ mod tests {
         let chain = chain_row(1, &entries[0].hash);
         // Edit the entry after sealing: the hash it carries is now a lie, and
         // the sequence check would otherwise have stopped before the hash one.
-        entries[4].tool_name = "rm".to_string();
+        entries[4].tool_name = Some("rm".to_string());
         let projection = projection_of(&entries[4], &trail.install);
 
         let verdict = adjudicate_entry(Some(&chain), None, &trail, &entries[4], &projection);
@@ -933,6 +985,126 @@ mod tests {
         assert!(uncorrectable(&derived, Some("success")).is_some());
         assert!(uncorrectable(&derived, None).is_none());
         assert!(uncorrectable(&derived, Some("")).is_none());
+    }
+
+    #[test]
+    fn a_turn_entry_derives_a_turn_row_and_names_no_tool() {
+        let id = trail_id();
+        let entry = fixture::turn(1, GENESIS_HASH, Some(&id), TurnAuditOutcome::Completed);
+
+        let derived = derive(&entry);
+
+        assert_eq!(derived.kind, "turn");
+        assert_eq!(derived.tool_name, "");
+        assert_eq!(derived.command, "");
+        assert_eq!(derived.decision, "auto_approved");
+        assert_eq!(derived.decider, "default");
+        assert_eq!(derived.outcome, Some("success"));
+        assert_eq!(derived.provider, "anthropic");
+        assert_eq!(derived.model, "claude-opus-5");
+        assert_eq!(derived.prompt_bytes, 64);
+        assert_eq!(derived.response_bytes, 512);
+        assert_eq!(derived.input_tokens, 900);
+        assert_eq!(derived.output_tokens, 120);
+    }
+
+    #[test]
+    fn a_refused_turn_derives_a_refusal_and_carries_its_reason() {
+        let id = trail_id();
+        let entry = fixture::turn(
+            1,
+            GENESIS_HASH,
+            Some(&id),
+            TurnAuditOutcome::Refused {
+                decision: "draining".into(),
+                reason: "the daemon is draining".into(),
+            },
+        );
+
+        let derived = derive(&entry);
+
+        assert_eq!(derived.decision, "forbidden");
+        assert_eq!(derived.decider, "policy");
+        assert_eq!(derived.justification, "the daemon is draining");
+        assert_eq!(derived.outcome, None);
+    }
+
+    #[test]
+    fn an_outcome_claimed_for_a_turn_that_never_ran_is_refused() {
+        // The same rule the denied tool call gets: a row saying a refused turn
+        // succeeded is claiming a provider round that was never paid for.
+        let id = trail_id();
+        let entry = fixture::turn(
+            1,
+            GENESIS_HASH,
+            Some(&id),
+            TurnAuditOutcome::Refused {
+                decision: "paused".into(),
+                reason: "admission is paused".into(),
+            },
+        );
+        let derived = derive(&entry);
+
+        assert!(uncorrectable(&derived, Some("success")).is_some());
+        assert!(uncorrectable(&derived, None).is_none());
+    }
+
+    #[test]
+    fn a_tool_call_derives_none_of_the_turn_columns() {
+        // Empty and zero rather than unset: an unset optional in the response
+        // leaves whatever the client sent, so an install could otherwise
+        // decorate a tool call with invented token counts.
+        let id = trail_id();
+        let entries = fixture::chain(1, &id);
+
+        let derived = derive(&entries[0]);
+
+        assert_eq!(derived.kind, "tool_call");
+        assert_eq!(derived.provider, "");
+        assert_eq!(derived.model, "");
+        assert_eq!(derived.prompt_bytes, 0);
+        assert_eq!(derived.input_tokens, 0);
+        assert_eq!(derived.output_tokens, 0);
+        assert_eq!(derived.justification, "");
+    }
+
+    #[test]
+    fn a_turn_row_overwrites_every_count_the_client_sent() {
+        let id = trail_id();
+        let entry = fixture::turn(1, GENESIS_HASH, Some(&id), TurnAuditOutcome::Completed);
+        let trail = trail_row(&id);
+
+        let response = accept(&trail, "operator_01", &derive(&entry));
+
+        assert_eq!(response.kind.as_deref(), Some("turn"));
+        assert_eq!(response.input_tokens, Some(900));
+        assert_eq!(response.output_tokens, Some(120));
+        assert_eq!(response.prompt_bytes, Some(64));
+        assert_eq!(response.response_bytes, Some(512));
+        assert_eq!(response.model.as_deref(), Some("claude-opus-5"));
+    }
+
+    #[test]
+    fn a_turn_entry_adjudicates_on_the_chain_like_any_other() {
+        // Turn and invocation entries share one chain, so the ingest must
+        // link them together rather than treating a turn as an interloper.
+        let id = trail_id();
+        let entries = fixture::mixed_chain(2, &id);
+        let trail = trail_row(&id);
+        let chain = chain_row(1, &entries[0].hash);
+
+        let verdict = adjudicate_entry(
+            Some(&chain),
+            None,
+            &trail,
+            &entries[1],
+            &projection_of(&entries[1], &trail.install),
+        );
+
+        assert!(
+            matches!(&verdict, Verdict::Accept { head_seq, .. } if *head_seq == 2),
+            "{verdict:?}"
+        );
     }
 
     #[test]
