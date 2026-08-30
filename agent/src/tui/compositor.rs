@@ -15,7 +15,7 @@
 //! hundred, and an idle interface costs none at all.
 
 use super::message::{
-    ClearHistory, CommitHistory, DrawTick, Region, RegionRendered, ScreenResized, Shutdown,
+    ClearHistory, CommitHistory, DrawTick, Region, RegionRendered, ScreenResized, Shutdown, Suspend,
 };
 use super::viewport::ViewportTerminal;
 use super::wrap::wrap_lines;
@@ -237,6 +237,38 @@ fn configure(builder: &mut ManagedActor<Idle, Compositor>) {
         }
         Reply::ready()
     });
+
+    builder.mutate_on::<Suspend>(|actor, _| {
+        let Some(mut terminal) = actor.model.terminal.take() else {
+            return Reply::ready();
+        };
+        if let Err(error) = terminal.restore() {
+            tracing::warn!(%error, "could not restore the terminal before suspending");
+        }
+        if let Err(error) = suspend_process() {
+            tracing::warn!(%error, "could not suspend to the shell");
+        }
+        match ViewportTerminal::new() {
+            Ok(terminal) => actor.model.terminal = Some(terminal),
+            Err(error) => tracing::warn!(%error, "could not retake the terminal after resuming"),
+        }
+        let handle = actor.handle().clone();
+        actor.model.request_frame(&handle);
+        Reply::ready()
+    });
+}
+
+/// Stops this process after terminal modes have been restored.
+fn suspend_process() -> std::io::Result<()> {
+    // SAFETY: `raise` is called with the fixed, valid SIGTSTP constant. It
+    // touches no Rust memory; execution resumes here after the shell sends
+    // SIGCONT.
+    let result = unsafe { libc::raise(libc::SIGTSTP) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 #[cfg(test)]

@@ -2220,7 +2220,7 @@ dependencies = [
 
 [[package]]
 name = "garrison-agent"
-version = "1.1.9"
+version = "1.1.10"
 dependencies = [
  "acton-ai",
  "acton-reactive",
@@ -2236,6 +2236,7 @@ dependencies = [
  "garrison-wire",
  "getrandom 0.4.3",
  "hostname",
+ "libc",
  "lsp-types",
  "mti",
  "ratatui",

@@ -6,13 +6,14 @@
 //! modal that is up gets every key, and the composer gets none of them, with
 //! no region needing to know the other exists.
 //!
-//! Two keys never reach a region at all. Esc asks the running turn to stop,
-//! and Ctrl+C does the same but leaves when nothing was running. Which of
-//! those two things happens is not decided here — this actor does not know
-//! whether a turn is open — so both become one [`Interrupt`] carrying the
-//! difference, and the session, which does know, resolves it.
+//! Three keys have global meaning. Esc asks the running turn to stop, and
+//! Ctrl+C does the same but leaves when nothing was running. Which of those
+//! two things happens is not decided here — this actor does not know whether
+//! a turn is open — so both become one [`Interrupt`] carrying the difference,
+//! and the session, which does know, resolves it. Ctrl+Z goes to the terminal
+//! owner so raw mode can be restored before the process suspends.
 
-use super::message::{Focus, FocusChanged, Interrupt, KeyPressed, Pasted, Wire};
+use super::message::{Focus, FocusChanged, Interrupt, KeyPressed, Pasted, Suspend, Wire};
 use acton_reactive::prelude::*;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -26,6 +27,8 @@ pub enum Route {
     Composer,
     /// To the modal that has taken the keyboard.
     Approval,
+    /// To the terminal owner, which restores modes before suspending.
+    Suspend,
     /// To the session, as a request to stop.
     Interrupt {
         /// Whether to leave when nothing was running.
@@ -36,11 +39,16 @@ pub enum Route {
 /// Decides where a key belongs.
 ///
 /// Pure, and deliberately total: there is no key this does not answer for.
-/// A modal takes everything, including Esc and Ctrl+C, because refusing a
-/// permission is what those mean while one is up — the alternative would be a
-/// key that dismisses the prompt without ever answering the agent.
+/// Except for Ctrl+Z, a modal takes everything, including Esc and Ctrl+C,
+/// because refusing a permission is what those mean while one is up — the
+/// alternative would be a key that dismisses the prompt without ever
+/// answering the agent. Ctrl+Z suspends without answering.
 #[must_use]
 pub const fn route(focus: Focus, key: KeyEvent) -> Route {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('z')) {
+        return Route::Suspend;
+    }
+
     if matches!(focus, Focus::Approval) {
         return Route::Approval;
     }
@@ -69,6 +77,8 @@ pub struct Router {
     composer: Option<ActorHandle>,
     /// The permission modal.
     approval: Option<ActorHandle>,
+    /// The terminal owner, which can safely suspend the process.
+    compositor: Option<ActorHandle>,
     /// The connection, which owns what an interrupt means.
     session: Option<ActorHandle>,
 }
@@ -94,6 +104,7 @@ fn configure(builder: &mut ManagedActor<Idle, Router>) {
         let message = context.message();
         actor.model.composer = Some(message.composer.clone());
         actor.model.approval = Some(message.approval.clone());
+        actor.model.compositor = Some(message.compositor.clone());
         actor.model.session = Some(message.session.clone());
         Reply::ready()
     });
@@ -127,6 +138,7 @@ fn configure(builder: &mut ManagedActor<Idle, Router>) {
 fn forward(actor: &ManagedActor<Started, Router>, destination: Route, key: KeyEvent) -> FutureBox {
     let composer = actor.model.composer.clone();
     let approval = actor.model.approval.clone();
+    let compositor = actor.model.compositor.clone();
     let session = actor.model.session.clone();
 
     Reply::pending(async move {
@@ -139,6 +151,11 @@ fn forward(actor: &ManagedActor<Started, Router>, destination: Route, key: KeyEv
             Route::Approval => {
                 if let Some(approval) = approval {
                     approval.send(KeyPressed { key }).await;
+                }
+            }
+            Route::Suspend => {
+                if let Some(compositor) = compositor {
+                    compositor.send(Suspend).await;
                 }
             }
             Route::Interrupt { quit_when_idle } => {
@@ -201,6 +218,13 @@ mod tests {
         ] {
             assert_eq!(route(Focus::Approval, pressed), Route::Approval);
         }
+    }
+
+    #[test]
+    fn control_z_suspends_from_the_composer_or_a_modal() {
+        let suspend = control(KeyCode::Char('z'));
+        assert_eq!(route(Focus::Composer, suspend), Route::Suspend);
+        assert_eq!(route(Focus::Approval, suspend), Route::Suspend);
     }
 
     #[test]

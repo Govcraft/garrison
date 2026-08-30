@@ -100,6 +100,10 @@ pub struct ScreenResized {
 #[acton_message]
 pub struct Shutdown;
 
+/// Temporarily give the terminal back and suspend to the shell.
+#[acton_message]
+pub struct Suspend;
+
 /// A key the user pressed.
 #[acton_message]
 pub struct KeyPressed {

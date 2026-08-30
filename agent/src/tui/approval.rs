@@ -248,7 +248,7 @@ pub fn prompt(
         )));
     }
     lines.push(Line::from(Span::styled(
-        "  Esc or Ctrl+C refuses".to_string(),
+        "  Esc or Ctrl+C refuses · Ctrl+Z suspends".to_string(),
         secondary,
     )));
 
@@ -657,7 +657,7 @@ mod tests {
         let lines = prompt("run bash", None, 0, 1, Duration::from_secs(300));
         assert_eq!(
             text(lines.last().expect("a key hint")),
-            "  Esc or Ctrl+C refuses"
+            "  Esc or Ctrl+C refuses · Ctrl+Z suspends"
         );
     }
 

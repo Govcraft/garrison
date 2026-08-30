@@ -193,7 +193,7 @@ pub fn banner(session: &acp::SessionId) -> Vec<Line<'static>> {
     vec![
         notice_line(format!("garrison-agent {}", env!("CARGO_PKG_VERSION"))),
         notice_line(format!("session {}", session.0)),
-        notice_line("/help for commands, Ctrl+C to leave".to_string()),
+        notice_line("/help for commands, Ctrl+C to leave, Ctrl+Z to suspend".to_string()),
         Line::default(),
     ]
 }
@@ -209,6 +209,9 @@ pub fn help() -> Vec<Line<'static>> {
             command.description()
         ))
     }));
+    lines.push(notice_line(
+        "permission prompt: Esc or Ctrl+C refuses; Ctrl+Z suspends without answering".to_string(),
+    ));
     lines
 }
 
