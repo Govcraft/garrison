@@ -28,6 +28,7 @@ final class GarrisonToolWindow implements Disposable, GarrisonConnection.Listene
     private final GarrisonConnection connection;
     private final JPanel root = new JPanel(new BorderLayout());
     private final JTextPane transcript = new JTextPane();
+    private final JBScrollPane transcriptScroll = new JBScrollPane(transcript);
     private final JBTextArea input = new JBTextArea(4, 20);
     private final JButton send = new JButton("Send");
     private final JButton cancel = new JButton("Cancel");
@@ -48,8 +49,7 @@ final class GarrisonToolWindow implements Disposable, GarrisonConnection.Listene
         transcript.setContentType("text/plain");
         input.setLineWrap(true);
         input.setWrapStyleWord(true);
-        var scroll = new JBScrollPane(transcript);
-        scroll.setBorder(JBUI.Borders.empty());
+        transcriptScroll.setBorder(JBUI.Borders.empty());
 
         var buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
         var fresh = new JButton("New");
@@ -67,7 +67,7 @@ final class GarrisonToolWindow implements Disposable, GarrisonConnection.Listene
         composer.add(promptLabel, BorderLayout.NORTH);
         composer.add(new JBScrollPane(input), BorderLayout.CENTER);
         composer.add(buttons, BorderLayout.SOUTH);
-        root.add(scroll, BorderLayout.CENTER);
+        root.add(transcriptScroll, BorderLayout.CENTER);
         root.add(composer, BorderLayout.SOUTH);
 
         send.addActionListener(event -> sendPrompt());
@@ -212,8 +212,11 @@ final class GarrisonToolWindow implements Disposable, GarrisonConnection.Listene
             else StyleConstants.setForeground(attributes, JBColor.foreground());
             try {
                 var document = transcript.getStyledDocument();
+                var scrollBar = transcriptScroll.getVerticalScrollBar();
+                boolean stickToBottom = document.getLength() == 0
+                        || scrollBar.getValue() + scrollBar.getVisibleAmount() >= scrollBar.getMaximum() - 1;
                 document.insertString(document.getLength(), text, attributes);
-                transcript.setCaretPosition(document.getLength());
+                if (stickToBottom) transcript.setCaretPosition(document.getLength());
             } catch (BadLocationException ignored) {}
         });
     }
