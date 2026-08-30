@@ -130,9 +130,16 @@ session's working directory plus the operator's own `~/.agents/AGENTS.md`;
 with no plane runs unrestricted, the same trust the local auto-approve list
 already gets.
 
-Loading is logged (which files, which BLAKE3, not their content) but not yet
-sealed into the tamper-evident audit chain — `TurnRecord` has no field for it
-in acton-ai 0.36.0. Tracked as Govcraft/acton-ai#18.
+Every layer that survives the gate is sealed into the turn's own audit entry
+as an acton-ai `ContextSource` — scope, path, and a BLAKE3 of the content,
+never the content itself (Govcraft/acton-ai#18, shipped in 0.37.0). The
+fingerprints are built from the layers that survived the policy filter, never
+from `AgentInstructions::context_sources()`, which would name every layer
+discovery *found*, including ones a `restricted` bundle refused to load: an
+entry claiming a turn was steered by a withheld file would be worse than none.
+So "what steered this turn" is hash-chained next to "what did this turn do",
+and an auditor holding the file can recompute the digest and check it against
+the sealed entry.
 
 ### 1.8 Context management: budget + compaction + rollouts
 - `compact.rs`: auto-summarization when the window fills, with pre/post-compact

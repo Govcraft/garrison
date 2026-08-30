@@ -1786,12 +1786,6 @@ exactly one install identity: a fleet of editor windows is one
 - **A bundle's `network_egress` and `allow_unsandboxed_escalation` are
   recorded and not enforced.** They are part of the checksum and reported in
   `_garrison/status`; no code acts on them. `ping` says so out loud.
-- **Which `AGENTS.md` files steered a turn is logged, not sealed.** The
-  daemon records the loaded files and their BLAKE3 hashes via structured
-  tracing, but the acton-ai audit chain has no field for it yet, so that
-  record is not tamper-evident the way the rest of the trail is.
-  [Govcraft/acton-ai#18](https://github.com/Govcraft/acton-ai/issues/18)
-  tracks giving it one.
 - **Schemas are unsigned.** Every command prints `schema signature
   verification is disabled (signing.mode = off)`. SchemaForge can require
   ed25519, SSH allowed-signers, or cosign-keyless signatures over `schemas/`

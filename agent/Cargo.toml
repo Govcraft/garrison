@@ -11,7 +11,6 @@ acton-reactive = "9.2.1"
 acton-service-client = "0.1.2"
 agent-client-protocol-schema = "1.6.0"
 base64 = "0.23.1"
-blake3 = "1.8.7"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde", "std"] }
 clap = { version = "4.6.6", features = ["derive"] }
 crossterm = { version = "0.29", features = ["bracketed-paste", "event-stream"] }
@@ -42,6 +41,7 @@ unicode-width = "0.2.2"
 url = "2.5.8"
 
 [dev-dependencies]
+blake3 = "1.8.7"
 garrison-wire = { path = "../wire", features = ["testing"] }
 tempfile = "3.27.0"
 testcontainers = "0.28.0"

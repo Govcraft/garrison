@@ -475,6 +475,10 @@ pub mod fixture {
             model: None,
             input_tokens: None,
             output_tokens: None,
+            // Empty on the shared skeleton for the same reason `entry_kind`
+            // is absent: it is the shape acton-ai writes for an entry no
+            // project instructions steered, and it serializes away entirely,
+            // so a fixture chain hashes over the same bytes a real one does.
             context_sources: Vec::new(),
             resumed: false,
             trail_id: trail_id.cloned(),
