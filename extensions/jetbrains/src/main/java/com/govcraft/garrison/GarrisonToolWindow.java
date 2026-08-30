@@ -164,6 +164,15 @@ final class GarrisonToolWindow implements Disposable, GarrisonConnection.Listene
     }
 
     void newSession() {
+        if (transcript.getDocument().getLength() > 0) {
+            int choice = Messages.showDialog(project,
+                    "Clear the current Garrison transcript and start a new session?",
+                    "New Garrison Session",
+                    new String[]{"Clear Transcript", "Keep Transcript"},
+                    1,
+                    Messages.getWarningIcon());
+            if (choice != 0) return;
+        }
         cancelTurn();
         connection.resetSession();
         ApplicationManager.getApplication().invokeLater(() -> transcript.setText(""));
