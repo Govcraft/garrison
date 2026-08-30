@@ -293,6 +293,11 @@ async fn a_seat_is_only_an_entitlement_while_the_plane_says_it_is() {
         "plane",
     );
 
+    // The same rule the crate follows: a FIPS build asks reqwest not to
+    // install a crypto provider of its own, and `Client::new` panics rather
+    // than erroring when it finds none. This harness builds its own client to
+    // drive the plane's admin API, so it installs one too.
+    garrison_agent::crypto::ensure_provider().expect("the crypto provider installs");
     let http = reqwest::Client::new();
     let admin = {
         let deadline = Instant::now() + Duration::from_secs(90);

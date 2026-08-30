@@ -71,6 +71,7 @@ pub async fn login(key_stdin: bool) -> Result<(), GarrisonError> {
 
 /// Proves the key works by listing models; returns the model IDs.
 async fn validate_key(key: &str) -> Result<Vec<String>, GarrisonError> {
+    crate::crypto::ensure_provider()?;
     let client = reqwest::Client::new();
     let response = client
         .get(MODELS_URL)

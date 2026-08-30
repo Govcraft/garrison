@@ -311,6 +311,10 @@ async fn exchange(identity: &Identity, now: i64) -> Result<Bearer, PlaneError> {
 /// value here is bearer handling and this is the request that has no bearer.
 async fn post_assertion(hooks_url: &str, request: &TokenRequest) -> Result<TokenGrant, PlaneError> {
     let url = format!("{}/api/v1/install/token", hooks_url.trim_end_matches('/'));
+    // Before the builder, not after: a FIPS build asks reqwest not to install
+    // a crypto provider of its own, and `build()` panics rather than erroring
+    // when it finds none. See [`crate::crypto`].
+    crate::crypto::ensure_provider().map_err(|error| PlaneError::Unreachable(error.to_string()))?;
     let http = reqwest::Client::builder()
         .timeout(EXCHANGE_TIMEOUT)
         .build()
