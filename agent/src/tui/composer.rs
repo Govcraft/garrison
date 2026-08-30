@@ -56,6 +56,26 @@ impl Composer {
         let indent = UnicodeWidthStr::width(PROMPT);
         let usable = usize::from(width).saturating_sub(indent).max(1);
 
+        // Handled before the wrap loop rather than as a fallback after it,
+        // because the loop cannot leave `lines` empty: splitting `""` yields
+        // one empty segment, and `chunk` returns one empty row for it, so an
+        // empty buffer still produces a line — a bare prompt followed by an
+        // unstyled empty span. Written as a fallback, the hint was
+        // unreachable and nobody ever saw it.
+        if self.text.is_empty() {
+            return RegionRendered {
+                region: Region::Composer,
+                lines: vec![Line::from(vec![
+                    Span::styled(PROMPT.to_string(), Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        "send a message, /help for commands".to_string(),
+                        Style::default().fg(Color::Gray),
+                    ),
+                ])],
+                cursor: Some((u16::try_from(indent).unwrap_or(0), 0)),
+            };
+        }
+
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut caret = (0u16, 0u16);
         let mut consumed = 0usize;
@@ -85,17 +105,6 @@ impl Composer {
             }
             // The newline the split consumed.
             consumed += 1;
-        }
-
-        if lines.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled(PROMPT.to_string(), Style::default().fg(Color::Gray)),
-                Span::styled(
-                    "send a message, /help for commands".to_string(),
-                    Style::default().fg(Color::Gray),
-                ),
-            ]));
-            caret = (u16::try_from(indent).unwrap_or(0), 0);
         }
 
         RegionRendered {
@@ -436,6 +445,25 @@ mod tests {
             .style
             .add_modifier
             .contains(ratatui::style::Modifier::DIM)));
+    }
+
+    #[test]
+    fn the_empty_composer_actually_renders_the_hint_text() {
+        // The assertion the contrast pass was missing. Every check above
+        // passes on a bare prompt followed by an unstyled empty span, which
+        // is exactly what an empty composer used to render: the hint branch
+        // sat behind `lines.is_empty()`, and the wrap loop never leaves
+        // `lines` empty. Name the text, or "shows a hint" stays a claim the
+        // test does not check.
+        let rendered = Composer::default().render(80);
+
+        let text: String = rendered.lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+
+        assert_eq!(text, format!("{PROMPT}send a message, /help for commands"));
     }
 
     #[test]
