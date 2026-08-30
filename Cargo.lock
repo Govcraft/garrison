@@ -5,6 +5,8 @@ version = 4
 [[package]]
 name = "acton-ai"
 version = "0.35.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cdbcb4ac30042cb345d82528804d732545e4521e20bb9a9cba803659e99ddfd7"
 dependencies = [
  "acton-ai-macros",
  "acton-reactive",
@@ -53,6 +55,8 @@ dependencies = [
 [[package]]
 name = "acton-ai-macros"
 version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05ea72899e4e509e3252783b823086cd28ff8c02b56ed8d3f508646e067f9fd9"
 dependencies = [
  "proc-macro2",
  "quote",

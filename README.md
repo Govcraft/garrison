@@ -174,8 +174,9 @@ client of its socket (`$XDG_RUNTIME_DIR/garrison-agent.sock`):
 
 ## Development quickstart
 
-Prerequisites are a Rust toolchain and the sibling acton-ai checkout expected
-by `agent/Cargo.toml` at `../../acton-ai`.
+The only prerequisite is a Rust toolchain at 1.89 or newer, which is where
+`std::fs::File::try_lock` stabilized and what acton-ai's single-writer audit
+lock needs. Every dependency resolves from crates.io: a clone builds.
 
 ```sh
 # Compile and run the test suite.
