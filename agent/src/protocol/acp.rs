@@ -119,6 +119,16 @@ pub mod ext {
 
     /// Gives up on a turn a restart interrupted, unblocking the session.
     pub const SESSION_ABANDON: &str = "_garrison/session/abandon";
+    /// Suggests the code that goes at a cursor.
+    ///
+    /// Inline completion is not part of ACP, which models a conversation
+    /// rather than an editor. It lives here rather than as a `session/prompt`
+    /// with a clever prompt because the two have opposite shapes: a turn is
+    /// long-lived, streamed, tool-capable, approval-gated, and appended to the
+    /// session's history, whereas a completion must answer in under a second,
+    /// touch nothing, and leave no trace. Sharing the turn machinery would
+    /// have meant every keystroke contending for a session's message loop.
+    pub const COMPLETE: &str = "_garrison/complete";
 
     /// The key Garrison uses inside any ACP `_meta` object.
     ///
@@ -930,6 +940,94 @@ pub struct CompactionNotice {
     pub tokens_after: u64,
     /// Messages the summary replaced.
     pub messages_elided: u64,
+}
+
+// =============================================================================
+// Inline completion
+// =============================================================================
+
+/// What an editor asks for at a cursor.
+///
+/// The cursor is expressed as the text on either side of it rather than as a
+/// line and column, because that is what the agent needs and it frees the
+/// agent from having to hold, or agree on, the document's contents. An editor
+/// with unsaved changes is therefore served correctly without a synchronized
+/// document mirror, which is the part of a language-server protocol that costs
+/// the most to get right.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct CompletionRequest {
+    /// The session this completion is scoped to.
+    ///
+    /// Required, and checked, so a completion is subject to the same ownership
+    /// and workspace boundary as everything else the client can ask for. It is
+    /// not a hint: a client that has not opened a session cannot get one.
+    pub session_id: SessionId,
+    /// The document being edited, when the editor knows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+    /// The editor's language identifier, such as `rust` or `typescript`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language_id: Option<String>,
+    /// The text before the cursor.
+    pub prefix: String,
+    /// The text after the cursor.
+    #[serde(default)]
+    pub suffix: String,
+}
+
+impl CompletionRequest {
+    /// The minimum a client must say: which session, and where the cursor is.
+    ///
+    /// [`Self::uri`] and [`Self::language_id`] are set afterwards when the
+    /// editor knows them. A constructor exists because the struct is
+    /// `#[non_exhaustive]` — that keeps a later field from breaking clients,
+    /// but it also means nothing outside this crate could otherwise build the
+    /// request at all, and this is a type clients are supposed to build.
+    #[must_use]
+    pub fn new(session_id: SessionId, prefix: impl Into<String>, suffix: impl Into<String>) -> Self {
+        Self {
+            session_id,
+            uri: None,
+            language_id: None,
+            prefix: prefix.into(),
+            suffix: suffix.into(),
+        }
+    }
+
+    /// Names the document being edited.
+    #[must_use]
+    pub fn uri(mut self, uri: impl Into<String>) -> Self {
+        self.uri = Some(uri.into());
+        self
+    }
+
+    /// Names the editor's language for the document.
+    #[must_use]
+    pub fn language_id(mut self, language_id: impl Into<String>) -> Self {
+        self.language_id = Some(language_id.into());
+        self
+    }
+}
+
+/// The suggestion, ready to insert at the cursor.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct CompletionResponse {
+    /// The text to insert. Empty means the agent has nothing to suggest,
+    /// which is a normal answer rather than an error: a model that declines
+    /// to guess is more useful than one that always says something.
+    pub completion: String,
+}
+
+impl CompletionResponse {
+    /// The answer when there is nothing worth suggesting.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::default()
+    }
 }
 
 // =============================================================================

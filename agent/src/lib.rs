@@ -6,6 +6,7 @@ pub mod audit;
 pub mod auth;
 pub mod boundary;
 pub mod client;
+pub mod completion;
 pub mod config;
 pub mod daemon;
 pub mod duplex;

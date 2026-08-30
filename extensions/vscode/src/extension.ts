@@ -1,7 +1,8 @@
 import * as vscode from "vscode";
-import { AcpClient, Json } from "./acpClient";
+import { Json } from "./acpClient";
+import { GarrisonConnection } from "./connection";
+import { InlineCompletionProvider } from "./inlineCompletion";
 
-interface NewSessionResponse { sessionId: string }
 interface Update { sessionUpdate?: string; content?: { type?: string; text?: string } | Json[]; toolCallId?: string; title?: string; status?: string; rawInput?: Json }
 interface SessionNotification { sessionId: string; update: Update }
 interface PermissionOption { optionId: string; name: string; kind: string }
@@ -9,27 +10,65 @@ interface PermissionRequest { toolCall: { title?: string; toolCallId?: string; r
 
 export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel("Garrison", { log: true });
-  const provider = new ChatViewProvider(context.extensionUri, output);
+  const connection = new GarrisonConnection(output);
+  const provider = new ChatViewProvider(connection, context.extensionUri, output);
+
   context.subscriptions.push(
     output,
+    connection,
     provider,
     vscode.window.registerWebviewViewProvider("garrison.chat", provider, { webviewOptions: { retainContextWhenHidden: true } }),
+    vscode.languages.registerInlineCompletionItemProvider(
+      { pattern: "**" },
+      new InlineCompletionProvider(connection, output),
+    ),
     vscode.commands.registerCommand("garrison.newSession", () => provider.newSession()),
     vscode.commands.registerCommand("garrison.cancelTurn", () => provider.cancel()),
     vscode.commands.registerCommand("garrison.showStatus", () => provider.showStatus()),
+    vscode.commands.registerCommand("garrison.toggleInlineCompletion", () => toggleInlineCompletion(output)),
   );
 }
 
 export function deactivate(): void {}
 
+/**
+ * Flips `garrison.inlineCompletion.enabled` and says which way it went.
+ *
+ * Written to the workspace when the workspace already says something about
+ * it, and globally otherwise, so toggling in one project does not silently
+ * become a decision about every project.
+ */
+async function toggleInlineCompletion(output: vscode.LogOutputChannel): Promise<void> {
+  const config = vscode.workspace.getConfiguration("garrison");
+  const setting = config.inspect<boolean>("inlineCompletion.enabled");
+  const enabled = config.get<boolean>("inlineCompletion.enabled", true);
+  const target = setting?.workspaceValue === undefined
+    ? vscode.ConfigurationTarget.Global
+    : vscode.ConfigurationTarget.Workspace;
+
+  await config.update("inlineCompletion.enabled", !enabled, target);
+  const state = enabled ? "disabled" : "enabled";
+  output.info(`inline completion ${state}`);
+  void vscode.window.showInformationMessage(`Garrison inline completion ${state}.`);
+}
+
 class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposable {
   private view: vscode.WebviewView | undefined;
-  private client: AcpClient | undefined;
-  private sessionId: string | undefined;
   private busy = false;
   private readonly pendingPermissions = new Set<number | string>();
+  private readonly subscriptions: vscode.Disposable[] = [];
 
-  constructor(private readonly extensionUri: vscode.Uri, private readonly output: vscode.LogOutputChannel) {}
+  constructor(
+    private readonly connection: GarrisonConnection,
+    private readonly extensionUri: vscode.Uri,
+    private readonly output: vscode.LogOutputChannel,
+  ) {
+    this.subscriptions.push(
+      connection.onNotification(({ method, params }) => this.notification(method, params)),
+      connection.onRequest(({ id, method, params }) => void this.agentRequest(id, method, params)),
+      connection.onClosed(error => this.post({ type: "disconnected", text: error.message })),
+    );
+  }
 
   resolveWebviewView(view: vscode.WebviewView): void {
     this.view = view;
@@ -44,10 +83,10 @@ class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
 
   async newSession(): Promise<void> {
     if (this.busy) await this.cancel();
-    this.sessionId = undefined;
+    this.connection.resetSession();
     this.post({ type: "reset" });
     try {
-      await this.ensureSession();
+      await this.connection.session();
       this.post({ type: "ready" });
     } catch (error) { this.report(error); }
   }
@@ -59,8 +98,8 @@ class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
     this.post({ type: "user", text });
     this.post({ type: "busy", value: true });
     try {
-      const sessionId = await this.ensureSession();
-      await this.client!.request("session/prompt", {
+      const sessionId = await this.connection.session();
+      await this.connection.request("session/prompt", {
         sessionId,
         prompt: [{ type: "text", text }],
       });
@@ -70,70 +109,25 @@ class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
   }
 
   async cancel(): Promise<void> {
-    if (!this.busy || !this.sessionId || !this.client) return;
-    this.client.notify("session/cancel", { sessionId: this.sessionId });
+    if (!this.busy || !this.connection.hasSession) return;
+    const sessionId = await this.connection.session();
+    this.connection.notify("session/cancel", { sessionId });
     for (const id of this.pendingPermissions) {
-      this.client.respond(id, { outcome: { outcome: "cancelled" } });
+      this.connection.respond(id, { outcome: { outcome: "cancelled" } });
     }
     this.pendingPermissions.clear();
   }
 
   async showStatus(): Promise<void> {
     try {
-      await this.ensureConnected();
-      const status = await this.client!.request<Record<string, Json>>("_garrison/status", {});
+      const status = await this.connection.request<Record<string, Json>>("_garrison/status", {});
       this.output.info(JSON.stringify(status, null, 2));
       this.output.show(true);
     } catch (error) { this.report(error); }
   }
 
-  dispose(): void { this.client?.dispose(); }
-
-  private async ensureSession(): Promise<string> {
-    await this.ensureConnected();
-    if (this.sessionId) return this.sessionId;
-    const root = vscode.workspace.workspaceFolders?.[0]?.uri;
-    if (!root || root.scheme !== "file") throw new Error("Open a local workspace folder to start Garrison");
-    const response = await this.client!.request<NewSessionResponse>("session/new", { cwd: root.fsPath, mcpServers: [] });
-    this.sessionId = response.sessionId;
-    return response.sessionId;
-  }
-
-  private async ensureConnected(): Promise<void> {
-    if (this.client) return;
-    const config = vscode.workspace.getConfiguration("garrison");
-    // `garrison-agent acp` is a relay to the per-user daemon, not an engine:
-    // the flags only tell it where the socket is. The daemon's own
-    // configuration governs every session, which is why there is no
-    // acton-ai config setting here.
-    const command = config.get<string>("agentPath", "garrison-agent");
-    const args: string[] = [];
-    const socket = config.get<string>("socket", "");
-    const configPath = config.get<string>("configPath", "");
-    if (socket) args.push("--socket", socket);
-    if (configPath) args.push("--config", configPath);
-    const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
-    const client = new AcpClient(line => this.output.info(line));
-    this.client = client;
-    client.on("notification", (method, params) => this.notification(String(method), params));
-    client.on("request", (id, method, params) => void this.agentRequest(id as number | string, String(method), params));
-    client.on("close", (error: Error) => {
-      if (this.client === client) this.client = undefined;
-      this.sessionId = undefined;
-      this.post({ type: "disconnected", text: error.message });
-    });
-    try {
-      await client.start(command, args, cwd);
-      await client.request("initialize", {
-        protocolVersion: 1,
-        clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
-        clientInfo: { name: "garrison-vscode", version: "0.1.0" },
-      });
-    } catch (error) {
-      client.dispose();
-      if (this.client === client) this.client = undefined;
-      throw error;
-    }
+  dispose(): void {
+    for (const subscription of this.subscriptions) subscription.dispose();
   }
 
   private notification(method: string, params: unknown): void {
@@ -152,7 +146,7 @@ class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
 
   private async agentRequest(id: number | string, method: string, raw: unknown): Promise<void> {
     if (method !== "session/request_permission") {
-      this.client?.respond(id, { outcome: { outcome: "cancelled" } });
+      this.connection.respond(id, { outcome: { outcome: "cancelled" } });
       return;
     }
     const request = raw as PermissionRequest;
@@ -171,7 +165,7 @@ class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposable 
     const outcome: Json = option
       ? { outcome: "selected", optionId: option.optionId }
       : { outcome: "cancelled" };
-    if (this.pendingPermissions.delete(id)) this.client?.respond(id, { outcome });
+    if (this.pendingPermissions.delete(id)) this.connection.respond(id, { outcome });
   }
 
   private report(error: unknown): void {

@@ -21,8 +21,9 @@ import java.nio.file.Path;
 import java.util.Map;
 import java.util.concurrent.*;
 
-final class GarrisonToolWindow implements Disposable {
+final class GarrisonToolWindow implements Disposable, GarrisonConnection.Listener {
     private final Project project;
+    private final GarrisonConnection connection;
     private final JPanel root = new JPanel(new BorderLayout());
     private final JTextPane transcript = new JTextPane();
     private final JBTextArea input = new JBTextArea(4, 20);
@@ -34,12 +35,12 @@ final class GarrisonToolWindow implements Disposable {
         return thread;
     });
     private final Map<String, JsonElement> pendingApprovals = new ConcurrentHashMap<>();
-    private volatile AcpClient client;
-    private volatile String sessionId;
     private volatile boolean busy;
 
     GarrisonToolWindow(Project project) {
         this.project = project;
+        this.connection = GarrisonConnection.getInstance(project);
+        this.connection.setListener(this);
         transcript.setEditable(false);
         transcript.setContentType("text/plain");
         var scroll = new JBScrollPane(transcript);
@@ -81,7 +82,7 @@ final class GarrisonToolWindow implements Disposable {
         setBusy(true);
         worker.submit(() -> {
             try {
-                String id = ensureSession();
+                String id = connection.session();
                 var content = new JsonObject();
                 content.addProperty("type", "text");
                 content.addProperty("text", text);
@@ -90,46 +91,15 @@ final class GarrisonToolWindow implements Disposable {
                 var params = new JsonObject();
                 params.addProperty("sessionId", id);
                 params.add("prompt", prompt);
-                client.request("session/prompt", params).get();
+                connection.request("session/prompt", params).get();
                 append("\n", false);
             } catch (Exception error) { report(error); }
             finally { setBusy(false); }
         });
     }
 
-    private String ensureSession() throws Exception {
-        ensureConnected();
-        if (sessionId != null) return sessionId;
-        var params = new JsonObject();
-        params.addProperty("cwd", project.getBasePath());
-        params.add("mcpServers", new JsonArray());
-        sessionId = client.request("session/new", params).get().get("sessionId").getAsString();
-        return sessionId;
-    }
-
-    private void ensureConnected() throws Exception {
-        if (client != null) return;
-        String basePath = project.getBasePath();
-        if (basePath == null) throw new IOException("Open a local project to start Garrison");
-        var candidate = new AcpClient(Path.of(basePath), GarrisonSettings.getInstance().getState(),
-                this::notification, this::agentRequest);
-        var params = new JsonObject();
-        params.addProperty("protocolVersion", 1);
-        params.add("clientCapabilities", new JsonObject());
-        var info = new JsonObject();
-        info.addProperty("name", "garrison-jetbrains");
-        info.addProperty("version", "0.1.0");
-        params.add("clientInfo", info);
-        try {
-            candidate.request("initialize", params).get();
-            client = candidate;
-        } catch (Exception error) {
-            candidate.close();
-            throw error;
-        }
-    }
-
-    private void notification(JsonObject frame) {
+    @Override
+    public void notification(JsonObject frame) {
         if (!"session/update".equals(frame.get("method").getAsString())) return;
         var update = frame.getAsJsonObject("params").getAsJsonObject("update");
         String kind = update.get("sessionUpdate").getAsString();
@@ -142,7 +112,8 @@ final class GarrisonToolWindow implements Disposable {
         }
     }
 
-    private void agentRequest(JsonElement id, String method, JsonObject params) {
+    @Override
+    public void agentRequest(JsonElement id, String method, JsonObject params) {
         if (!"session/request_permission".equals(method)) {
             respondCancelled(id);
             return;
@@ -165,27 +136,25 @@ final class GarrisonToolWindow implements Disposable {
     }
 
     private void cancelTurn() {
-        var active = client;
-        var id = sessionId;
-        if (!busy || active == null || id == null) return;
+        if (!busy || !connection.hasSession()) return;
         var params = new JsonObject();
-        params.addProperty("sessionId", id);
-        try { active.notify("session/cancel", params); } catch (IOException error) { report(error); }
+        try { params.addProperty("sessionId", connection.session()); }
+        catch (Exception error) { report(error); return; }
+        try { connection.notify("session/cancel", params); } catch (IOException error) { report(error); }
         pendingApprovals.values().forEach(this::respondCancelled);
         pendingApprovals.clear();
     }
 
     private void newSession() {
         cancelTurn();
-        sessionId = null;
+        connection.resetSession();
         ApplicationManager.getApplication().invokeLater(() -> transcript.setText(""));
     }
 
     private void showStatus() {
         worker.submit(() -> {
             try {
-                ensureConnected();
-                var status = client.request("_garrison/status", new JsonObject()).get();
+                var status = connection.request("_garrison/status", new JsonObject()).get();
                 ApplicationManager.getApplication().invokeLater(() ->
                         Messages.showInfoMessage(project, status.toString(), "Garrison Governance Status"));
             } catch (Exception error) { report(error); }
@@ -198,7 +167,7 @@ final class GarrisonToolWindow implements Disposable {
         outcome.addProperty("optionId", optionId);
         var result = new JsonObject();
         result.add("outcome", outcome);
-        if (client != null) client.respond(id, result);
+        connection.respond(id, result);
     }
 
     private void respondCancelled(JsonElement id) {
@@ -206,7 +175,7 @@ final class GarrisonToolWindow implements Disposable {
         outcome.addProperty("outcome", "cancelled");
         var result = new JsonObject();
         result.add("outcome", outcome);
-        if (client != null) client.respond(id, result);
+        connection.respond(id, result);
     }
 
     private void append(String text, boolean user) {
@@ -244,7 +213,10 @@ final class GarrisonToolWindow implements Disposable {
     @Override
     public void dispose() {
         cancelTurn();
-        if (client != null) client.close();
+        // The connection belongs to the project service, not to this window:
+        // closing it here would kill the agent that inline completion is still
+        // using after the tool window is closed.
+        connection.setListener(null);
         worker.shutdownNow();
     }
 }

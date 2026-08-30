@@ -33,6 +33,26 @@ A project must lie under the daemon's project root (its working directory,
 | Daemon socket | The daemon's socket, if not the default. Passed as `--socket`. |
 | Garrison config | A `garrison.toml` the relay reads for `[server]` only. Never passed to an autostarted daemon. |
 
+## Inline completion
+
+Garrison suggests code at the cursor as you type, as ghost text. Suggestions
+come from the same agent and the same session as the tool window, over the
+`_garrison/complete` extension method, so they are inside the same project
+boundary and the same governance as everything else the agent does. The
+request carries no tools, so a keystroke can never raise an approval dialog.
+
+Both settings live under **Settings | Tools | Garrison**: a checkbox to turn
+it off and on, and the delay (default 250 ms) typing must pause for before the
+agent is asked. An explicit invocation ignores the delay.
+
+A suggestion that fails is logged and never raises a dialog: it is speculative
+work you did not ask for. After a failure the agent is left alone for 30
+seconds rather than being asked again on the next keystroke.
+
+The provider is the plugin's only Kotlin source. The platform's inline
+completion API declares its work as a `suspend` function and identifies
+providers with an inline value class, neither of which Java can implement.
+
 ## Development
 
 1. Build `garrison-agent` and make it available on `PATH`.

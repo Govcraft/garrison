@@ -1,5 +1,10 @@
 plugins {
     java
+    // The inline completion API is Kotlin-only: `InlineCompletionProvider`
+    // declares `getSuggestion` as a suspend function and identifies providers
+    // with an inline value class, neither of which Java can implement. The
+    // rest of the plugin stays Java.
+    kotlin("jvm") version "2.2.20"
     id("org.jetbrains.intellij.platform") version "2.18.1"
 }
 
@@ -22,6 +27,10 @@ java {
 }
 
 tasks.withType<JavaCompile>().configureEach { options.release = 21 }
+
+kotlin {
+    compilerOptions { jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_21 }
+}
 
 intellijPlatform {
     pluginConfiguration {
