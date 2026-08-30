@@ -10,6 +10,7 @@ import com.intellij.openapi.ui.Messages;
 import com.intellij.ui.JBColor;
 import com.intellij.ui.components.*;
 import com.intellij.util.ui.JBUI;
+import com.intellij.util.ui.accessibility.AccessibleAnnouncerUtil;
 
 import javax.swing.*;
 import javax.swing.text.BadLocationException;
@@ -79,6 +80,7 @@ final class GarrisonToolWindow implements Disposable, GarrisonConnection.Listene
         if (text.isEmpty() || busy) return;
         input.setText("");
         append("You\n" + text + "\n\n", true);
+        announce("Garrison is responding.", false);
         setBusy(true);
         worker.submit(() -> {
             try {
@@ -93,6 +95,7 @@ final class GarrisonToolWindow implements Disposable, GarrisonConnection.Listene
                 params.add("prompt", prompt);
                 connection.request("session/prompt", params).get();
                 append("\n", false);
+                announce("Garrison response complete.", false);
             } catch (Exception error) { report(error); }
             finally { setBusy(false); }
         });
@@ -106,9 +109,14 @@ final class GarrisonToolWindow implements Disposable, GarrisonConnection.Listene
         if ("agent_message_chunk".equals(kind)) {
             append(update.getAsJsonObject("content").get("text").getAsString(), false);
         } else if ("tool_call".equals(kind)) {
-            append("\n[" + update.get("title").getAsString() + " · " + value(update, "status", "in_progress") + "]\n", false);
+            String title = update.get("title").getAsString();
+            String status = value(update, "status", "in progress");
+            append("\n[" + title + " · " + status + "]\n", false);
+            announce("Tool " + title + ": " + status + ".", false);
         } else if ("tool_call_update".equals(kind)) {
-            append("[Tool " + value(update, "status", "updated") + "]\n", false);
+            String status = value(update, "status", "updated");
+            append("[Tool " + status + "]\n", false);
+            announce("Tool " + status + ".", false);
         }
     }
 
@@ -200,10 +208,17 @@ final class GarrisonToolWindow implements Disposable, GarrisonConnection.Listene
         });
     }
 
+    private void announce(String message, boolean interrupt) {
+        ApplicationManager.getApplication().invokeLater(() ->
+                AccessibleAnnouncerUtil.announce(transcript, message, interrupt));
+    }
+
     private void report(Throwable error) {
         Throwable cause = error instanceof ExecutionException && error.getCause() != null ? error.getCause() : error;
+        String message = cause.getMessage();
+        announce("Garrison error: " + (message == null || message.isBlank() ? "The operation failed." : message), true);
         ApplicationManager.getApplication().invokeLater(() ->
-                Messages.showErrorDialog(project, cause.getMessage(), "Garrison"));
+                Messages.showErrorDialog(project, message, "Garrison"));
     }
 
     private static String value(JsonObject object, String name, String fallback) {
