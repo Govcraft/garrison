@@ -8,6 +8,10 @@
 *.txt
 *.md
 !README.md
+!CLA.md
+!CONTRIBUTING.md
+!LICENSING.md
+!TRADEMARKS.md
 keys/
 .env
 *.pcap
