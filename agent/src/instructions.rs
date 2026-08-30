@@ -90,8 +90,11 @@ pub fn discover(
         .then(user_instructions_path)
         .flatten();
 
-    let found =
-        AgentInstructions::discover_with_root(working_directory, project_root, user_file.as_deref())?;
+    let found = AgentInstructions::discover_with_root(
+        working_directory,
+        project_root,
+        user_file.as_deref(),
+    )?;
 
     let kept = filter_layers(found.layers(), project_root, discovery, allowed_paths);
     Ok(render(&kept))
@@ -208,7 +211,12 @@ mod tests {
             layer(InstructionScope::User, "/home/op/.agents/AGENTS.md", "b"),
         ];
 
-        let kept = filter_layers(&layers, Path::new("/root"), AgentsMdDiscovery::Disabled, &[]);
+        let kept = filter_layers(
+            &layers,
+            Path::new("/root"),
+            AgentsMdDiscovery::Disabled,
+            &[],
+        );
 
         assert!(kept.is_empty());
     }
@@ -227,9 +235,18 @@ mod tests {
 
     #[test]
     fn restricted_discovery_drops_the_user_layer_even_when_no_paths_are_named() {
-        let layers = vec![layer(InstructionScope::User, "/home/op/.agents/AGENTS.md", "b")];
+        let layers = vec![layer(
+            InstructionScope::User,
+            "/home/op/.agents/AGENTS.md",
+            "b",
+        )];
 
-        let kept = filter_layers(&layers, Path::new("/root"), AgentsMdDiscovery::Restricted, &[]);
+        let kept = filter_layers(
+            &layers,
+            Path::new("/root"),
+            AgentsMdDiscovery::Restricted,
+            &[],
+        );
 
         assert!(kept.is_empty());
     }
@@ -328,7 +345,11 @@ mod tests {
 
     #[test]
     fn the_audit_row_carries_a_hash_and_never_the_content() {
-        let root = layer(InstructionScope::Project, "/root/AGENTS.md", "secret rule text");
+        let root = layer(
+            InstructionScope::Project,
+            "/root/AGENTS.md",
+            "secret rule text",
+        );
         let discovered = render(&[&root]);
 
         let row = &discovered.layers[0];

@@ -884,7 +884,10 @@ struct TurnJob {
 /// system prompt still runs.
 async fn discovered_agents_md(setup: &ThreadSetup) -> Option<String> {
     let policy = match &setup.policy {
-        Some(handle) => match handle.ask(crate::policy::agent::CurrentAgentsMdPolicy).await {
+        Some(handle) => match handle
+            .ask(crate::policy::agent::CurrentAgentsMdPolicy)
+            .await
+        {
             Ok(policy) => policy,
             Err(error) => {
                 tracing::warn!(

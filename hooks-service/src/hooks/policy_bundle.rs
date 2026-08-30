@@ -246,10 +246,8 @@ fn parse_enum<T: serde::de::DeserializeOwned + Default>(value: Option<&str>) -> 
 fn parse_agents_md_discovery(value: Option<&str>) -> AgentsMdDiscovery {
     match value {
         None => AgentsMdDiscovery::Enabled,
-        Some(value) => {
-            serde_json::from_value(serde_json::Value::String(value.to_string()))
-                .unwrap_or(AgentsMdDiscovery::Disabled)
-        }
+        Some(value) => serde_json::from_value(serde_json::Value::String(value.to_string()))
+            .unwrap_or(AgentsMdDiscovery::Disabled),
     }
 }
 
