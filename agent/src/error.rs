@@ -104,6 +104,15 @@ pub enum GarrisonErrorKind {
         /// What the comparison found.
         reason: String,
     },
+    /// A review ran but its audit trail never reached the control plane.
+    ///
+    /// Separate from every other audit failure because nothing is wrong with
+    /// the trail: it is intact, and it is on a machine that is about to be
+    /// deleted. The finding is about the evidence not existing anywhere else.
+    AuditUnshipped {
+        /// What stopped it.
+        reason: String,
+    },
     /// A review ran, found something blocking, and was enforcing.
     ///
     /// A rejection rather than a malfunction: the reviewer worked exactly as
@@ -212,6 +221,20 @@ impl GarrisonError {
         Self::new(GarrisonErrorKind::PatchRejected {
             reason: reason.into(),
         })
+    }
+
+    /// A review's audit trail never reached the control plane.
+    #[must_use]
+    pub fn audit_unshipped(reason: impl Into<String>) -> Self {
+        Self::new(GarrisonErrorKind::AuditUnshipped {
+            reason: reason.into(),
+        })
+    }
+
+    /// Whether the audit trail failed to leave the machine.
+    #[must_use]
+    pub const fn is_audit_unshipped(&self) -> bool {
+        matches!(self.kind, GarrisonErrorKind::AuditUnshipped { .. })
     }
 
     /// A review found something blocking while enforcing.
@@ -323,6 +346,11 @@ impl fmt::Display for GarrisonError {
             GarrisonErrorKind::ReviewBlocked { reason } => {
                 write!(f, "the review blocked this change: {reason}")
             }
+            GarrisonErrorKind::AuditUnshipped { reason } => write!(
+                f,
+                "the review ran but its audit trail did not reach the control \
+                 plane, so there is no evidence it happened: {reason}"
+            ),
         }
     }
 }

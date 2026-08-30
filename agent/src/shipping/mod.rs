@@ -15,6 +15,8 @@
 //!   appending to.
 //! - [`policy`] holds the written rule for when an unshipped backlog stops
 //!   the work, as pure functions over a status and a clock.
+//! - [`drain`] holds the rule for a machine that is about to be deleted, where
+//!   an unshipped entry is destroyed evidence rather than delayed evidence.
 //! - [`actor`] is the one thing with I/O in it: [`TrailShipper`], which polls
 //!   the trail, posts entries through the shared plane component, and answers
 //!   both `AdmitTurn` and `Describe`.
@@ -46,10 +48,12 @@
 
 pub mod actor;
 pub mod cursor;
+pub mod drain;
 pub mod policy;
 pub mod reader;
 
 pub use actor::{ShipperSettings, TrailShipper};
 pub use cursor::{Cursor, ResumeFault};
+pub use drain::{step as drain_step, Progress, Step};
 pub use policy::{admit_turn, backoff_delay, ShippingPolicy};
 pub use reader::{read_batch, Batch, ReadFault};

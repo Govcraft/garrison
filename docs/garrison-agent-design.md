@@ -174,9 +174,12 @@ Blocking is opt-in (`--enforce`) and off by default. Advisory also downgrades
 the comments themselves, because a Bitbucket BLOCKER comment gates a merge
 whatever the build status says.
 
-**Not** covered: audit shipping from an ephemeral runner (#8), which is a hard
-dependency for CI evidence and is not built. A review run in a container
-currently leaves its trail only where the container kept it.
+A review also waits for its audit trail to be accepted by the plane before it
+exits, and exits 5 when it was not. The general shipping policy assumes the
+trail file is a durable buffer, which is true of a laptop and false of a
+container deleted minutes after the step ends: there, an entry still in the
+buffer is destroyed evidence rather than delayed evidence. The drain is in
+`shipping/drain.rs`, pure and separate from the policy it qualifies.
 
 ### 1.11 Model-specific coding prompts
 Codex ships per-model system prompts (~80 focused lines) plus
@@ -282,8 +285,7 @@ client identity.
    section 6)
 8. **Review mode + PTY unified exec** — review mode implemented; PTY unified
    exec remains
-9. ~~**Bitbucket DC PR review** (review mode over REST API)~~ — implemented,
-   less audit shipping from an ephemeral runner (#8)
+9. ~~**Bitbucket DC PR review** (review mode over REST API)~~ — implemented
 
 Items 3–6 are the current agent-critical path. Control-plane, extension, and
 compliance work is tracked separately from this agent implementation plan.

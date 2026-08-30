@@ -14,6 +14,7 @@ garrison-agent review \
   --pull-request AGENCY/benefits-portal/42 \
   --commit "$GIT_COMMIT" \
   --run-url "$BUILD_URL" \
+  --audit-timeout 60 \
   --post
 ```
 
@@ -26,12 +27,18 @@ most CI logs.
 
 ## Exit codes
 
-| Code | Meaning |
-|------|---------|
-| 0 | The review ran. Findings may have been posted; nothing blocked. |
-| 1 | The review did not happen. The answer could not be read as a review. |
-| 2 | It refused to start: a malformed `--pull-request`, no credential. |
-| 3 | `--enforce` was set and a blocker-severity finding was found. |
+| Code | Meaning | Who should look |
+|------|---------|-----------------|
+| 0 | The review ran. Findings may have been posted; nothing blocked. | Nobody |
+| 1 | The review did not happen. The answer could not be read as a review. | An operator |
+| 2 | It refused to start: a malformed `--pull-request`, no credential. | Whoever wired the pipeline |
+| 3 | `--enforce` was set and a blocker-severity finding was found. | A developer |
+| 5 | The review ran but its audit trail never reached the control plane. | An operator |
+
+Codes 3 and 5 are deliberately distinct. One says the code under review has a
+problem; the other says the review itself cannot be proven to have happened.
+Collapsing them would route every shipping outage to a developer who has
+nothing to fix.
 
 The distinction between 0 and 1 is the one that matters. **An answer that
 could not be parsed is not a clean review.** A pipeline that treated it as one
@@ -122,13 +129,43 @@ Issue #16 raised four. Three are settled in the code; one is not.
    The install key never leaves the runner and is not used here.
 4. **What does a finding block?** — Nothing, by default. See advisory above.
 
+## The trail has to leave before the runner does
+
+This is the part a CI review gets wrong by default, and it is worth stating
+why rather than just documenting the flag.
+
+Garrison's general shipping policy is built on one assumption: the trail file
+is a durable buffer. An unreachable control plane never stops a turn, because
+a laptop on a train catches up when it lands, and a daemon that refused to
+work whenever a VPN dropped would be switched off within a week.
+
+That assumption is false in a container. The runner is deleted minutes after
+the review ends, so an entry still sitting in its buffer is not delayed
+evidence, it is destroyed evidence. Identical status fields, opposite meaning.
+
+So `review` waits for the plane to accept the trail before it exits, and exits
+5 when it could not. `--audit-timeout` bounds the wait (30 seconds by default)
+and `--allow-unshipped-audit` downgrades the failure to a warning, which is
+right on a workstation and wrong on a runner.
+
+Two subtleties the implementation handles, both of which would otherwise
+produce a confident green check:
+
+- **An empty backlog is not proof.** A turn's last entries are sealed
+  asynchronously, so a backlog of zero one millisecond after the turn can mean
+  "nothing written yet" rather than "everything shipped". The drain requires
+  the backlog to be empty *and* the trail head to have stopped moving between
+  observations.
+- **A halt is not waited out.** If the plane refused an entry as forked, or
+  the credential was rejected, the drain stops immediately rather than
+  spending the remaining timeout learning nothing.
+
+When the trail does not make it, the build status on the pull request says so
+too. A green mark on a review whose evidence died with the container would be
+precisely the claim Garrison exists not to make.
+
 ## What is not built
 
-- **Audit shipping from an ephemeral runner.** #16 names #8 as a hard
-  dependency: a trail written to a runner's local disk dies with the
-  container. Review mode does not yet ship its trail, so a review performed in
-  CI currently leaves evidence only where the runner kept it. This is the
-  largest remaining gap and it is a real one.
 - **Policy distribution to a pipeline install** (#11), so a build agent runs
   the organization's policy rather than whatever the repository ships.
 - **Reviewing anything that is not a Bitbucket pull request.** A local

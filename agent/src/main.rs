@@ -178,6 +178,22 @@ enum Command {
         /// How many unchanged lines to show either side of each change.
         #[arg(long, default_value_t = 10)]
         context: u32,
+        /// How long to wait for the audit trail to reach the control plane.
+        ///
+        /// A CI runner is deleted minutes after the review ends, so an entry
+        /// still in its buffer is destroyed evidence rather than delayed
+        /// evidence. The run waits for the plane to accept the trail before
+        /// exiting, and says so when it could not.
+        #[arg(long, default_value_t = 30)]
+        audit_timeout: u64,
+        /// Exit successfully even when the trail did not reach the plane.
+        ///
+        /// For running this from a workstation, where the trail file survives
+        /// and ships later. On an ephemeral runner it turns "no evidence this
+        /// review happened" into a green check, which is the failure the
+        /// default exists to prevent.
+        #[arg(long)]
+        allow_unshipped_audit: bool,
     },
 }
 
@@ -349,6 +365,8 @@ async fn run(cli: Cli) -> Result<(), GarrisonError> {
             commit,
             run_url,
             context,
+            audit_timeout,
+            allow_unshipped_audit,
         } => {
             review(ReviewRun {
                 socket,
@@ -359,6 +377,8 @@ async fn run(cli: Cli) -> Result<(), GarrisonError> {
                 commit,
                 run_url,
                 context,
+                audit_timeout,
+                allow_unshipped_audit,
             })
             .await
         }
@@ -792,6 +812,8 @@ struct ReviewRun {
     commit: Option<String>,
     run_url: Option<String>,
     context: u32,
+    audit_timeout: u64,
+    allow_unshipped_audit: bool,
 }
 
 /// The environment variable carrying the Bitbucket credential.
@@ -875,18 +897,53 @@ async fn review(run: ReviewRun) -> Result<(), GarrisonError> {
         outcome
     };
 
+    // Drain before the status is posted, so the status can report on the
+    // evidence as well as the findings. A pull request marked green by a run
+    // whose trail died with the container would be the exact claim Garrison
+    // exists not to make.
+    let evidence = drain_audit(&run).await;
+    let audit_failure = match &evidence {
+        Evidence::Shipped(through) => {
+            println!("the audit trail reached the plane through entry {through}");
+            None
+        }
+        Evidence::NotShipping => {
+            // Not an error here. A standalone install legitimately ships
+            // nothing, and this binary cannot tell that apart from a
+            // misconfigured runner. Said out loud so the difference is the
+            // operator's to notice rather than nobody's.
+            println!(
+                "this install ships no audit trail, so this review left evidence \
+                 only on the machine that ran it"
+            );
+            None
+        }
+        Evidence::Missing(reason) => Some(reason.clone()),
+    };
+
+    if let Some(reason) = &audit_failure {
+        eprintln!("the audit trail did not leave this machine: {reason}");
+    }
+
     if let (Some(commit), true) = (run.commit.as_ref(), run.post) {
         // A status is only posted when posting is on. A dry run that marked
         // the pull request would not be a dry run.
         let status = garrison_bitbucket::BuildStatus {
             key: STATUS_KEY.to_string(),
-            state: outcome.build_state(),
+            state: if audit_failure.is_some() {
+                garrison_bitbucket::BuildState::Failed
+            } else {
+                outcome.build_state()
+            },
             url: run
                 .run_url
                 .clone()
                 .unwrap_or_else(|| "https://garrison.local/review".to_string()),
             name: "Garrison review".to_string(),
-            description: outcome.description(),
+            description: audit_failure.as_ref().map_or_else(
+                || outcome.description(),
+                |reason| format!("{} (audit not shipped: {reason})", outcome.description()),
+            ),
         };
         if let Err(error) = bitbucket.set_build_status(commit, &status).await {
             // Not fatal on its own: the comments already landed, and losing
@@ -897,12 +954,27 @@ async fn review(run: ReviewRun) -> Result<(), GarrisonError> {
 
     println!("\n{}", outcome.description());
 
+    // Order matters. A blocked review is reported ahead of a missing trail,
+    // because a developer with a blocker to fix should be sent to the blocker
+    // first; the shipping failure is still printed above either way.
     match outcome {
-        review::Outcome::Clean | review::Outcome::Advised { .. } => Ok(()),
         review::Outcome::Blocked { .. } => {
             Err(GarrisonError::review_blocked(outcome.description()))
         }
         review::Outcome::Failed { reason } => Err(GarrisonError::turn_failed(reason)),
+        review::Outcome::Clean | review::Outcome::Advised { .. } => match audit_failure {
+            // The default. A review nobody can prove happened is not a review
+            // that passed, and on a runner that is about to be deleted there
+            // is no later attempt that fixes it.
+            Some(reason) if !run.allow_unshipped_audit => {
+                Err(GarrisonError::audit_unshipped(reason))
+            }
+            Some(reason) => {
+                println!("continuing anyway, because --allow-unshipped-audit was given: {reason}");
+                Ok(())
+            }
+            None => Ok(()),
+        },
     }
 }
 
@@ -1034,5 +1106,93 @@ async fn publish(
     println!("\nposted {posted} comment(s)");
     if refused > 0 {
         println!("{refused} were refused by Bitbucket and are above in this log");
+    }
+}
+
+/// What the drain came to, once the polling stopped.
+enum Evidence {
+    /// The plane accepted the trail through this sequence.
+    Shipped(u64),
+    /// It did not, and this is why.
+    Missing(String),
+    /// This install does not ship at all.
+    NotShipping,
+}
+
+/// Waits for the audit trail to reach the control plane before the machine
+/// that wrote it stops existing.
+///
+/// This is the whole reason a CI review differs from a workstation one. The
+/// shipping policy elsewhere in this binary is built on the trail file being a
+/// durable buffer, which is true of a laptop and false of a container that is
+/// deleted when the pipeline step ends. Waiting here is what turns "the entry
+/// is queued" into "the entry is evidence".
+async fn drain_audit(run: &ReviewRun) -> Evidence {
+    use garrison_agent::shipping::drain::{self, Progress, Step};
+
+    let deadline = std::time::Duration::from_secs(run.audit_timeout);
+    let started = std::time::Instant::now();
+
+    let (_server, path) = match client_target(run.socket.clone(), None) {
+        Ok(target) => target,
+        Err(error) => {
+            return Evidence::Missing(format!("the daemon could not be located: {error}"))
+        }
+    };
+
+    let stream = match daemon::connect(&path).await {
+        Ok(stream) => stream,
+        // Not fatal to reach for: the daemon may have exited with the runner.
+        // But it does mean nobody can say whether the trail left, which is
+        // exactly the thing this function exists to establish.
+        Err(error) => {
+            return Evidence::Missing(format!(
+                "the daemon could not be reached to confirm shipping: {error}"
+            ))
+        }
+    };
+
+    let mut client = AgentClient::from_stream(stream);
+    if let Err(error) = client.initialize("garrison-agent review drain").await {
+        return Evidence::Missing(format!("the daemon would not answer: {error}"));
+    }
+
+    let mut progress = Progress::default();
+
+    loop {
+        let status: acp::GarrisonStatus = match client
+            .request(acp::ext::STATUS, &serde_json::json!({}), &mut Quiet)
+            .await
+        {
+            Ok(status) => status,
+            Err(error) => {
+                return Evidence::Missing(format!("the status could not be read: {error}"))
+            }
+        };
+
+        let Some(shipping) = status.shipping else {
+            // No shipping section at all. Reported as "not shipping" rather
+            // than as a failure, because the caller is the one that knows
+            // whether that is a configuration choice or a governance hole.
+            return Evidence::NotShipping;
+        };
+
+        match drain::step(&shipping, progress, started.elapsed(), deadline) {
+            Step::Complete { shipped_through } => return Evidence::Shipped(shipped_through),
+            Step::NotShipping => return Evidence::NotShipping,
+            Step::Halted { reason } => {
+                return Evidence::Missing(format!("shipping has halted: {reason}"))
+            }
+            Step::Expired { backlog } => {
+                return Evidence::Missing(format!(
+                    "{backlog} entr(ies) were still unshipped after {}s",
+                    run.audit_timeout
+                ))
+            }
+            Step::Waiting { next_poll, .. } => {
+                progress = Progress::observing(shipping.local_head);
+                tokio::time::sleep(next_poll).await;
+            }
+        }
     }
 }

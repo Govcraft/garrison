@@ -107,7 +107,10 @@ direction, not checkout.
   permission prompt. Blocking is opt-in and off by default, since failing a
   build on a model's opinion is a strong claim. An answer that cannot be
   parsed exits non-zero rather than reporting a clean review, because a green
-  check on code nobody read is worse than no reviewer at all. See
+  check on code nobody read is worse than no reviewer at all. It also waits
+  for its audit trail to reach the plane before exiting, because a container
+  is deleted minutes later and an entry still in its buffer is destroyed
+  evidence rather than delayed evidence. See
   [docs/review-mode.md](docs/review-mode.md).
 - acton-ai policy, accounting, audit, planning, context, MCP, and tool-loop
   primitives where enabled by configuration.
@@ -122,9 +125,6 @@ sync alongside them. These components are not present in this repository today:
 - Infrastructure, SIEM integration, and compliance document sets.
 - Command-prefix policy, turn diffs, repository context,
   project-instruction discovery, and persistent PTYs.
-- Audit shipping from an ephemeral CI runner. Until it exists, a review run
-  in a pipeline leaves evidence only where the container kept it
-  ([#8](https://github.com/Govcraft/garrison/issues/8)).
 
 Some things the plane models are recorded rather than enforced, and the code
 says so out loud rather than implying otherwise: a bundle's `network_egress`

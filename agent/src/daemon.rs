@@ -56,6 +56,15 @@ pub const EXIT_REJECTED: u8 = 3;
 /// and 4 says it hangs together perfectly but is missing its tail.
 pub const EXIT_AUDIT_MISMATCH: u8 = 4;
 
+/// Exit status for "the review ran but its evidence never left the machine".
+///
+/// Its own code because a pipeline branches on it differently from everything
+/// else. 3 says the code under review has a problem and a developer should
+/// look at it; 5 says the review itself cannot be proven to have happened and
+/// an operator should look at the plane. Collapsing the two would send every
+/// shipping outage to the wrong person.
+pub const EXIT_AUDIT_UNSHIPPED: u8 = 5;
+
 /// The process exit status an error maps to.
 ///
 /// Pure, because the mapping is a contract: `RestartPreventExitStatus=2 3`
@@ -66,6 +75,8 @@ pub const fn exit_code(error: &GarrisonError) -> u8 {
         EXIT_REFUSED_TO_START
     } else if error.is_audit_anchor_mismatch() {
         EXIT_AUDIT_MISMATCH
+    } else if error.is_audit_unshipped() {
+        EXIT_AUDIT_UNSHIPPED
     } else if error.is_rejection() {
         EXIT_REJECTED
     } else {
@@ -477,6 +488,48 @@ mod tests {
             exit_code(&GarrisonError::audit_anchor_mismatch("truncated")),
             exit_code(&GarrisonError::audit_chain_broken("line 4")),
         );
+    }
+
+    #[test]
+    fn a_blocked_review_is_a_rejection_like_any_other() {
+        // Exit 3 already means "the system refused on purpose", and a review
+        // that found a blocker while enforcing is exactly that.
+        assert_eq!(
+            exit_code(&GarrisonError::review_blocked("1 blocker(s)")),
+            EXIT_REJECTED
+        );
+    }
+
+    #[test]
+    fn an_unshipped_trail_is_told_apart_from_every_other_failure() {
+        // This is a contract with whatever branches on the exit status. 3
+        // sends a developer to the code; 5 sends an operator to the plane.
+        // A pipeline that could not tell them apart would route every
+        // shipping outage to the wrong person.
+        let unshipped = exit_code(&GarrisonError::audit_unshipped("3 entries"));
+        assert_eq!(unshipped, EXIT_AUDIT_UNSHIPPED);
+
+        for other in [
+            GarrisonError::review_blocked("1 blocker"),
+            GarrisonError::audit_chain_broken("line 4"),
+            GarrisonError::audit_anchor_mismatch("truncated"),
+            GarrisonError::configuration("x", "y"),
+            GarrisonError::runtime("boom"),
+        ] {
+            assert_ne!(
+                unshipped,
+                exit_code(&other),
+                "an unshipped trail must not share a code with {other}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unshipped_trail_says_there_is_no_evidence_rather_than_naming_a_disk() {
+        // The message is what an operator reads at 2am. It has to name the
+        // consequence, not just the mechanism.
+        let rendered = GarrisonError::audit_unshipped("3 entries were still unshipped").to_string();
+        assert!(rendered.contains("no evidence"), "{rendered}");
     }
 
     #[tokio::test]
