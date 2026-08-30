@@ -202,20 +202,34 @@ claim and can already write the field back, and the binding is
 persisting an unfilled row. The client would then be unable to express a
 `token_id` at all, which is a stronger anti-replay property than the `@require`.
 
-It is not taken here for three reasons, in order of weight:
+**The route's one open question has been settled empirically.** It depended on
+the hook's `user_id` being populated for an `enrollee` bearer, which has no
+console `User` row. It is: probing the hook during the live redemption in
+`hooks-service/tests/directory_sync.rs` — a real enrollee artifact, posted to a
+real plane in a container — yields `user_id = Some("tok_alice_1")` against
+`token_id = "tok_alice_1"`. The subject claim arrives, and it is exactly the
+value the `@require` compares against today.
 
-1. **One assumption is unverified.** The route depends on the hook's `user_id`
-   being populated for an `enrollee` bearer, which has no console `User` row.
-   It is known populated for a bearer that does have one. There is no
-   end-to-end enrollment test today to settle it either way, which is itself
-   worth fixing.
-2. **On the update path it removes a check without replacing it.** `write`
-   covers update, and the hook no-ops on anything but a create. Redemption rows
-   are the evidence a security officer reads. The route needs a
-   `forbid UpdateRedemption` beside the existing append-only policies to be
-   safe, which is the right posture anyway but is a second decision.
-3. **It changes the on-disk packet**, which is the surface the issue singles
-   out as the one provisioning tooling will hard-code.
+What remains is a decision rather than a finding, for two reasons:
+
+1. **On the update path the route removes a check without replacing one.**
+   `write` covers update, and the hook no-ops on anything but a create.
+   Redemption rows are the evidence a security officer reads when an unknown
+   machine presents a revoked grant. The route needs a `forbid
+   UpdateRedemption` beside the existing append-only policies in
+   `policies/custom/` to be safe. That is the right posture regardless, but it
+   is a second decision and it is not implied by the first.
+2. **It changes the on-disk packet**, which the issue singles out as the
+   surface provisioning tooling will hard-code. Whoever owns that tooling
+   should say when, not have it decided for them.
 
 If it is taken, it must be taken before 1.0. `deny_unknown_fields` means a
-one-field daemon would hard-fail on any unspent two-field packet afterwards.
+one-field daemon would hard-fail on any unspent two-field packet afterwards,
+naming the file — the right failure, but a fleet-wide one.
+
+The mechanical cost, for sizing: drop `required` and the `@require` from
+`Redemption.token_id`; flip the field to `optional string` in
+`redemption_hooks.proto` and regenerate `hooks_descriptor.bin`; fill it from
+`user_id` in `provision`; drop the field from `Packet` and from the redemption
+body; add the `forbid`; migrate the column's nullability; update both documented
+mint recipes.
