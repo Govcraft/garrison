@@ -306,6 +306,39 @@ pub mod vector {
     );
 }
 
+/// Whether an integration test that needs real infrastructure may skip.
+///
+/// # Why this exists
+///
+/// Five test files in this workspace stand up a real control plane in a
+/// container and drive it. Each begins by checking that `schemaforge` is on
+/// `PATH` and that a container runtime answers, and returns early when either
+/// is missing. A test that returns early **passes**. That is the right
+/// behaviour on a laptop with no podman running, and it is a false green
+/// anywhere the tests are supposed to be the gate: the run reports success
+/// having exercised nothing.
+///
+/// So the skip is a decision rather than a reflex. Set `GARRISON_REQUIRE_LIVE`
+/// to a value other than `0` and a would-be skip panics instead, naming what
+/// was missing. CI sets it on any runner that has the infrastructure, and the
+/// `task test:live` recipe sets it locally.
+///
+/// # Panics
+///
+/// When `GARRISON_REQUIRE_LIVE` is set to anything but `0`, which is the
+/// point: the caller asked for the live gate and it could not be run.
+#[cfg(feature = "testing")]
+pub fn skip_live(reason: &str) {
+    let required = std::env::var("GARRISON_REQUIRE_LIVE")
+        .ok()
+        .is_some_and(|value| value != "0");
+    assert!(
+        !required,
+        "GARRISON_REQUIRE_LIVE is set, so this test may not skip: {reason}"
+    );
+    eprintln!("skipping: {reason}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

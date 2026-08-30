@@ -337,7 +337,7 @@ fn run_apply(cwd: &Path, db_url: &str) -> bool {
 #[tokio::test]
 async fn provisioning_and_deprovisioning_flow_through_a_real_plane() {
     if schemaforge().is_none() {
-        eprintln!("skipping: schemaforge is not on PATH");
+        garrison_wire::skip_live("schemaforge is not on PATH");
         return;
     }
 
@@ -352,7 +352,7 @@ async fn provisioning_and_deprovisioning_flow_through_a_real_plane() {
     let postgres = match image.start().await {
         Ok(container) => container,
         Err(error) => {
-            eprintln!("skipping: no container runtime answered ({error})");
+            garrison_wire::skip_live(&format!("no container runtime answered ({error})"));
             return;
         }
     };

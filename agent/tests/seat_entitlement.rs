@@ -213,7 +213,7 @@ fn run_apply(cwd: &Path, db_url: &str) -> bool {
 #[tokio::test]
 async fn a_seat_is_only_an_entitlement_while_the_plane_says_it_is() {
     if schemaforge().is_none() {
-        eprintln!("skipping: schemaforge is not on PATH");
+        garrison_wire::skip_live("schemaforge is not on PATH");
         return;
     }
 
@@ -228,7 +228,7 @@ async fn a_seat_is_only_an_entitlement_while_the_plane_says_it_is() {
     let postgres = match image.start().await {
         Ok(container) => container,
         Err(error) => {
-            eprintln!("skipping: no container runtime answered ({error})");
+            garrison_wire::skip_live(&format!("no container runtime answered ({error})"));
             return;
         }
     };

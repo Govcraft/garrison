@@ -55,6 +55,35 @@ tasks:
       # the thing that ships.
       - cargo nextest run --workspace --locked
 
+  test:live:
+    desc: Run the suite with the control-plane tests required rather than skipped
+    # Five test files stand up a real plane in a container. Each skips when
+    # `schemaforge` is off PATH or no container runtime answers, and a test
+    # that skips passes — which is right on a laptop and a false green
+    # anywhere the suite is the gate. GARRISON_REQUIRE_LIVE turns a would-be
+    # skip into a failure naming what was missing. Use this before a release.
+    env:
+      GARRISON_REQUIRE_LIVE: '1'
+    cmds:
+      - cargo nextest run --workspace --locked
+
+  lint:
+    desc: Clippy over the whole workspace, warnings as errors
+    # -D warnings on the command line rather than as a crate attribute: a
+    # suppression written into the source to make a gate pass is the thing
+    # this project's conventions forbid, and a flag cannot be mistaken for a
+    # fix.
+    cmds:
+      - cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  gate:
+    desc: Everything CI runs, in the order CI runs it
+    cmds:
+      - task: fmt
+      - task: lint
+      - task: check
+      - task: test
+
   check:
     desc: Type-check the Rust workspace
     cmds:

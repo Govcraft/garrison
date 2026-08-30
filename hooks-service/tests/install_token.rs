@@ -355,7 +355,7 @@ fn run_apply(cwd: &Path, db_url: &str) -> bool {
 #[tokio::test]
 async fn a_signed_assertion_buys_a_bearer_that_reads_its_own_install() {
     if schemaforge().is_none() {
-        eprintln!("skipping: schemaforge is not on PATH");
+        garrison_wire::skip_live("schemaforge is not on PATH");
         return;
     }
 
@@ -370,7 +370,7 @@ async fn a_signed_assertion_buys_a_bearer_that_reads_its_own_install() {
     let postgres = match image.start().await {
         Ok(container) => container,
         Err(error) => {
-            eprintln!("skipping: no container runtime answered ({error})");
+            garrison_wire::skip_live(&format!("no container runtime answered ({error})"));
             return;
         }
     };
