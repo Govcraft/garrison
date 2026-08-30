@@ -81,6 +81,12 @@ other ACP client ─────────────────┘
           approved provider   session root    control plane
 ```
 
+Text equivalent: VS Code, JetBrains, the terminal and any other ACP client
+connect through relays to one Unix socket and one `garrison-agent serve`
+daemon. That daemon branches to the model loop, sandboxed tools and audit
+trail; those respectively connect to an approved provider, the bounded session
+root and the control plane.
+
 The daemon owns the model runtime, session store, sandbox host, policy, and
 audit writer. Each session receives one canonical filesystem root. Symlinks and
 `..` cannot move a tool outside it. On Linux, write-capable tools run in a
@@ -189,6 +195,14 @@ Both launch `garrison-agent acp`, which relays ACP over standard input and
 output to the same daemon. Point the extension at the binary you just built,
 then open a workspace allowed by the daemon configuration.
 
+## Accessibility
+
+Garrison provides accessible paths through VS Code, JetBrains and the terminal,
+including line-oriented and single-message terminal modes. See
+[Accessibility and support](docs/accessibility.md) for surface-specific
+features, terminal presentation controls, current limitations, the
+accessibility contact and available support accommodations.
+
 ## A governed deployment adds the plane; it does not replace the agent
 
 To move from evaluation to centrally governed use, operators add a `[plane]`
@@ -251,6 +265,7 @@ explicit opt-in, and may change behavior or exit codes before stabilization.
 
 Before adopting Garrison, also review:
 
+- [Accessibility and support](docs/accessibility.md)
 - [Known gaps and operational failure modes](docs/control-plane.md#known-gaps)
 - [Agent and integration design](docs/garrison-agent-design.md)
 - [Bitbucket review mode](docs/review-mode.md)

@@ -289,6 +289,14 @@ GarrisonRuntime (acton-ai / acton-reactive)
                             disables the account; the daemon side reads it)
 ```
 
+Text equivalent: `GarrisonRuntime` contains the acton-ai core plus actors for
+the ACP protocol server, conversation supervision, language servers, control-
+plane authentication and audit anchoring. PTY supervision, turn diffs,
+repository context and plane synchronization are shown as planned children.
+Clients enter through the protocol server; governed authentication is
+centralized in `PlaneSession`, while `AnchorKeeper` observes turn completion
+and gates new turns when strict audit evidence is unhealthy.
+
 Approval round-trip: policy gate → callback → ProtocolServer → IDE dialog →
 decision → gate → audit entry with decider = `Callback` and the protocol
 client identity.

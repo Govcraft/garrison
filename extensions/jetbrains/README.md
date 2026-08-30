@@ -53,6 +53,18 @@ The provider is the plugin's only Kotlin source. The platform's inline
 completion API declares its work as a `suspend` function and identifies
 providers with an inline value class, neither of which Java can implement.
 
+## Accessibility
+
+The tool window follows JetBrains keyboard navigation, focus, font scaling,
+theme and screen reader behavior; approvals use native dialogs with safe
+defaults. Ctrl+Enter sends from the multiline composer. Send, cancel, new
+session and governance status are available through **Find Action** and the IDE
+keymap. Inline completion can be disabled in Garrison settings. The terminal's
+line-oriented mode is an alternative path to the same daemon and sessions. See
+the shared
+[Accessibility and support](../../docs/accessibility.md) guide for features,
+limitations, contact information and accommodations.
+
 ## Development
 
 1. Build `garrison-agent` and make it available on `PATH`.

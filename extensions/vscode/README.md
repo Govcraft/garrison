@@ -52,6 +52,18 @@ raises a dialog: it is speculative work you did not ask for. After a failure
 the agent is left alone for 30 seconds rather than being asked again on the
 next keystroke.
 
+## Accessibility
+
+The sidebar follows VS Code keyboard navigation, focus, zoom, theme and screen
+reader behavior; approvals use a native modal and default to rejection. Inline
+completion can be disabled from the command palette. Enter sends from the
+composer, Shift+Enter inserts a newline, and Tab or Shift+Tab follows the
+control order. New session, cancel, governance status and the completion
+toggle are available from the Command Palette. The terminal's line-oriented
+mode is an alternative path to the same daemon and sessions. See the shared
+[Accessibility and support](../../docs/accessibility.md) guide for features,
+limitations, contact information and accommodations.
+
 ## Development
 
 1. Build `garrison-agent` and make it available on `PATH`, or set
