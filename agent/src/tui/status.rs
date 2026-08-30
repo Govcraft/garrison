@@ -38,12 +38,15 @@ pub struct Status {
     frame: usize,
     /// Where rendered rows go.
     compositor: Option<ActorHandle>,
+    /// Whether the activity glyph advances on the timer.
+    animation: bool,
 }
 
 impl Status {
     /// Builds and starts the status line.
-    pub async fn start(runtime: &mut ActorRuntime) -> ActorHandle {
+    pub async fn start(runtime: &mut ActorRuntime, animation: bool) -> ActorHandle {
         let mut builder = runtime.new_actor::<Self>();
+        builder.model.animation = animation;
         configure(&mut builder);
         builder.start().await
     }
@@ -58,7 +61,11 @@ impl Status {
         RegionRendered::showing(
             Region::Status,
             summary(
-                SPINNER[self.frame % SPINNER.len()],
+                if self.animation {
+                    SPINNER[self.frame % SPINNER.len()]
+                } else {
+                    "•"
+                },
                 started.elapsed(),
                 &self.tools,
             ),
@@ -126,7 +133,9 @@ fn configure(builder: &mut ManagedActor<Idle, Status>) {
         actor.model.frame = 0;
         // The tick is armed only while a turn runs, and re-arms itself from
         // its own handler, so an idle interface schedules nothing.
-        drop(actor.handle().send_after(StatusTick, TICK));
+        if actor.model.animation {
+            drop(actor.handle().send_after(StatusTick, TICK));
+        }
         repaint(actor)
     });
 
@@ -140,8 +149,10 @@ fn configure(builder: &mut ManagedActor<Idle, Status>) {
         if actor.model.started.is_none() {
             return Reply::ready();
         }
-        actor.model.frame = actor.model.frame.wrapping_add(1);
-        drop(actor.handle().send_after(StatusTick, TICK));
+        if actor.model.animation {
+            actor.model.frame = actor.model.frame.wrapping_add(1);
+            drop(actor.handle().send_after(StatusTick, TICK));
+        }
         repaint(actor)
     });
 
@@ -240,5 +251,15 @@ mod tests {
             ..Status::default()
         };
         assert!(!status.render().lines.is_empty());
+    }
+
+    #[test]
+    fn animation_disabled_uses_a_static_activity_marker() {
+        let status = Status {
+            started: Some(Instant::now()),
+            animation: false,
+            ..Status::default()
+        };
+        assert!(text(&status.render().lines[0]).starts_with("• Working"));
     }
 }

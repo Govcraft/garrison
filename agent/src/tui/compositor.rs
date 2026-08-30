@@ -53,6 +53,8 @@ pub struct Compositor {
     dirty: bool,
     /// Whether a [`DrawTick`] is already on its way.
     armed: bool,
+    /// Whether color survives into the terminal output.
+    color: bool,
 }
 
 impl Compositor {
@@ -61,10 +63,14 @@ impl Compositor {
     /// # Errors
     ///
     /// Any failure putting the terminal into raw mode.
-    pub async fn start(runtime: &mut ActorRuntime) -> Result<ActorHandle, std::io::Error> {
+    pub async fn start(
+        runtime: &mut ActorRuntime,
+        color: bool,
+    ) -> Result<ActorHandle, std::io::Error> {
         let terminal = ViewportTerminal::new()?;
         let mut builder = runtime.new_actor::<Self>();
         builder.model.terminal = Some(terminal);
+        builder.model.color = color;
         configure(&mut builder);
         Ok(builder.start().await)
     }
@@ -86,7 +92,10 @@ impl Compositor {
         };
 
         let width = terminal.width() as usize;
-        let (rows, cursor) = stack(&self.regions, width);
+        let (mut rows, cursor) = stack(&self.regions, width);
+        if !self.color {
+            remove_colors(&mut rows);
+        }
         let height = u16::try_from(rows.len()).unwrap_or(u16::MAX).max(1);
 
         // Sizing before writing, rather than after, is what keeps the
@@ -99,7 +108,10 @@ impl Compositor {
         }
 
         if !self.pending.is_empty() {
-            let lines = std::mem::take(&mut self.pending);
+            let mut lines = std::mem::take(&mut self.pending);
+            if !self.color {
+                remove_colors(&mut lines);
+            }
             if let Err(error) = terminal.insert_history(&lines) {
                 tracing::warn!(%error, "could not write history to the terminal");
             }
@@ -107,6 +119,15 @@ impl Compositor {
         if let Err(error) = terminal.draw(&rows, cursor) {
             tracing::warn!(%error, "could not paint the viewport");
         }
+    }
+}
+
+/// Removes foreground, background, and underline colors without losing text.
+fn remove_colors(lines: &mut [Line<'static>]) {
+    for span in lines.iter_mut().flat_map(|line| &mut line.spans) {
+        span.style.fg = None;
+        span.style.bg = None;
+        span.style.underline_color = None;
     }
 }
 
@@ -221,6 +242,7 @@ fn configure(builder: &mut ManagedActor<Idle, Compositor>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::{Color, Style};
     use ratatui::text::Line;
 
     fn snapshot(lines: &[&str], cursor: Option<(u16, u16)>) -> Snapshot {
@@ -265,6 +287,24 @@ mod tests {
 
         let (_, cursor) = stack(&regions, 40);
         assert_eq!(cursor, Some((4, 2)));
+    }
+
+    #[test]
+    fn disabling_color_preserves_text_and_non_color_attributes() {
+        let mut lines = vec![Line::styled(
+            "warning",
+            Style::default().fg(Color::Red).bg(Color::Black).bold(),
+        )];
+
+        remove_colors(&mut lines);
+
+        assert_eq!(texts(&lines), ["warning"]);
+        assert_eq!(lines[0].spans[0].style.fg, None);
+        assert_eq!(lines[0].spans[0].style.bg, None);
+        assert!(lines[0].spans[0]
+            .style
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD));
     }
 
     #[test]

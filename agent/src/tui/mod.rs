@@ -61,6 +61,17 @@ use tokio_stream::StreamExt;
 /// The name the agent sees this client identify itself as.
 const CLIENT_NAME: &str = "garrison-chat";
 
+/// Accessibility-relevant presentation choices for an interactive chat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Options {
+    /// Whether permission requests may be accepted without prompting.
+    pub approve_all: bool,
+    /// Whether terminal colors are emitted.
+    pub color: bool,
+    /// Whether the activity indicator advances between frames.
+    pub animation: bool,
+}
+
 /// Runs the chat until the user leaves or the agent disconnects.
 ///
 /// # Errors
@@ -72,7 +83,7 @@ const CLIENT_NAME: &str = "garrison-chat";
 pub async fn run(
     stream: tokio::net::UnixStream,
     cwd: PathBuf,
-    approve_all: bool,
+    options: Options,
 ) -> Result<(), GarrisonError> {
     let mut client = DuplexClient::from_stream(stream);
 
@@ -98,14 +109,15 @@ pub async fn run(
 
     // The compositor takes the terminal over, so it is built first and any
     // failure here happens before anything else has state to unwind.
-    let compositor = compositor::Compositor::start(&mut runtime)
+    let compositor = compositor::Compositor::start(&mut runtime, options.color)
         .await
         .map_err(|error| GarrisonError::runtime(format!("could not take the terminal: {error}")))?;
 
     let transcript = transcript::Transcript::start(&mut runtime).await;
-    let status = status::Status::start(&mut runtime).await;
+    let status = status::Status::start(&mut runtime, options.animation).await;
     let composer = composer::Composer::start(&mut runtime).await;
-    let approval = approval::Approval::start(&mut runtime, approve_all, approval_timeout).await;
+    let approval =
+        approval::Approval::start(&mut runtime, options.approve_all, approval_timeout).await;
     let router = input::Router::start(&mut runtime).await;
     let session =
         session::Session::start(&mut runtime, writer, opened.session_id, cwd, exit.clone()).await;

@@ -130,6 +130,15 @@ enum Command {
         /// Approve every tool call without asking at the terminal.
         #[arg(long)]
         approve_all: bool,
+        /// Use a line-oriented interactive session with no cursor control.
+        #[arg(long, conflicts_with = "message")]
+        plain_session: bool,
+        /// Disable color while keeping the interactive terminal layout.
+        #[arg(long)]
+        no_color: bool,
+        /// Replace the animated activity spinner with a static indicator.
+        #[arg(long)]
+        no_animation: bool,
     },
     /// Reviews a Bitbucket pull request and reports what it found.
     ///
@@ -266,7 +275,14 @@ enum Logs {
 /// viewport. So while the chat owns the terminal, logs go to a file, and if no
 /// file can be opened they go nowhere at all.
 fn destination(cli: &Cli) -> Logs {
-    if !matches!(cli.command, Command::Chat { message: None, .. }) {
+    if !matches!(
+        cli.command,
+        Command::Chat {
+            message: None,
+            plain_session: false,
+            ..
+        }
+    ) {
         return Logs::Stderr;
     }
 
@@ -371,7 +387,20 @@ async fn run(cli: Cli) -> Result<(), GarrisonError> {
             socket,
             message,
             approve_all,
-        } => chat(socket, message, approve_all).await,
+            plain_session,
+            no_color,
+            no_animation,
+        } => {
+            chat(
+                socket,
+                message,
+                approve_all,
+                plain_session,
+                no_color || std::env::var_os("NO_COLOR").is_some(),
+                no_animation,
+            )
+            .await
+        }
         Command::Review {
             socket,
             bitbucket,
@@ -785,13 +814,24 @@ async fn chat(
     socket: Option<PathBuf>,
     message: Option<String>,
     approve_all: bool,
+    plain_session: bool,
+    no_color: bool,
+    no_animation: bool,
 ) -> Result<(), GarrisonError> {
     let (server, path) = client_target(socket, None)?;
     let stream = daemon::connect_or_start(&server, &path).await?;
     let Some(message) = message else {
         let cwd = std::env::current_dir()
             .map_err(|error| GarrisonError::runtime(format!("no working directory: {error}")))?;
-        return garrison_agent::tui::run(stream, cwd, approve_all).await;
+        if plain_session {
+            return plain_chat(stream, cwd, approve_all).await;
+        }
+        let options = garrison_agent::tui::Options {
+            approve_all,
+            color: !no_color,
+            animation: !no_animation,
+        };
+        return garrison_agent::tui::run(stream, cwd, options).await;
     };
 
     let mut client = AgentClient::from_stream(stream);
@@ -812,6 +852,43 @@ async fn chat(
 
     println!("\n[{:?}]", response.stop_reason);
     Ok(())
+}
+
+/// A reusable chat session that emits ordinary lines and no terminal control.
+async fn plain_chat(
+    stream: tokio::net::UnixStream,
+    cwd: PathBuf,
+    approve_all: bool,
+) -> Result<(), GarrisonError> {
+    let mut client = AgentClient::from_stream(stream);
+    client.initialize("garrison-agent plain chat").await?;
+    let session = client.new_session(cwd).await?.session_id;
+    let mut terminal = Terminal {
+        approve_all,
+        tool_titles: std::collections::HashMap::new(),
+    };
+
+    loop {
+        print!("› ");
+        let _ = std::io::stdout().flush();
+        let mut input = String::new();
+        let read = std::io::stdin()
+            .read_line(&mut input)
+            .map_err(|error| GarrisonError::runtime(format!("could not read input: {error}")))?;
+        if read == 0 {
+            return Ok(());
+        }
+        let input = input.trim();
+        if input == "/quit" {
+            return Ok(());
+        }
+        if input.is_empty() {
+            continue;
+        }
+
+        let response = client.prompt(session.clone(), input, &mut terminal).await?;
+        println!("\n[{:?}]", response.stop_reason);
+    }
 }
 
 /// Everything one `review` invocation was told.
