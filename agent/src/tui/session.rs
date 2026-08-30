@@ -712,6 +712,7 @@ fn finish(
         },
         None => false,
     };
+    let lines = lifecycle_lines(lines, true, started);
 
     let transcript = actor.model.transcript.clone();
     let status = actor.model.status.clone();
@@ -741,6 +742,7 @@ fn announce(
     lines: Vec<Line<'static>>,
     started: bool,
 ) -> FutureBox {
+    let lines = lifecycle_lines(lines, false, started);
     let transcript = actor.model.transcript.clone();
     let status = actor.model.status.clone();
 
@@ -754,6 +756,22 @@ fn announce(
             }
         }
     })
+}
+
+/// Adds lifecycle notices in the order a terminal reader should encounter them.
+#[must_use]
+pub fn lifecycle_lines(
+    mut lines: Vec<Line<'static>>,
+    ended: bool,
+    started: bool,
+) -> Vec<Line<'static>> {
+    if ended {
+        lines.push(notice_line("turn ended".to_string()));
+    }
+    if started {
+        lines.push(notice_line("turn started".to_string()));
+    }
+    lines
 }
 
 /// Commits one row, when there is one to commit.
@@ -780,6 +798,24 @@ mod tests {
         let response = serde_json::to_value(acp::PromptResponse::new(reason))
             .expect("a prompt response serializes");
         ending(&Ok(response))
+    }
+
+    #[test]
+    fn starting_a_turn_appends_a_scrollback_notice() {
+        let lines = lifecycle_lines(vec![user_line("hello".to_string())], false, true);
+        assert_eq!(
+            lines.iter().map(text).collect::<Vec<_>>(),
+            ["› hello", "turn started"]
+        );
+    }
+
+    #[test]
+    fn queued_turn_handoff_announces_end_before_restart() {
+        let lines = lifecycle_lines(Vec::new(), true, true);
+        assert_eq!(
+            lines.iter().map(text).collect::<Vec<_>>(),
+            ["turn ended", "turn started"]
+        );
     }
 
     #[test]

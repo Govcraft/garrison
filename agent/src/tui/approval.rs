@@ -281,6 +281,7 @@ fn configure(builder: &mut ManagedActor<Idle, Approval>) {
             return answer(actor, message.id.clone(), acp::OPTION_ALLOW_ONCE, &title);
         }
 
+        let notice = permission_notice(&title);
         actor.model.pending.push_back(Pending {
             id: message.id.clone(),
             title,
@@ -289,7 +290,7 @@ fn configure(builder: &mut ManagedActor<Idle, Approval>) {
         if actor.model.pending.len() == 1 {
             actor.model.selected = 0;
         }
-        open(actor)
+        open(actor, notice)
     });
 
     builder.mutate_on::<KeyPressed>(|actor, context| {
@@ -305,13 +306,27 @@ fn configure(builder: &mut ManagedActor<Idle, Approval>) {
     });
 }
 
-/// Announces the modal and paints it.
-fn open(actor: &mut ManagedActor<Started, Approval>) -> FutureBox {
+/// One scrollback line announcing that a permission request arrived.
+#[must_use]
+pub fn permission_notice(title: &str) -> Line<'static> {
+    notice_line(format!("permission required: {title}"))
+}
+
+/// Announces the modal in scrollback and paints it.
+fn open(actor: &mut ManagedActor<Started, Approval>, notice: Line<'static>) -> FutureBox {
     let rendered = actor.model.render();
     let compositor = actor.model.compositor.clone();
+    let transcript = actor.model.transcript.clone();
     let router = actor.model.router.clone();
 
     Reply::pending(async move {
+        if let Some(transcript) = transcript {
+            transcript
+                .send(Note {
+                    lines: vec![notice],
+                })
+                .await;
+        }
         if let Some(router) = router {
             router
                 .send(FocusChanged {
@@ -498,6 +513,14 @@ mod tests {
     fn a_queue_deeper_than_one_says_how_many_are_waiting() {
         let lines = prompt("run bash", None, 0, 3);
         assert!(text(lines.last().expect("a tail row")).contains("2 more waiting"));
+    }
+
+    #[test]
+    fn permission_arrival_is_worded_for_terminal_scrollback() {
+        assert_eq!(
+            text(&permission_notice("run cargo check")),
+            "permission required: run cargo check"
+        );
     }
 
     #[test]
