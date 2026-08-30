@@ -415,8 +415,8 @@ fn configure(builder: &mut ManagedActor<Idle, Session>) {
 
 /// Echoes what the user typed, then either sends it or holds it.
 fn submit(actor: &mut ManagedActor<Started, Session>, text: String) -> FutureBox {
-    if let Some((command, _)) = slash::parse(&text) {
-        return run_command(actor, command, text);
+    if let Some((command, arguments)) = slash::parse(&text) {
+        return run_command(actor, command, arguments.to_string(), text);
     }
 
     let mut lines = vec![user_line(text.clone())];
@@ -438,6 +438,7 @@ fn submit(actor: &mut ManagedActor<Started, Session>, text: String) -> FutureBox
 fn run_command(
     actor: &mut ManagedActor<Started, Session>,
     command: Command,
+    arguments: String,
     typed: String,
 ) -> FutureBox {
     let mut lines = vec![user_line(typed)];
@@ -449,6 +450,13 @@ fn run_command(
             return announce(actor, lines, false);
         }
         Command::Clear => {
+            if !clear_is_confirmed(&arguments) {
+                lines.push(notice_line(
+                    "this permanently erases terminal scrollback; type /clear confirm to proceed"
+                        .to_string(),
+                ));
+                return announce(actor, lines, false);
+            }
             let compositor = actor.model.compositor.clone();
             return Reply::pending(async move {
                 if let Some(compositor) = compositor {
@@ -500,6 +508,12 @@ fn run_command(
     }
 
     announce(actor, lines, false)
+}
+
+/// Whether the destructive form of `/clear` was explicitly confirmed.
+#[must_use]
+const fn clear_is_confirmed(arguments: &str) -> bool {
+    matches!(arguments.as_bytes(), b"confirm")
 }
 
 /// Stops the running turn, or leaves when there was nothing to stop.
@@ -816,6 +830,14 @@ mod tests {
             lines.iter().map(text).collect::<Vec<_>>(),
             ["turn ended", "turn started"]
         );
+    }
+
+    #[test]
+    fn clearing_scrollback_requires_the_exact_confirmation_word() {
+        assert!(clear_is_confirmed("confirm"));
+        assert!(!clear_is_confirmed(""));
+        assert!(!clear_is_confirmed("yes"));
+        assert!(!clear_is_confirmed("confirm now"));
     }
 
     #[test]

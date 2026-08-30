@@ -60,7 +60,7 @@ impl Command {
             Self::Status => "show the agent's approval policy and audit settings",
             Self::Resume => "carry on with the turn a restart interrupted",
             Self::Abandon => "give up on that turn and unblock this session",
-            Self::Clear => "clear the screen",
+            Self::Clear => "clear the screen and scrollback (requires confirmation)",
             Self::Quit => "leave",
         }
     }
