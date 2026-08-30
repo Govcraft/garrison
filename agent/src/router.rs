@@ -68,6 +68,16 @@ use std::time::Duration;
 /// that a wedged claim cannot stall turn starts for a whole session.
 pub const CLAIM_DEADLINE: Duration = Duration::from_secs(10);
 
+/// How many disowned turns are remembered at once.
+///
+/// A disowned id is normally forgotten the moment its `TurnStarted` arrives,
+/// so this bound is only reached by turns that were disowned and then never
+/// started — a `collect()` that failed before admission. Holding the newest
+/// and dropping the oldest keeps that leak bounded without a second timer:
+/// far more completions can be in flight than any editor will ever ask for,
+/// and one that is evicted is merely routed as it would have been before.
+const DISOWNED_CAPACITY: usize = 64;
+
 /// One thread's stake in the next turn acton-ai starts.
 #[derive(Clone, Debug)]
 struct Claim {
@@ -116,6 +126,32 @@ impl Request for ReleaseTurn {
     type Response = TurnReleased;
 }
 
+/// Declares that a turn is not a session's turn and must not be routed.
+///
+/// Inline completion drives the same prompt loop a turn does, so it publishes
+/// the same `TurnStarted` the claim protocol reads. It holds no claim and
+/// wants none — it streams nothing and takes microseconds to be worth
+/// nothing — but the router cannot tell whose `TurnStarted` it is looking at
+/// and would otherwise bind it to whichever claim happened to be outstanding.
+///
+/// So the caller mints the id itself, disowns it here, and passes it to
+/// [`PromptBuilder::turn_id`](acton_ai::prompt::PromptBuilder::turn_id).
+/// Await the reply before calling `collect()`: the router has to know the id
+/// before the event carrying it can arrive.
+#[acton_message]
+pub struct DisownTurn {
+    /// The acton-ai turn that is about to start and must be ignored.
+    pub turn_id: ActonTurnId,
+}
+
+/// Acknowledges a disowned turn.
+#[acton_message]
+pub struct TurnDisowned;
+
+impl Request for DisownTurn {
+    type Response = TurnDisowned;
+}
+
 /// Fires when an outstanding claim has waited too long to be bound.
 ///
 /// Carries the generation it was armed for, so a timer that loses the race
@@ -142,6 +178,8 @@ pub struct TurnRouter {
     generation: u64,
     /// The armed expiry for [`Self::outstanding`].
     expiry: Option<ScheduledSend>,
+    /// Turns that must never be bound to a claim, newest last.
+    disowned: VecDeque<ActonTurnId>,
     /// The auto-compaction policy the runtime launched under, for
     /// `_garrison/status`. `None` means histories are truncated rather than
     /// summarized.
@@ -215,6 +253,30 @@ impl TurnRouter {
         self.outstanding = Some(claim);
         self.generation = self.generation.wrapping_add(1);
         Some(reply)
+    }
+
+    /// Remembers that `turn_id` must not be bound to a claim.
+    fn disown(&mut self, turn_id: ActonTurnId) {
+        if self.disowned.len() == DISOWNED_CAPACITY {
+            self.disowned.pop_front();
+        }
+        self.disowned.push_back(turn_id);
+    }
+
+    /// Whether `turn_id` was disowned, forgetting it if so.
+    ///
+    /// Consuming the answer is what keeps the set small in the ordinary case:
+    /// an id is disowned once, starts once, and is of no further interest.
+    fn is_disowned(&mut self, turn_id: &ActonTurnId) -> bool {
+        let Some(at) = self
+            .disowned
+            .iter()
+            .position(|disowned| disowned == turn_id)
+        else {
+            return false;
+        };
+        self.disowned.remove(at);
+        true
     }
 
     /// Forgets a bound turn and everything indexed against it.
@@ -365,6 +427,14 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, TurnRouter>) {
         })
     });
 
+    builder.mutate_on::<DisownTurn>(|actor, envelope| {
+        actor.model.disown(envelope.message().turn_id.clone());
+        let reply = envelope.reply_envelope();
+        Reply::pending(async move {
+            reply.send(TurnDisowned).await;
+        })
+    });
+
     builder.mutate_on::<ClaimExpired>(|actor, envelope| {
         if envelope.message().generation != actor.model.generation {
             return Reply::ready();
@@ -388,6 +458,13 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, TurnRouter>) {
 
         match &event {
             TurnLifecycle::TurnStarted { turn_id, .. } => {
+                // A disowned turn is not anybody's: settling on it would hand
+                // the outstanding claim to a completion, and the turn that
+                // actually holds that claim would then route nowhere.
+                if actor.model.is_disowned(turn_id) {
+                    return Reply::ready();
+                }
+
                 // No announcement: ACP has no "turn started" event, and the
                 // client already knows — it is the one holding the open
                 // `session/prompt` request this turn answers.
@@ -585,6 +662,72 @@ mod tests {
         assert_eq!(
             router.turns.get(&acton_turn).unwrap().turn_id,
             garrison_turn
+        );
+    }
+
+    #[test]
+    fn a_disowned_turn_leaves_an_outstanding_claim_alone() {
+        // The race this exists to stop: a completion's `TurnStarted` arriving
+        // while a real turn is waiting to be bound.
+        let mut router = TurnRouter::default();
+        let (sink, _rx) = sink();
+        let staked = claim(sink);
+        let garrison_turn = staked.turn_id.clone();
+        router.outstanding = Some(staked);
+
+        let completion = ActonTurnId::new();
+        router.disown(completion.clone());
+        assert!(router.is_disowned(&completion));
+
+        // The turn's own start still binds it, and to its own claim.
+        let real = ActonTurnId::new();
+        router.settle(Some(real.clone()));
+
+        assert_eq!(router.turns.get(&real).unwrap().turn_id, garrison_turn);
+        assert!(
+            !router.turns.contains_key(&completion),
+            "a completion must never appear as a routable turn",
+        );
+    }
+
+    #[test]
+    fn a_turn_that_was_never_disowned_is_still_bound() {
+        let mut router = TurnRouter::default();
+        let (sink, _rx) = sink();
+        router.outstanding = Some(claim(sink));
+
+        let acton_turn = ActonTurnId::new();
+        assert!(!router.is_disowned(&acton_turn));
+        router.settle(Some(acton_turn.clone()));
+
+        assert!(router.turns.contains_key(&acton_turn));
+    }
+
+    #[test]
+    fn disowning_is_answered_once_and_then_forgotten() {
+        // Consumed on the first ask, so a second turn that happened to reuse
+        // the id would route normally rather than vanishing.
+        let mut router = TurnRouter::default();
+        let turn = ActonTurnId::new();
+        router.disown(turn.clone());
+
+        assert!(router.is_disowned(&turn));
+        assert!(!router.is_disowned(&turn));
+    }
+
+    #[test]
+    fn disowned_turns_that_never_start_cannot_grow_without_bound() {
+        let mut router = TurnRouter::default();
+        let first = ActonTurnId::new();
+        router.disown(first.clone());
+        for _ in 0..DISOWNED_CAPACITY {
+            router.disown(ActonTurnId::new());
+        }
+
+        assert_eq!(router.disowned.len(), DISOWNED_CAPACITY);
+        assert!(
+            !router.is_disowned(&first),
+            "the oldest disowned turn is evicted, not the newest",
         );
     }
 
