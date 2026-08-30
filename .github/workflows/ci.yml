@@ -1,0 +1,111 @@
+# Clippy and the test suite, on every pull request and every push to main.
+#
+# # Why everything here is `--release`
+#
+# `agent/Cargo.toml` builds acton-ai with its `fips` feature, which links the
+# FIPS 140-3 validated AWS-LC module. That module runs a power-on integrity
+# test that hashes its own loaded text segment against a constant baked in at
+# build time. A debug build's relocations move that text, the hash disagrees,
+# and the module aborts the process — by design, not as a bug.
+#
+# The abort reaches the test harness, not just the shipped binary: a debug
+# `seat_entitlement` test binary dies with SIGABRT during nextest's list pass,
+# before a single test runs. So clippy and the tests both use the release
+# profile. It costs build time and buys the only profile the FIPS module will
+# start under, which is also the profile that ships.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A new push to a branch makes the run in flight for that branch pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # A FIPS build compiles AWS-LC from source; a backtrace is worth having when
+  # that or anything downstream of it falls over.
+  RUST_BACKTRACE: 1
+
+jobs:
+  clippy-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    # The first run on a cold cache builds AWS-LC-FIPS from source, which is
+    # the slow part. Warm runs are minutes.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux carries the whole workspace: the daemon and the control
+          # plane's hook service both deploy there.
+          - name: linux-x86_64
+            os: ubuntu-latest
+            packages: --workspace
+          # macOS carries the daemon only. `garrison-hooks` is the control
+          # plane, and the control plane runs on Linux.
+          - name: macos-aarch64
+            os: macos-latest
+            packages: --workspace --exclude garrison-hooks
+          # Windows is missing on purpose. `garrison-agent` reaches for
+          # Unix-domain sockets in about a dozen modules without a `cfg`, and
+          # acton-ai itself gates `acton-reactive` behind `cfg(unix)`, so the
+          # daemon does not compile for `x86_64-pc-windows-msvc` yet. Add the
+          # leg here — nothing else in this file needs to change — once that
+          # port lands.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # AWS-LC's FIPS build is a CMake project that shells out to Go and Perl,
+      # and `hooks-service/build.rs` compiles protobufs with `protoc`.
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang libclang-dev protobuf-compiler
+
+      - name: Install build tools (macOS)
+        if: runner.os == 'macOS'
+        # No protoc: only hooks-service compiles protobufs, and that is the
+        # control plane, which is Linux-only.
+        run: brew install cmake ninja
+
+      # Named rather than inherited from the image: a FIPS artifact should not
+      # change because a runner image bumped its preinstalled Go.
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: false
+
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
+      # Keyed on the profile so the release-profile AWS-LC build — the
+      # expensive artifact here — is not evicted by anything else.
+      - name: Cache cargo and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-fips
+          cache-on-failure: true
+
+      - name: Clippy
+        run: cargo clippy --release --locked ${{ matrix.packages }} --all-targets -- -D warnings
+
+      # Tests that want a container runtime or `schemaforge` on PATH report
+      # themselves skipped rather than failing, so this is the same command a
+      # developer runs.
+      - name: Tests
+        run: cargo nextest run --release --locked ${{ matrix.packages }}
