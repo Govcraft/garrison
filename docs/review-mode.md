@@ -153,10 +153,16 @@ stage('Garrison review') {
 
    The alternative was a per-review exemption, and building one would have
    meant a path on which work reaches a model without a live seat behind it.
-   Nothing in review mode gets to be that path. The consequence worth stating
-   plainly: a build agent is a seat, so a fleet of runners is a fleet of
-   seats, and that is a licensing fact an agency should know before wiring
-   this into every repository.
+   Nothing in review mode gets to be that path.
+
+   Which seat, precisely, because the answer surprises people: a seat belongs
+   to an **operator**, not to a machine. An install is entitled on the strength
+   of the seats its operator holds, and nothing counts concurrent turns. So a
+   whole fleet of runners bound to one CI operator runs on that one operator's
+   seat, and twenty parallel builds all pass. Review mode is governed, then,
+   without being a per-runner licensing cost. An agency that wants pipeline
+   review metered per runner would need seats to bind to installs, which is
+   not what they do today.
 3. **Which credential?** — A short-lived bearer token from the environment.
    The install key never leaves the runner and is not used here.
 4. **What does a finding block?** — Nothing, by default. See advisory above.

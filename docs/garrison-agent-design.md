@@ -190,8 +190,13 @@ written for review mode. `review` is a client: it connects to the daemon,
 opens a session, and prompts, so its turn passes the same gates as any other
 turn and the seat monitor is one of them. Building a per-review exemption
 would have meant a path on which work reaches a model with no live seat behind
-it, and review mode does not get to be that path. The consequence is a
-licensing fact rather than a design one: a build agent is a seat.
+it, and review mode does not get to be that path.
+
+Which seat is worth stating, because it is easy to assume the wrong one. A
+seat belongs to an operator, not to a machine: `adjudicate` entitles an
+install from the seats its operator holds, and nothing counts concurrent
+turns. A fleet of runners bound to one CI operator therefore runs on one
+seat. Governed, and not a per-runner licensing cost.
 
 A review also waits for its audit trail to be accepted by the plane before it
 exits, and exits 5 when it was not. The general shipping policy assumes the
