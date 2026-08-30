@@ -510,6 +510,7 @@ async fn a_signed_assertion_buys_a_bearer_that_reads_its_own_install() {
                 "platform": "linux",
                 "agent_version": "0.1.0",
                 "sandbox_hardening": "best_effort",
+                "lifecycle": "durable",
                 "isolation_active": true,
                 "status": "active"
             }),
@@ -550,6 +551,7 @@ async fn a_signed_assertion_buys_a_bearer_that_reads_its_own_install() {
                 "platform": "linux",
                 "agent_version": "0.1.0",
                 "sandbox_hardening": "unavailable",
+                "lifecycle": "durable",
                 "status": "active"
             }),
         )

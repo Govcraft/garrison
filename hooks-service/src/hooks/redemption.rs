@@ -203,7 +203,7 @@ impl Service {
             .plane
             .create(
                 "AgentInstall",
-                install_fields(req, &organization, &operator.id, &token.id),
+                install_fields(req, &organization, &operator.id, &token, &now),
             )
             .await?;
 
@@ -285,8 +285,10 @@ fn install_fields(
     req: &RedemptionBeforeValidateRequest,
     organization: &str,
     operator: &str,
-    enrollment_token: &str,
+    token: &crate::plane::EnrollmentTokenRow,
+    now: &chrono::DateTime<Utc>,
 ) -> BTreeMap<String, Value> {
+    let enrollment_token = token.id.as_str();
     let mut fields = BTreeMap::new();
     fields.insert("install_id".into(), json!(req.install_id));
     fields.insert("hostname".into(), json!(req.hostname));
@@ -301,10 +303,53 @@ fn install_fields(
     );
     fields.insert("status".into(), json!("enrolled"));
     fields.insert("enrolled_via".into(), json!(enrollment_token));
+
+    // Stamped from the grant, never from the request. The daemon has no field
+    // to declare this in and could not fill one honestly if it had: from
+    // inside, a fresh container and a freshly imaged laptop are the same
+    // situation. Whoever minted the grant knew which they were provisioning.
+    let (lifecycle, expiry) = install_window(token, now);
+    fields.insert("lifecycle".into(), json!(lifecycle));
+    if let Some(at) = expiry {
+        fields.insert("expires_at".into(), json!(at));
+    }
     if let Some(version) = req.acton_ai_version.as_deref().filter(|v| !v.is_empty()) {
         fields.insert("acton_ai_version".into(), json!(version));
     }
     fields
+}
+
+/// What lifecycle an install gets, and when its window closes. Pure.
+///
+/// A durable grant mints a durable install with no expiry: that is a
+/// workstation, and dating it would only create a way for it to stop working
+/// on a Tuesday for no reason anyone remembers.
+///
+/// An ephemeral grant mints an install that stops being valid at
+/// `now + install_ttl_secs`. The window is stamped here, at mint time, rather
+/// than computed later from the grant, because the grant can be revoked,
+/// edited, or spent again, and none of that should change when an install that
+/// already exists stops running.
+///
+/// A grant that says ephemeral and carries no usable TTL still gets a window:
+/// the schema's floor, not an absent expiry. The agent refuses an ephemeral
+/// install with no window anyway, so the two ends agree, and this end picks
+/// the reading that produces a working short-lived identity rather than a
+/// broken one.
+fn install_window(
+    token: &crate::plane::EnrollmentTokenRow,
+    now: &chrono::DateTime<Utc>,
+) -> (&'static str, Option<String>) {
+    /// The schema's own `min`, used when a grant names nothing usable.
+    const FLOOR_SECS: i64 = 60;
+
+    if token.install_lifecycle != "ephemeral" {
+        return ("durable", None);
+    }
+
+    let ttl = token.install_ttl_secs.max(FLOOR_SECS);
+    let closes = *now + Duration::from_secs(ttl.unsigned_abs());
+    ("ephemeral", Some(rfc3339(&closes)))
 }
 
 /// The credential the daemon will sign with from now on.
@@ -413,22 +458,135 @@ mod tests {
         }
     }
 
+    /// A grant row as the hook reads one. `id` is the row id rather than the
+    /// artifact subject, which is what `enrolled_via` points at.
+    fn grant(lifecycle: &str, ttl: i64) -> crate::plane::EnrollmentTokenRow {
+        crate::plane::EnrollmentTokenRow {
+            id: "tok_row".into(),
+            organization: Some("org_1".into()),
+            scope: "operator".into(),
+            operator: Some("operator_1".into()),
+            max_uses: 1,
+            uses: 0,
+            status: "issued".into(),
+            expires_at: None,
+            first_redeemed_at: None,
+            install_lifecycle: lifecycle.into(),
+            install_ttl_secs: ttl,
+        }
+    }
+
+    fn at(text: &str) -> chrono::DateTime<Utc> {
+        chrono::DateTime::parse_from_rfc3339(text)
+            .expect("fixture instant parses")
+            .with_timezone(&Utc)
+    }
+
     #[test]
     fn an_install_joins_as_enrolled_not_active() {
-        let fields = install_fields(&request(), "org_1", "operator_1", "tok_row");
+        let fields = install_fields(
+            &request(),
+            "org_1",
+            "operator_1",
+            &grant("durable", 3600),
+            &at("2026-08-30T12:00:00Z"),
+        );
         assert_eq!(fields["status"], json!("enrolled"));
         assert_eq!(fields["enrolled_via"], json!("tok_row"));
         assert_eq!(fields["operator"], json!("operator_1"));
     }
 
     #[test]
+    fn a_workstation_is_durable_and_carries_no_expiry() {
+        // Dating a workstation would only invent a way for it to stop working
+        // on a Tuesday for a reason nobody remembers.
+        let fields = install_fields(
+            &request(),
+            "org_1",
+            "operator_1",
+            &grant("durable", 3600),
+            &at("2026-08-30T12:00:00Z"),
+        );
+        assert_eq!(fields["lifecycle"], json!("durable"));
+        assert!(!fields.contains_key("expires_at"));
+    }
+
+    #[test]
+    fn a_pipeline_grant_mints_an_install_that_expires() {
+        let fields = install_fields(
+            &request(),
+            "org_1",
+            "operator_1",
+            &grant("ephemeral", 3600),
+            &at("2026-08-30T12:00:00Z"),
+        );
+        assert_eq!(fields["lifecycle"], json!("ephemeral"));
+        assert_eq!(fields["expires_at"], json!("2026-08-30T13:00:00.000Z"));
+    }
+
+    #[test]
+    fn the_window_is_stamped_at_mint_time_not_left_to_be_recomputed() {
+        // The grant can be revoked, edited, or spent again, and none of that
+        // may change when an install that already exists stops running. Two
+        // redemptions of one grant an hour apart get different windows.
+        let noon = install_fields(
+            &request(),
+            "o",
+            "p",
+            &grant("ephemeral", 600),
+            &at("2026-08-30T12:00:00Z"),
+        );
+        let one = install_fields(
+            &request(),
+            "o",
+            "p",
+            &grant("ephemeral", 600),
+            &at("2026-08-30T13:00:00Z"),
+        );
+        assert_ne!(noon["expires_at"], one["expires_at"]);
+    }
+
+    #[test]
+    fn an_ephemeral_grant_with_no_ttl_still_mints_a_window() {
+        // A row written before the column existed, or one somebody zeroed.
+        // The agent refuses an ephemeral install with no window at all, so
+        // omitting the field here would mint an identity that cannot run. The
+        // schema floor produces a short-lived one that can.
+        let fields = install_fields(
+            &request(),
+            "o",
+            "p",
+            &grant("ephemeral", 0),
+            &at("2026-08-30T12:00:00Z"),
+        );
+        assert_eq!(fields["expires_at"], json!("2026-08-30T12:01:00.000Z"));
+    }
+
+    #[test]
+    fn a_grant_from_before_the_column_existed_mints_a_workstation() {
+        // An empty lifecycle is every grant issued before this feature. It
+        // must keep meaning what it meant, which is a durable install.
+        let fields = install_fields(
+            &request(),
+            "o",
+            "p",
+            &grant("", 0),
+            &at("2026-08-30T12:00:00Z"),
+        );
+        assert_eq!(fields["lifecycle"], json!("durable"));
+        assert!(!fields.contains_key("expires_at"));
+    }
+
+    #[test]
     fn an_absent_acton_version_is_omitted_rather_than_sent_empty() {
         let mut req = request();
         req.acton_ai_version = Some(String::new());
-        assert!(!install_fields(&req, "o", "p", "t").contains_key("acton_ai_version"));
+        let when = at("2026-08-30T12:00:00Z");
+        assert!(!install_fields(&req, "o", "p", &grant("durable", 0), &when)
+            .contains_key("acton_ai_version"));
         req.acton_ai_version = Some("0.34.0".into());
         assert_eq!(
-            install_fields(&req, "o", "p", "t")["acton_ai_version"],
+            install_fields(&req, "o", "p", &grant("durable", 0), &when)["acton_ai_version"],
             json!("0.34.0")
         );
     }
@@ -436,7 +594,13 @@ mod tests {
     #[test]
     fn isolation_defaults_to_false_when_the_daemon_says_nothing() {
         assert_eq!(
-            install_fields(&request(), "o", "p", "t")["isolation_active"],
+            install_fields(
+                &request(),
+                "o",
+                "p",
+                &grant("durable", 0),
+                &at("2026-08-30T12:00:00Z")
+            )["isolation_active"],
             json!(false)
         );
     }

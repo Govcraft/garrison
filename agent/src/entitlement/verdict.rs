@@ -52,6 +52,17 @@ pub struct InstallRow {
     /// The operator this machine acts for.
     #[serde(default)]
     pub operator: Option<String>,
+    /// `durable` or `ephemeral`. Empty on a plane that predates the field,
+    /// which is read as durable: an install nobody marked ephemeral is one
+    /// nobody time-boxed.
+    #[serde(default)]
+    pub lifecycle: String,
+    /// When this install stops being allowed to run, RFC 3339.
+    ///
+    /// Null on a durable install. Mandatory on an ephemeral one, and its
+    /// absence there is a refusal rather than an immortal identity.
+    #[serde(default)]
+    pub expires_at: Option<String>,
 }
 
 /// One `Seat` row, in the fields that decide whether it entitles anything.
@@ -222,6 +233,11 @@ pub enum Refusal {
     },
     /// The install row names no operator, so there is nobody to be entitled.
     InstallUnbound,
+    /// An ephemeral install outlived the window it was minted with.
+    InstallExpired {
+        /// The expiry the plane recorded, when it recorded one at all.
+        expires_at: Option<String>,
+    },
     /// The plane refused this install's credential outright.
     CredentialRejected {
         /// The HTTP status it refused with.
@@ -242,6 +258,7 @@ impl Refusal {
             Self::NoSeat => "no_seat",
             Self::InstallNotActive { .. } => "install_not_active",
             Self::InstallUnbound => "install_unbound",
+            Self::InstallExpired { .. } => "install_expired",
             Self::CredentialRejected { .. } => "credential_rejected",
         }
     }
@@ -288,6 +305,21 @@ impl fmt::Display for Refusal {
                 "the control plane's record for this install names no operator, so there is \
                  no seat to check. Re-enroll this machine against an operator-scoped grant",
             ),
+            Self::InstallExpired { expires_at } => {
+                f.write_str("this install is ephemeral and its window has closed")?;
+                if let Some(at) = expires_at {
+                    write!(f, " (it ran to {at})")?;
+                } else {
+                    // The other half of the rule, said plainly, because an
+                    // operator reading this needs to know it is a provisioning
+                    // fault rather than a clock they can wait out.
+                    f.write_str(", and the plane recorded no window for it at all")?;
+                }
+                f.write_str(
+                    ". A pipeline install is minted for one build; start a new one rather \
+                     than reusing this identity",
+                )
+            }
             Self::CredentialRejected { status, message } => write!(
                 f,
                 "the control plane refused this install's credential ({status}: {message}). \
@@ -423,6 +455,15 @@ pub fn adjudicate(install: &InstallRow, seats: &[SeatRow], now: DateTime<Utc>) -
         });
     }
 
+    // Before the seat, because an identity that has stopped being valid is not
+    // a question about entitlement. An ephemeral install is minted for one
+    // build and is the whole reason a CI runner can hold an identity at all;
+    // the window is what keeps a credential lifted out of a container image
+    // from becoming a standing machine in the fleet.
+    if let Some(refusal) = install_window(install, now) {
+        return Verdict::Refused(refusal);
+    }
+
     let Some(operator) = install.operator.as_deref().filter(|id| !id.is_empty()) else {
         return Verdict::Refused(Refusal::InstallUnbound);
     };
@@ -469,6 +510,39 @@ fn has_expired(seat: &SeatRow, now: DateTime<Utc>) -> bool {
         None => false,
         Some(text) if text.trim().is_empty() => false,
         Some(text) => parse_time(text).is_none_or(|at| at <= now),
+    }
+}
+
+/// Whether an install has outlived its window, and why. Pure.
+///
+/// Two rules, and the second is the one worth defending:
+///
+/// 1. An expiry that is set is enforced, whatever the lifecycle says. An
+///    administrator who dated a durable install meant it, and honouring it
+///    costs nothing.
+/// 2. An install marked ephemeral with *no* expiry is refused. It is tempting
+///    to read a missing window as "no limit", and that reading would turn a
+///    hook that failed to stamp the field into an immortal pipeline identity,
+///    which is precisely what the field exists to prevent. An unparseable date
+///    is refused for the same reason, matching how a seat's own expiry is
+///    read.
+fn install_window(install: &InstallRow, now: DateTime<Utc>) -> Option<Refusal> {
+    let ephemeral = install.lifecycle == "ephemeral";
+    let stamped = install
+        .expires_at
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+
+    match stamped {
+        Some(text) => {
+            parse_time(text)
+                .is_none_or(|at| at <= now)
+                .then(|| Refusal::InstallExpired {
+                    expires_at: Some(text.to_string()),
+                })
+        }
+        None => ephemeral.then_some(Refusal::InstallExpired { expires_at: None }),
     }
 }
 
@@ -647,6 +721,18 @@ mod tests {
         InstallRow {
             status: status.to_string(),
             operator: operator.map(str::to_owned),
+            lifecycle: "durable".to_string(),
+            expires_at: None,
+        }
+    }
+
+    /// A pipeline install: minted for one build, dated at mint time.
+    fn ephemeral(expires_at: Option<&str>) -> InstallRow {
+        InstallRow {
+            status: "enrolled".to_string(),
+            operator: Some("operator_01".to_string()),
+            lifecycle: "ephemeral".to_string(),
+            expires_at: expires_at.map(str::to_owned),
         }
     }
 
@@ -1299,5 +1385,121 @@ mod tests {
         assert_eq!(row.id, "seat_01");
         assert_eq!(row.status, "");
         assert_eq!(row.expires_at, None);
+    }
+    #[test]
+    fn a_pipeline_install_runs_inside_its_window() {
+        let live = seat("seat_01", "active");
+        let verdict = adjudicate(&ephemeral(Some("2026-08-29T13:00:00Z")), &[live], now());
+        assert!(matches!(verdict, Verdict::Entitled { .. }), "{verdict:?}");
+    }
+
+    #[test]
+    fn a_pipeline_install_stops_when_its_window_closes() {
+        // The build finished an hour ago. Whatever is still holding this
+        // identity is not the build it was minted for.
+        let live = seat("seat_01", "active");
+        let verdict = adjudicate(&ephemeral(Some("2026-08-29T11:00:00Z")), &[live], now());
+        assert!(
+            matches!(verdict, Verdict::Refused(Refusal::InstallExpired { .. })),
+            "{verdict:?}"
+        );
+    }
+
+    #[test]
+    fn an_ephemeral_install_with_no_window_is_refused_rather_than_immortal() {
+        // The tempting reading of a missing expiry is "no limit", and it would
+        // turn a hook that failed to stamp the field into a standing pipeline
+        // identity. That is the exact failure the field exists to prevent.
+        let live = seat("seat_01", "active");
+        let verdict = adjudicate(&ephemeral(None), &[live], now());
+        assert_eq!(
+            verdict,
+            Verdict::Refused(Refusal::InstallExpired { expires_at: None })
+        );
+    }
+
+    #[test]
+    fn an_unreadable_window_is_refused_like_an_unreadable_seat_expiry() {
+        let live = seat("seat_01", "active");
+        let verdict = adjudicate(&ephemeral(Some("whenever")), &[live], now());
+        assert!(
+            matches!(verdict, Verdict::Refused(Refusal::InstallExpired { .. })),
+            "{verdict:?}"
+        );
+    }
+
+    #[test]
+    fn a_workstation_never_expires() {
+        // Every install written before the lifecycle column existed reads as
+        // durable with no window, and must keep running.
+        let live = seat("seat_01", "active");
+        let verdict = adjudicate(&install("active", Some("operator_01")), &[live], now());
+        assert!(matches!(verdict, Verdict::Entitled { .. }), "{verdict:?}");
+    }
+
+    #[test]
+    fn a_dated_workstation_is_honoured_too() {
+        // An administrator who put a date on a durable install meant it, and
+        // enforcing it costs nothing.
+        let live = seat("seat_01", "active");
+        let mut row = install("active", Some("operator_01"));
+        row.expires_at = Some("2026-08-29T11:00:00Z".to_string());
+        assert!(matches!(
+            adjudicate(&row, &[live], now()),
+            Verdict::Refused(Refusal::InstallExpired { .. })
+        ));
+    }
+
+    #[test]
+    fn a_closed_window_is_told_apart_from_a_seat_problem() {
+        // They go to different people: an expired pipeline identity is the
+        // pipeline's own business, a seat refusal is an administrator's.
+        assert_ne!(
+            Refusal::InstallExpired { expires_at: None }.kind(),
+            Refusal::NoSeat.kind()
+        );
+        assert_eq!(
+            Refusal::InstallExpired { expires_at: None }.kind(),
+            "install_expired"
+        );
+    }
+
+    #[test]
+    fn an_expired_install_is_refused_before_its_seat_is_consulted() {
+        // Order matters for the message an operator reads: an identity that
+        // has stopped being valid is not a question about entitlement, and
+        // reporting "no seat" here would send them to the wrong person.
+        let verdict = adjudicate(&ephemeral(Some("2026-08-29T11:00:00Z")), &[], now());
+        assert!(
+            matches!(verdict, Verdict::Refused(Refusal::InstallExpired { .. })),
+            "{verdict:?}"
+        );
+    }
+
+    #[test]
+    fn a_quarantined_pipeline_install_still_reports_the_quarantine() {
+        // Status comes first: somebody acted deliberately, and that is more
+        // useful to hear than the window that would also have closed.
+        let mut row = ephemeral(Some("2026-08-29T11:00:00Z"));
+        row.status = "quarantined".to_string();
+        assert!(matches!(
+            adjudicate(&row, &[], now()),
+            Verdict::Refused(Refusal::InstallNotActive { .. })
+        ));
+    }
+
+    #[test]
+    fn the_expiry_refusal_says_what_to_do_about_it() {
+        let text = Refusal::InstallExpired {
+            expires_at: Some("2026-08-29T11:00:00Z".to_string()),
+        }
+        .to_string();
+        assert!(text.contains("2026-08-29T11:00:00Z"), "{text}");
+        assert!(text.contains("new one"), "{text}");
+
+        // The no-window case has to say so, or an operator waits for a clock
+        // that will never come round.
+        let missing = Refusal::InstallExpired { expires_at: None }.to_string();
+        assert!(missing.contains("no window"), "{missing}");
     }
 }

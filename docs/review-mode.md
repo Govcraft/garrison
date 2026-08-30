@@ -111,6 +111,40 @@ to guess whether a comment came from a colleague or a model, and an
 attribution that appears only sometimes teaches readers that unmarked comments
 are human.
 
+## How a runner gets an identity
+
+A review is a governed turn, so the runner needs an install the plane
+recognizes. Enrollment assumes a disk that outlives the process, and a
+container has none: every build is a first run, with a new install id, a new
+keypair, and no record of ever having enrolled.
+
+That is what an **ephemeral grant** is for. Provision the runner with a
+multi-use `EnrollmentToken` whose `install_lifecycle` is `ephemeral` and whose
+`install_ttl_secs` covers the longest build:
+
+```
+schemaforge token generate --sub tok_pipeline --lifetime 172800 \
+  --issuer garrison-control-plane --roles enrollee \
+  --tenant-chain '[{"schema":"Organization","entity_id":"<org id>"}]' \
+  --custom-claim-string scope=organization \
+  --custom-claim-long max_uses=500
+```
+
+with the matching row carrying `install_lifecycle = "ephemeral"` and
+`install_ttl_secs = 900`. Each build redeems it, gets an install dated fifteen
+minutes out, and that identity stops running when the window closes whether or
+not anything cleaned up after it. Bake the packet into the runner image: it is
+single-use per container, and a fresh container gets a fresh copy.
+
+The daemon never says which kind it is. From inside, a fresh container and a
+freshly imaged laptop are indistinguishable, so the grant decides. See
+"Machines that will not exist tomorrow" in
+[control-plane.md](control-plane.md#fleet--schemasfleetschema).
+
+One thing this does not do is multiply seat cost. Every build binds to the same
+CI operator and spends that operator's seat, so a hundred builds a day is one
+seat.
+
 ## Wiring it into CI
 
 Bitbucket **Pipelines** is a Cloud feature. Data Center has no built-in CI, so
@@ -204,28 +238,6 @@ precisely the claim Garrison exists not to make.
 
 ## What is not built
 
-- **An install identity that is legitimately ephemeral** (#11). Note what this
-  is *not*: policy distribution already works here. The runner's daemon pulls
-  its assigned bundle from the plane, re-verifies the checksum against the
-  rows it received, and puts it in force before any turn, and a review's turn
-  is governed by that bundle like any other. Nothing about delivery is
-  review-specific or missing.
-
-  What is missing is upstream of the bundle. Enrollment is one-time and
-  durable on purpose: a daemon is enrolled if and only if it can read back its
-  install record, the packet is destroyed the moment it is spent, and the
-  signing key is generated on the machine and never transmitted. A container
-  has no durable disk, so every build is a first run. That gives either one
-  install row per build, which makes the fleet view and the seat count
-  meaningless, or a spent packet and a refusal to start, which is the right
-  behaviour and a broken pipeline.
-
-  The workaround today is to mount a provisioned install record and key into
-  the runner image. It works, and it costs a long-lived private key living in
-  an image and every concurrent build sharing one identity and one seat. The
-  real fix is a control-plane question rather than an agent one: a grant that
-  mints a short-lived identity per build, or an install kind provisioned once
-  and permitted to run concurrently.
 - **Reviewing anything that is not a Bitbucket pull request.** A local
   `git diff` mode would reuse everything except the transport, and the prompt
   layer is already independent of Bitbucket for that reason.

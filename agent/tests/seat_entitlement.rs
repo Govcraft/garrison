@@ -368,6 +368,7 @@ async fn a_seat_is_only_an_entitlement_while_the_plane_says_it_is() {
                 "platform": "linux",
                 "agent_version": "0.1.0",
                 "sandbox_hardening": "best_effort",
+                "lifecycle": "durable",
                 "status": "active"
             }),
         )

@@ -482,6 +482,7 @@ async fn sealed_entries_ship_into_a_real_plane_and_the_chain_head_matches() {
                 "agent_version": "0.1.0",
                 "acton_ai_version": "0.35.0",
                 "sandbox_hardening": "enforce",
+                "lifecycle": "durable",
                 "status": "active"
             }),
         )
