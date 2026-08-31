@@ -66,6 +66,16 @@ Two shipped editor extensions and every operator's config file.
   or repurposed, and an unknown key is a hard error by design — which is why
   removing one is a break rather than a tidy-up.
 
+**Changed in 1.3, within the promise rather than against it:**
+`_garrison/complete` now crosses the admission gates, so an install refused
+from running a turn is refused a completion too. Its request and response
+shapes are untouched and it still answers a refusal the way it answers every
+other failure: an empty completion, never an error. A client written against
+1.0 therefore needs no change, because "no suggestion" was always a reply it
+had to handle. What changed is how often it is the true one, which is the
+point: the alternative was a client learning about a revoked seat from a
+suggestion it should never have been given.
+
 ### 4. The audit trail on disk
 
 The entry format, the hash pre-image, the chain, and the `.trail` sidecar.
