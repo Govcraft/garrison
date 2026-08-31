@@ -105,6 +105,13 @@ The implemented agent provides:
 - Persistent sessions, cancellation, plans, and optional context compaction.
 - Structural patching with fuzzy context matching and atomic application.
 - Read-only LSP diagnostics, hover, definitions, and references.
+- `AGENTS.md` project instructions, discovered under the session's approved root
+  and gated by the policy bundle. A governed install's bundle decides whether
+  discovery is enabled, confined to named paths, or off; an ungoverned install
+  or a policy ask that errors loads nothing. The files that survive that gate
+  are named in the turn's own audit entry by path and content hash, never by
+  content, so the answer to what steered a turn is chained alongside the answer
+  to what the turn did.
 - Human approval round trips, timeouts, and connection-local approval caching.
 - Sandboxed `bash`, file-write, and file-edit tools.
 - Anthropic, OpenAI, Groq, Kimi, Ollama, and OpenAI-compatible endpoints through
@@ -273,9 +280,19 @@ described in [the compatibility contract](docs/compatibility.md).
 Experimental features make a narrower promise. They ship off, require an
 explicit opt-in, and may change behavior or exit codes before stabilization.
 
+Released binaries carry their own provenance. Each archive ships a CycloneDX
+SBOM per binary, generated for that archive's own target rather than for the
+workspace as a whole, and `SHA256SUMS` is signed keylessly with `cosign`
+against the release workflow's GitHub Actions identity rather than a stored
+key. `cargo deny` gates every push, every pull request, and every tagged
+release against the advisory, license, and source policy in `deny.toml`. The
+advisories currently accepted, and why, are written down rather than silently
+allowed.
+
 Before adopting Garrison, also review:
 
 - [Accessibility and support](docs/accessibility.md)
+- [Supply-chain policy](docs/supply-chain-policy.md)
 - [Known gaps and operational failure modes](docs/control-plane.md#known-gaps)
 - [Agent and integration design](docs/garrison-agent-design.md)
 - [Bitbucket review mode](docs/review-mode.md)
