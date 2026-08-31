@@ -14,6 +14,9 @@
 //!    from "the record is incomplete" without reading a log.
 //! 3. **A turn gate** ([`keeper`]), so a strict deployment stops running turns
 //!    once the writer has failed, rather than running them unrecorded.
+//! 4. **A record of what the gates turned away** ([`seal`]), because the
+//!    runtime only records the work it runs, and an install refused all
+//!    afternoon must not read like an install nobody touched.
 //!
 //! [`verify`] is the offline form of the first: `garrison-agent audit verify`
 //! answers both the chain question and the anchor question, with a distinct
@@ -30,11 +33,13 @@
 
 pub mod anchor;
 pub mod keeper;
+pub mod seal;
 pub mod state;
 pub mod verify;
 
 pub use anchor::{Anchor, AnchorVerdict, HeadComparison, StartupDecision};
 pub use keeper::{AnchorKeeper, AnchorNow, AnchorOutcome, KeeperSettings};
+pub use seal::seal_refusal;
 pub use state::{state_for, AuditState};
 pub use verify::{Outcome as VerifyOutcome, VerifyReport};
 

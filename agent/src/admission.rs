@@ -6,6 +6,14 @@
 //! shipper, a session store. None of them touch `thread.rs`; they are handed
 //! to a session as a list, and the fold here is the only code that walks it.
 //!
+//! # Two kinds of work, one list of gates
+//!
+//! An inline completion is a paid model call that sends code to a provider, so
+//! it crosses these gates too. It is not a turn a person asked for, though, and
+//! a rule about an interrupted turn has nothing to say about a keystroke. The
+//! request carries a [`Work`] saying which it is, and every gate answers for
+//! both rather than a caller deciding which gates a completion deserves.
+//!
 //! # Fail closed
 //!
 //! A gate that cannot be asked — its actor has stopped, its reply never comes,
@@ -34,13 +42,37 @@ use std::time::Duration;
 /// runtime-wide thirty seconds.
 pub const GATE_DEADLINE: Duration = Duration::from_secs(5);
 
-/// Asks a gate whether a turn may start.
+/// What kind of work a gate is being asked to admit.
+///
+/// Every gate is asked about both kinds, and each decides for itself what its
+/// own rule means for each. The alternative was a second, shorter gate list
+/// that the completion path walks instead, and it was rejected: it puts the
+/// judgment about completions in the code that assembles the list rather than
+/// in the gate that holds the rule, and a gate added later would join that
+/// list by being forgotten rather than by being considered. Here, a new gate
+/// cannot compile without answering for both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Work {
+    /// A turn a person asked for, through `session/prompt`.
+    Turn,
+    /// An inline completion at a cursor, through `_garrison/complete`.
+    ///
+    /// Speculative, discarded when it is slow, and running no tools. It is
+    /// still a paid model call that sends the code around a cursor to a
+    /// provider, on every typing pause, which is the whole reason it is put to
+    /// the gates rather than trusted to the ownership check alone.
+    Completion,
+}
+
+/// Asks a gate whether work may start.
 #[acton_message]
 pub struct AdmitTurn {
-    /// The session about to run a turn.
+    /// The session about to run the work.
     pub thread_id: ThreadId,
-    /// Garrison's identifier for the turn.
+    /// Garrison's identifier for the turn the work runs under.
     pub turn_id: TurnId,
+    /// Which kind of work this is. See [`Work`].
+    pub work: Work,
 }
 
 /// A gate's answer.
@@ -202,8 +234,24 @@ pub fn fold(admissions: impl IntoIterator<Item = Admission>) -> Admission {
 ///
 /// Empty gates admit. A gate that cannot be asked refuses; see the module docs.
 pub async fn admit(gates: &[ActorHandle], request: &AdmitTurn) -> Admission {
+    admit_within(gates, request, GATE_DEADLINE).await
+}
+
+/// [`admit`], with a deadline the caller chooses.
+///
+/// The completion path asks for a tighter one than [`GATE_DEADLINE`]. A
+/// completion is abandoned after two seconds, so a gate given five could spend
+/// the entire budget and still decide nothing, and the latency this path exists
+/// to protect would be spent on the gates rather than on the model. A gate that
+/// misses the shorter deadline refuses exactly as it would miss the longer one:
+/// a completion nobody admitted is not shown.
+pub async fn admit_within(
+    gates: &[ActorHandle],
+    request: &AdmitTurn,
+    deadline: Duration,
+) -> Admission {
     for gate in gates {
-        let answer = match gate.ask_with_timeout(request.clone(), GATE_DEADLINE).await {
+        let answer = match gate.ask_with_timeout(request.clone(), deadline).await {
             Ok(answer) => answer,
             Err(error) => Admission::Refuse(TurnRefusal::GateUnreachable {
                 gate: gate.id().to_string(),
@@ -215,6 +263,7 @@ pub async fn admit(gates: &[ActorHandle], request: &AdmitTurn) -> Admission {
                 gate = %gate.id(),
                 thread_id = %request.thread_id,
                 turn_id = %request.turn_id,
+                work = ?request.work,
                 %refusal,
                 "a gate refused a turn",
             );
@@ -367,6 +416,7 @@ mod tests {
         AdmitTurn {
             thread_id: ThreadId::new(),
             turn_id: TurnId::new(),
+            work: Work::Turn,
         }
     }
 
@@ -426,6 +476,48 @@ mod tests {
                 Admission::Refuse(TurnRefusal::GateUnreachable { .. })
             ),
             "{answer:?}"
+        );
+        runtime.shutdown_all().await.expect("clean shutdown");
+    }
+
+    #[tokio::test]
+    async fn a_completion_is_refused_by_the_same_gate_a_turn_is() {
+        // The whole point of #22: naming work a completion must not be a way
+        // past a gate. Only a gate that opts out for itself may admit one.
+        let mut runtime = ActonApp::launch_async().await;
+        let (_, refuser, _) = spawn_gates(&mut runtime).await;
+
+        let completion = AdmitTurn {
+            work: Work::Completion,
+            ..request()
+        };
+        let answer = admit(&[refuser], &completion).await;
+
+        assert_eq!(answer, Admission::Refuse(TurnRefusal::StoreUnavailable));
+        runtime.shutdown_all().await.expect("clean shutdown");
+    }
+
+    #[tokio::test]
+    async fn a_short_deadline_refuses_a_silent_gate_without_waiting_the_long_one() {
+        // A completion is abandoned after two seconds, so a gate given the
+        // full five would decide nothing and cost everything.
+        let mut runtime = ActonApp::launch_async().await;
+        let (_, _, mute) = spawn_gates(&mut runtime).await;
+
+        let started = std::time::Instant::now();
+        let answer = admit_within(&[mute], &request(), Duration::from_millis(50)).await;
+        let waited = started.elapsed();
+
+        assert!(
+            matches!(
+                answer,
+                Admission::Refuse(TurnRefusal::GateUnreachable { .. })
+            ),
+            "{answer:?}"
+        );
+        assert!(
+            waited < GATE_DEADLINE,
+            "the caller's deadline must be the one honoured, waited {waited:?}",
         );
         runtime.shutdown_all().await.expect("clean shutdown");
     }

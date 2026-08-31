@@ -952,6 +952,14 @@ same reason a denied call has none: it never ran. `sandboxed` is written
 `false` on every turn row rather than inheriting the schema's `default(true)`,
 because a turn confines nothing.
 
+An inline completion crosses the same gates and seals a row when it is refused,
+under the same stable decision word. Only the refusal is sealed: an admitted
+completion writes nothing, because a debounce timer decides how often that path
+is entered and a trail written by a timer rather than by a person is noise
+wearing the shape of evidence. What the trail therefore answers about
+completions is the governance question — was this install spending on them
+after its seat lapsed — and not the accounting one.
+
 The ingest hook re-derives every one of those columns, turn columns included.
 An install that could set its own `kind` could file a turn as a tool call and
 vanish from a turn-level export; one that could set its own token counts could
@@ -1198,6 +1206,14 @@ use.
 |---|---|---|
 | The store cannot be reached, or answered with an error | `-32018` `STORE_UNAVAILABLE` | Every turn is refused. "I cannot find out whether this will be saved" and "this will not be saved" have the same consequence for the record |
 | The session's own record names a turn that is still open | `-32019` `TURN_INTERRUPTED` | That session refuses *new* prompts until an operator resumes or abandons the old one |
+
+Both rules are about a session's stored record, so this is the one gate that
+admits an inline completion without asking: a completion writes no record to
+lose, and blocking a developer's editor because some earlier turn was left open
+would refuse them for a reason that is not about them. It is also the only gate
+that reaches the store to answer, so skipping the read is what keeps the gates
+inside a completion's two-second budget. Every other gate answers a completion
+exactly as it answers a turn.
 
 The second is deliberately automatic in neither direction. Silently restarting
 the turn would re-run tools that have already run and be paid for twice;
@@ -1773,16 +1789,6 @@ exactly one install identity: a fleet of editor windows is one
 
 ## Known gaps
 
-- **Inline completion reaches no admission gate.** `_garrison/complete`
-  resolves the session that owns it, which is what holds the request inside
-  the workspace boundary, and then makes a paid model call without passing the
-  seat, policy, or audit gates every turn passes. An install refused from
-  running a turn can still spend on every typing pause, and the number of
-  completions in flight against the model is uncapped. Running it off the
-  session actor was a deliberate latency decision and is still the right one;
-  losing admission along with it was not a decision at all. Which gates a
-  completion should pass is
-  [#22](https://github.com/Govcraft/garrison/issues/22).
 - **A bundle's `network_egress` and `allow_unsandboxed_escalation` are
   recorded and not enforced.** They are part of the checksum and reported in
   `_garrison/status`; no code acts on them. `ping` says so out loud.

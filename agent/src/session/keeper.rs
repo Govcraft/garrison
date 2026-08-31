@@ -20,6 +20,14 @@
 //! the record names: the gate refuses a turn that is *different* from the one
 //! left open, not the one picking it up.
 //!
+//! A completion is admitted without asking the store at all. Both sentences
+//! above are about a session's stored record, and a completion writes none: it
+//! is discarded when it is slow, it leaves no exchange to lose at a restart,
+//! and refusing one because some earlier turn was interrupted would stop a
+//! developer's editor for a reason that has nothing to do with them. This is
+//! also the only gate that reaches a store to answer, so skipping the read is
+//! what keeps the gates inside a completion's two-second budget.
+//!
 //! # It is a describer
 //!
 //! [`Describe`] answers with the store's health, how many sessions survive a
@@ -34,7 +42,7 @@
 //! the actor. What to delete is [`plan_retention`]'s decision, made from
 //! values; this actor only carries it out.
 
-use crate::admission::{Admission, AdmitTurn, TurnRefusal};
+use crate::admission::{Admission, AdmitTurn, TurnRefusal, Work};
 use crate::protocol::acp;
 use crate::protocol::conn::{Describe, StatusPart};
 use crate::session::meta::SessionMeta;
@@ -285,6 +293,15 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, SessionKeeper>) {
     builder.act_on::<AdmitTurn>(|actor, envelope| {
         let reply = envelope.reply_envelope();
         let request = envelope.message().clone();
+        // A completion has no stored record for either rule to be about, and
+        // this is the one gate that reaches a store to answer. See the module
+        // docs.
+        if request.work == Work::Completion {
+            return Reply::pending(async move {
+                reply.send(Admission::Admit).await;
+            });
+        }
+
         let Some(settings) = actor.model.settings.clone() else {
             // A keeper with no store is a keeper that was never armed, and an
             // unarmed gate has nothing to say about a turn.

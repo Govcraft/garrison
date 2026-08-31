@@ -37,8 +37,9 @@ use crate::protocol::transport::{Connection, Listener};
 use crate::types::ClientId;
 use acton_ai::facade::ActonAI;
 use acton_reactive::prelude::*;
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 /// Everything the server hands to each connection it accepts.
@@ -65,6 +66,13 @@ pub struct ServerSetup {
     /// `None` on a standalone agent. See [`crate::plane`]: this handle is the
     /// only way to an authenticated plane client anywhere in the daemon.
     pub plane: Option<ActorHandle>,
+    /// Permits bounding how many inline completions run at once.
+    ///
+    /// Held here rather than per connection, and cloned into every
+    /// [`ConnSetup`], because this setup is cloned once per accepted socket:
+    /// one `Arc` means every editor attached to this daemon draws on the same
+    /// bound. See `conn::COMPLETIONS_IN_FLIGHT`.
+    pub completions: Arc<Semaphore>,
 }
 
 /// Owns the listener and the accept loop.
@@ -243,6 +251,7 @@ where
             sandbox: setup.sandbox,
             describers: setup.describers,
             plane: setup.plane,
+            completions: setup.completions,
         },
     )
     .await;

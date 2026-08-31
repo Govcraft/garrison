@@ -33,6 +33,7 @@ use acton_ai::tools::sandbox::{HardeningMode, ProcessSandboxConfig};
 use acton_reactive::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 /// A running agent server.
 #[derive(Debug)]
@@ -291,6 +292,9 @@ pub async fn build_setup(
         sandbox,
         describers,
         plane,
+        completions: Arc::new(Semaphore::new(
+            crate::protocol::conn::COMPLETIONS_IN_FLIGHT,
+        )),
     })
 }
 

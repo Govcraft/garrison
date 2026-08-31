@@ -1003,6 +1003,7 @@ mod tests {
 
         let admission = handle
             .ask(AdmitTurn {
+                work: crate::admission::Work::Turn,
                 thread_id: crate::types::ThreadId::new(),
                 turn_id: crate::types::TurnId::new(),
             })
