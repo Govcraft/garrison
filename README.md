@@ -39,10 +39,9 @@ packages, and enterprise support may be offered separately by Govcraft.
 
 It is also not yet a complete enforcement point for network behavior. Policy
 can record `network_egress` and `allow_unsandboxed_escalation`, but the current
-agent reports rather than enforces those fields. Inline completion is confined
-to its session workspace but does not yet pass the turn-admission gates. Read
-the complete [known gaps](docs/control-plane.md#known-gaps) before evaluating a
-production deployment.
+agent reports rather than enforces those fields. Read the complete
+[known gaps](docs/control-plane.md#known-gaps) before evaluating a production
+deployment.
 
 ## Four gates turn governance claims into runtime decisions
 
@@ -101,7 +100,10 @@ autostart the daemon; the daemon then outlives that client.
 The implemented agent provides:
 
 - Streaming chat in VS Code, JetBrains IDEs, and an interactive terminal.
-- Inline completion in both first-party editor integrations.
+- Inline completion in both first-party editor integrations, crossing the same
+  seat, audit and policy gates a turn crosses. It is a paid model call that
+  sends the code around a cursor to a provider, so an install refused from
+  running a turn is refused this too, and the refusal is sealed in the trail.
 - Persistent sessions, cancellation, plans, and optional context compaction.
 - Structural patching with fuzzy context matching and atomic application.
 - Read-only LSP diagnostics, hover, definitions, and references.

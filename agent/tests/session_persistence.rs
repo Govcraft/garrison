@@ -696,6 +696,44 @@ async fn a_turn_the_daemon_died_in_blocks_the_session_until_it_is_settled() {
         "and the prompt text itself never reaches the trail",
     );
 
+    // A completion crosses the gates now, but not this one. Both of the
+    // session keeper's rules are about a stored record a completion never
+    // writes, so an interrupted turn must not stop a developer's editor from
+    // suggesting anything until somebody settles it.
+    //
+    // The trail is what proves it rather than the response, because a refused
+    // completion answers exactly what an unhelpful one does: no suggestion. A
+    // gate that had refused this would have sealed a second `turn_interrupted`
+    // entry, so counting them is the assertion.
+    let interrupted_refusals = |trail: &str| -> usize {
+        trail
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|entry| entry["turn_outcome"]["decision"] == "turn_interrupted")
+            .count()
+    };
+    assert_eq!(
+        interrupted_refusals(&trail),
+        1,
+        "the refused prompt sealed exactly one entry",
+    );
+
+    let _: acp::CompletionResponse = client
+        .request(
+            acp::ext::COMPLETE,
+            &acp::CompletionRequest::new(session_id.clone(), "fn main() {", "}"),
+            &mut Watched::default(),
+        )
+        .await
+        .expect("a completion must be answered, not refused as an error");
+
+    let after = std::fs::read_to_string(fixture.trail()).expect("the trail must be readable");
+    assert_eq!(
+        interrupted_refusals(&after),
+        1,
+        "the interrupted turn must not have refused the completion as well",
+    );
+
     // And the escape hatch: the operator says the work is not wanted, and the
     // session is promptable again.
     let abandoned = client

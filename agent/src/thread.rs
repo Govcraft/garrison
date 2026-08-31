@@ -32,7 +32,7 @@
 //! session owns neither. Silently resurrecting a conversation with no memory of
 //! itself is worse than reporting that it is gone.
 
-use crate::admission::{self, Admission, AdmitTurn, TurnRefusal};
+use crate::admission::{self, Admission, AdmitTurn, TurnRefusal, Work};
 use crate::approval::{with_turn_scope, TurnScope};
 use crate::entitlement::EntitlementLost;
 use crate::protocol::acp::{self, StopReason};
@@ -945,16 +945,9 @@ async fn discovered_agents_md(setup: &ThreadSetup) -> Option<crate::instructions
 
 /// Seals a refusal the gates made, so a turn nobody ran still leaves a line.
 ///
-/// The gates are asked before the prompt loop, so the runtime never sees these
-/// turns and cannot record them the way it records the ones it runs. Without
-/// this, an install whose seat lapsed and was refused all afternoon would
-/// leave a trail indistinguishable from an install nobody touched, and telling
-/// those two apart is most of what an audit trail is for.
-///
-/// Nothing here changes the verdict. A refusal that cannot be sealed is still
-/// a refusal: the turn was already being turned away, and failing louder would
-/// not admit it. What an operator gets instead is the error in the log and the
-/// audit health `_garrison/status` already reports.
+/// Thin over [`crate::audit::seal_refusal`], which the completion path shares.
+/// What belongs here rather than there is the prompt this turn would have sent:
+/// the last thing the user said, measured in bytes and never copied.
 async fn seal_refusal(
     setup: &ThreadSetup,
     turn_id: &TurnId,
@@ -962,60 +955,21 @@ async fn seal_refusal(
     messages: &[Message],
     opening: Option<&SessionMeta>,
 ) {
-    // An install with no trail configured has nothing to seal into, and
-    // saying so on every refusal would be noise rather than evidence.
-    if setup.runtime.audit_durability().is_none() {
-        return;
-    }
-
-    let turn = match acton_turn_id(turn_id) {
-        Ok(turn) => turn,
-        Err(error) => {
-            tracing::error!(
-                thread_id = %setup.thread_id,
-                %turn_id,
-                %error,
-                "a refused turn could not be sealed: its id does not translate",
-            );
-            return;
-        }
-    };
-
-    // The same prompt the admitted path would have counted: the last thing
-    // the user said, measured in bytes and never copied.
     let prompt_size_bytes = messages
         .iter()
         .rev()
         .find(|message| message.role == MessageRole::User)
         .map_or(0, |message| message.content.len() as u64);
 
-    match setup
-        .runtime
-        .record_refused_turn(
-            turn,
-            opening.map(|meta| meta.conversation.clone()),
-            refusal.decision(),
-            &refusal.to_string(),
-            prompt_size_bytes,
-        )
-        .await
-    {
-        Ok(receipt) if receipt.is_durable() => {}
-        Ok(receipt) => tracing::error!(
-            thread_id = %setup.thread_id,
-            %turn_id,
-            decision = refusal.decision(),
-            ?receipt,
-            "a refused turn was sealed but never reached the disk",
-        ),
-        Err(error) => tracing::error!(
-            thread_id = %setup.thread_id,
-            %turn_id,
-            decision = refusal.decision(),
-            %error,
-            "a refused turn could not be recorded",
-        ),
-    }
+    crate::audit::seal_refusal(
+        &setup.runtime,
+        &setup.thread_id,
+        turn_id,
+        refusal,
+        opening.map(|meta| meta.conversation.clone()),
+        prompt_size_bytes,
+    )
+    .await;
 }
 
 /// The turn itself, separated so `run_turn` is only about reporting.
@@ -1032,6 +986,7 @@ async fn drive_turn(
     let request = AdmitTurn {
         thread_id: setup.thread_id.clone(),
         turn_id: turn_id.clone(),
+        work: Work::Turn,
     };
     if let Admission::Refuse(refusal) = admission::admit(&setup.gates, &request).await {
         seal_refusal(setup, turn_id, &refusal, &messages, opening).await;

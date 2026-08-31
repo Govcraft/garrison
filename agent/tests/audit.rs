@@ -674,6 +674,7 @@ async fn a_plane_without_a_trail_refuses_to_start() {
     );
     let admission = gates[0]
         .ask(AdmitTurn {
+            work: garrison_agent::admission::Work::Turn,
             thread_id: ThreadId::new(),
             turn_id: TurnId::new(),
         })

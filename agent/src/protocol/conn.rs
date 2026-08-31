@@ -53,7 +53,7 @@
 //! and the shortest safe life for one is the session the operator was looking
 //! at when they made it.
 
-use crate::admission::refusal_code;
+use crate::admission::{self, refusal_code, Admission, AdmitTurn, Work};
 use crate::approval::{ApprovalOutcome, RequestApproval, CANCELLED_REASON, REJECTED_REASON};
 use crate::protocol::acp::{self, Permission};
 use crate::protocol::codec::EventSink;
@@ -65,16 +65,17 @@ use crate::thread::{
     ResumeAdmission, ResumeTurn, StartTurn, ThreadList, ThreadLookup, ThreadSetup, TurnAdmission,
     TurnFinished, TurnResult,
 };
-use crate::types::{ClientId, ThreadId};
+use crate::session::ids::acton_turn_id;
+use crate::types::{ClientId, ThreadId, TurnId};
 use acton_ai::checkpoint::CheckpointStatus;
 use acton_ai::facade::ActonAI;
-use acton_ai::types::TurnId as ActonTurnId;
 use acton_reactive::prelude::*;
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 /// How long a `_garrison/complete` waits on the model before giving up.
 ///
@@ -84,6 +85,32 @@ use std::time::Duration;
 /// generous enough for a small model on a warm connection and short enough
 /// that a stalled provider cannot leave requests piling up per keystroke.
 const COMPLETION_DEADLINE: Duration = Duration::from_secs(2);
+
+/// How long a gate has to admit a completion before its silence refuses it.
+///
+/// Much tighter than [`crate::admission::GATE_DEADLINE`], and deliberately so.
+/// Every gate a completion crosses decides from state it already holds: the
+/// seat monitor refreshes on its own interval, the audit keeper and the shipper
+/// read their own health, the policy agent answers from the bundle in hand.
+/// None of them make a network call to answer, so a gate that has not replied
+/// in this long is wedged rather than working, and a completion is abandoned
+/// two seconds from now regardless. Waiting the full five would spend the
+/// entire budget on the gates and leave nothing for the model.
+const COMPLETION_GATE_DEADLINE: Duration = Duration::from_millis(250);
+
+/// How many completions may be in flight against the model at once.
+///
+/// A debounce timer, not a person, decides how often this path is entered, and
+/// before this bound the only thing limiting concurrency was
+/// [`COMPLETION_DEADLINE`]: a provider that slowed to just under two seconds
+/// would accumulate one in-flight request per keystroke pause across every open
+/// editor, all of them paid for.
+///
+/// A completion that cannot get a permit is dropped rather than queued. Queuing
+/// would defeat the point: a suggestion that waits for a slot arrives after the
+/// keystroke that made it interesting, which is the same reason this path does
+/// not go through the session actor.
+pub const COMPLETIONS_IN_FLIGHT: usize = 8;
 
 /// The server-wide settings a new session inherits.
 #[derive(Clone, Debug)]
@@ -177,6 +204,12 @@ pub struct ConnSetup {
     /// A subsystem that needs the control plane asks this handle for an
     /// authenticated client and never builds one; see [`crate::plane`].
     pub plane: Option<ActorHandle>,
+    /// Permits bounding how many completions run at once, daemon-wide.
+    ///
+    /// Shared rather than per-connection: the bound exists to protect the
+    /// provider and the operator's bill, and both are shared by every editor
+    /// this daemon serves. See [`COMPLETIONS_IN_FLIGHT`].
+    pub completions: Arc<Semaphore>,
 }
 
 /// Asks a subsystem to describe itself for `_garrison/status`.
@@ -1406,10 +1439,85 @@ async fn session_abandon(context: &Dispatch, raw: Option<Value>) -> Result<Value
 /// `max_tool_rounds(1)` keeps it that way should a future MCP server make
 /// `continue_with` generous again. A tool call behind a completion would mean
 /// a keystroke raising an approval dialog.
+///
+/// # It is admitted, not merely owned
+///
+/// Ownership proves the client holds the session. It says nothing about
+/// whether this install may spend, which is a different question and the one
+/// [#22](https://github.com/Govcraft/garrison/issues/22) was about: a
+/// completion is a paid model call that ships the code around a cursor to a
+/// provider, so it crosses the same gates a turn crosses. Every gate but the
+/// session keeper answers it, and the keeper admits it without touching the
+/// store; see [`crate::admission::Work`].
+///
+/// Policy is the gate that matters most here, against first appearances. A
+/// completion runs no tools, so the tool rules have nothing to bite on, but
+/// the policy gate's actual question is whether the provider about to receive
+/// this code is one the bundle approves. That is precisely what a completion
+/// does, on every typing pause, which made an ungoverned or unapproved install
+/// leak exactly the code the gate exists to hold back.
+///
+/// A refusal is silent to the editor. Every other failure on this path answers
+/// "no suggestion" and this is no different: raising an error per keystroke
+/// would bury a developer in dialogs over a state one glance at
+/// `_garrison/status` explains. The trail is where a refusal is not silent.
 async fn complete(context: &Dispatch, raw: Option<Value>) -> Result<Value, ErrorObject> {
     let request: acp::CompletionRequest = params(raw)?;
     let thread_id = acp::thread_id(&request.session_id)?;
     let _owned = context.find(&thread_id).await?;
+
+    // Taken before the gates are asked, so a provider that has slowed to a
+    // crawl stops new completions at the door rather than after five actor
+    // round-trips. Dropped, never queued: see `COMPLETIONS_IN_FLIGHT`.
+    let Ok(_permit) = context.setup.completions.clone().try_acquire_owned() else {
+        tracing::debug!(
+            limit = COMPLETIONS_IN_FLIGHT,
+            "no completion: too many are already in flight",
+        );
+        return encode(&acp::CompletionResponse::empty());
+    };
+
+    // Garrison's id first, because that is what the gates and the trail speak;
+    // the runtime's is derived from it, so a refusal and the turn it refused
+    // name the same thing.
+    let turn_id = TurnId::new();
+    let Ok(completion_turn) = acton_turn_id(&turn_id) else {
+        tracing::error!(%turn_id, "no completion: the turn id does not translate");
+        return encode(&acp::CompletionResponse::empty());
+    };
+
+    let admission = admission::admit_within(
+        &context.setup.defaults.gates,
+        &AdmitTurn {
+            thread_id: thread_id.clone(),
+            turn_id: turn_id.clone(),
+            work: Work::Completion,
+        },
+        COMPLETION_GATE_DEADLINE,
+    )
+    .await;
+
+    if let Admission::Refuse(refusal) = admission {
+        // Sealed for the same reason a refused turn is: an install refused all
+        // afternoon must not read like an install nobody touched. Only the
+        // refusal is sealed, never an admitted completion, because a debounce
+        // timer would otherwise write the trail rather than a person would.
+        //
+        // No conversation and no prompt bytes: a completion belongs to no
+        // stored conversation, and its context is the buffer around a cursor
+        // rather than something a developer chose to send.
+        crate::audit::seal_refusal(
+            &context.setup.runtime,
+            &thread_id,
+            &turn_id,
+            &refusal,
+            None,
+            0,
+        )
+        .await;
+        tracing::debug!(%refusal, "no completion: a gate refused it");
+        return encode(&acp::CompletionResponse::empty());
+    }
 
     // A completion drives the same prompt loop a turn does, so it publishes
     // the same `TurnStarted` the router's claim protocol reads. It holds no
@@ -1417,7 +1525,6 @@ async fn complete(context: &Dispatch, raw: Option<Value>) -> Result<Value, Error
     // be outstanding and the turn that owns it would route nowhere. Minting
     // the id here and disowning it before the loop can start is what keeps a
     // keystroke from stealing a turn's identity; see `crate::router`.
-    let completion_turn = ActonTurnId::new();
     if let Err(error) = context
         .setup
         .router
@@ -1576,7 +1683,7 @@ fn assemble(
 mod tests {
     use super::*;
     use crate::thread::TurnUsage;
-    use crate::types::{ApprovalId, TurnId};
+    use crate::types::ApprovalId;
     use serde_json::json;
     use tokio::sync::mpsc;
 
